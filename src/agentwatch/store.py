@@ -1,0 +1,319 @@
+"""DuckDB storage for spans, with trace summaries computed at query time."""
+
+from __future__ import annotations
+
+import json
+import threading
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import duckdb
+
+from agentwatch import genai
+from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
+
+SCHEMA_VERSION = 1
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);
+CREATE TABLE IF NOT EXISTS spans (
+    trace_id VARCHAR NOT NULL,
+    span_id VARCHAR NOT NULL,
+    parent_span_id VARCHAR,
+    name VARCHAR NOT NULL,
+    kind TINYINT NOT NULL,
+    start_ns BIGINT NOT NULL,
+    end_ns BIGINT NOT NULL,
+    status_code TINYINT NOT NULL,
+    status_message VARCHAR NOT NULL,
+    service_name VARCHAR NOT NULL,
+    scope_name VARCHAR NOT NULL,
+    scope_version VARCHAR NOT NULL,
+    attributes JSON NOT NULL,
+    resource JSON NOT NULL,
+    events JSON NOT NULL,
+    links JSON NOT NULL,
+    operation VARCHAR,
+    provider VARCHAR,
+    request_model VARCHAR,
+    response_model VARCHAR,
+    input_tokens BIGINT,
+    output_tokens BIGINT,
+    cache_read_tokens BIGINT,
+    cache_write_tokens BIGINT,
+    reasoning_tokens BIGINT,
+    cost_usd DOUBLE,
+    finish_reasons VARCHAR[] NOT NULL,
+    tool_name VARCHAR,
+    agent_name VARCHAR,
+    conversation_id VARCHAR,
+    error_type VARCHAR,
+    is_model_call BOOLEAN NOT NULL,
+    counts_toward_totals BOOLEAN NOT NULL,
+    received_ns BIGINT NOT NULL,
+    PRIMARY KEY (trace_id, span_id)
+);
+CREATE INDEX IF NOT EXISTS spans_start ON spans (start_ns);
+"""
+
+_COLUMNS = (
+    "trace_id, span_id, parent_span_id, name, kind, start_ns, end_ns, status_code, "
+    "status_message, service_name, scope_name, scope_version, attributes, resource, events, "
+    "links, operation, provider, request_model, response_model, input_tokens, output_tokens, "
+    "cache_read_tokens, cache_write_tokens, reasoning_tokens, cost_usd, finish_reasons, "
+    "tool_name, agent_name, conversation_id, error_type, is_model_call, counts_toward_totals, "
+    "received_ns"
+)
+_PLACEHOLDERS = ", ".join("?" for _ in _COLUMNS.split(","))
+
+
+@dataclass(frozen=True, slots=True)
+class TraceSummary:
+    trace_id: str
+    root_name: str
+    service_name: str
+    start_ns: int
+    duration_ns: int
+    span_count: int
+    error_count: int
+    model_calls: int
+    tool_calls: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cost_usd: float | None
+    models: tuple[str, ...]
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoredSpan:
+    span: Span
+    fields: genai.GenAI
+
+
+class Store:
+    """A single-process store. All access is serialized through one lock."""
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        target = ":memory:" if path is None else str(path)
+        if path is not None:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._db = duckdb.connect(target)
+        with self._lock:
+            self._db.execute(_SCHEMA)
+            row = self._db.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()
+            if row is None:
+                self._db.execute("INSERT INTO meta VALUES ('schema', ?)", [str(SCHEMA_VERSION)])
+            elif int(row[0]) != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"database schema {row[0]} is not supported (expected {SCHEMA_VERSION})"
+                )
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
+
+    def insert(self, spans: Iterable[Span], received_ns: int) -> int:
+        """Insert spans; a re-sent span (same trace and span ID) replaces the earlier copy."""
+        rows = [_row(span, received_ns) for span in spans]
+        if not rows:
+            return 0
+        with self._lock:
+            self._db.execute("BEGIN")
+            try:
+                self._db.executemany(
+                    f"INSERT OR REPLACE INTO spans ({_COLUMNS}) VALUES ({_PLACEHOLDERS})", rows
+                )
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        return len(rows)
+
+    def span_count(self) -> int:
+        with self._lock:
+            row = self._db.execute("SELECT count(*) FROM spans").fetchone()
+        return 0 if row is None else int(row[0])
+
+    def services(self) -> list[str]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT DISTINCT service_name FROM spans ORDER BY service_name"
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def traces(
+        self,
+        *,
+        limit: int = 50,
+        before_ns: int | None = None,
+        service: str | None = None,
+        errors_only: bool = False,
+    ) -> list[TraceSummary]:
+        """Most recent traces first, paged by the trace start time."""
+        filters: list[str] = []
+        params: list[Any] = []
+        if service is not None:
+            filters.append("service_name = ?")
+            params.append(service)
+        if before_ns is not None:
+            filters.append("start_ns < ?")
+            params.append(before_ns)
+        if errors_only:
+            filters.append("error_count > 0")
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.append(max(1, min(limit, 500)))
+        query = f"""
+            WITH totals AS (
+                SELECT
+                    trace_id,
+                    min(start_ns) AS start_ns,
+                    max(end_ns) AS end_ns,
+                    count(*) AS span_count,
+                    count(*) FILTER (WHERE status_code = {STATUS_ERROR}) AS error_count,
+                    count(*) FILTER (WHERE is_model_call) AS model_calls,
+                    count(*) FILTER (WHERE operation = 'execute_tool') AS tool_calls,
+                    coalesce(sum(input_tokens) FILTER (WHERE counts_toward_totals), 0) AS input_tokens,
+                    coalesce(sum(output_tokens) FILTER (WHERE counts_toward_totals), 0) AS output_tokens,
+                    coalesce(sum(cache_read_tokens) FILTER (WHERE counts_toward_totals), 0) AS cache_read,
+                    sum(cost_usd) FILTER (WHERE counts_toward_totals) AS cost_usd,
+                    list(DISTINCT coalesce(response_model, request_model) ORDER BY coalesce(response_model, request_model))
+                        FILTER (WHERE is_model_call AND coalesce(response_model, request_model) IS NOT NULL) AS models
+                FROM spans GROUP BY trace_id
+            ),
+            roots AS (
+                SELECT
+                    s.trace_id,
+                    arg_min(s.name, s.start_ns) AS root_name,
+                    arg_min(s.service_name, s.start_ns) AS service_name,
+                    count(*) FILTER (WHERE s.parent_span_id IS NULL) > 0 AS complete
+                FROM spans s
+                LEFT JOIN spans p ON p.trace_id = s.trace_id AND p.span_id = s.parent_span_id
+                WHERE p.span_id IS NULL
+                GROUP BY s.trace_id
+            ),
+            joined AS (
+                SELECT t.*, r.root_name, r.service_name, r.complete
+                FROM totals t JOIN roots r USING (trace_id)
+            )
+            SELECT trace_id, root_name, service_name, start_ns, end_ns - start_ns, span_count,
+                   error_count, model_calls, tool_calls, input_tokens, output_tokens, cache_read,
+                   cost_usd, coalesce(models, []), complete
+            FROM joined {where}
+            ORDER BY start_ns DESC, trace_id
+            LIMIT ?
+        """
+        with self._lock:
+            rows = self._db.execute(query, params).fetchall()
+        return [
+            TraceSummary(
+                trace_id=row[0],
+                root_name=row[1],
+                service_name=row[2],
+                start_ns=int(row[3]),
+                duration_ns=max(0, int(row[4])),
+                span_count=int(row[5]),
+                error_count=int(row[6]),
+                model_calls=int(row[7]),
+                tool_calls=int(row[8]),
+                input_tokens=int(row[9]),
+                output_tokens=int(row[10]),
+                cache_read_tokens=int(row[11]),
+                cost_usd=None if row[12] is None else float(row[12]),
+                models=tuple(row[13]),
+                complete=bool(row[14]),
+            )
+            for row in rows
+        ]
+
+    def trace(self, trace_id: str) -> list[StoredSpan]:
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT {_COLUMNS} FROM spans WHERE trace_id = ? ORDER BY start_ns, span_id",
+                [trace_id.lower()],
+            ).fetchall()
+        return [_stored(row) for row in rows]
+
+
+def _row(span: Span, received_ns: int) -> Sequence[Any]:
+    fields = genai.read(span)
+    return (
+        span.trace_id,
+        span.span_id,
+        span.parent_span_id,
+        span.name,
+        span.kind,
+        span.start_ns,
+        span.end_ns,
+        span.status_code,
+        span.status_message,
+        span.service_name,
+        span.scope_name,
+        span.scope_version,
+        json.dumps(jsonable(span.attributes)),
+        json.dumps(jsonable(span.resource)),
+        json.dumps(
+            [
+                {"name": e.name, "time_ns": e.time_ns, "attributes": jsonable(e.attributes)}
+                for e in span.events
+            ]
+        ),
+        json.dumps(
+            [
+                {"trace_id": k.trace_id, "span_id": k.span_id, "attributes": jsonable(k.attributes)}
+                for k in span.links
+            ]
+        ),
+        fields.operation,
+        fields.provider,
+        fields.request_model,
+        fields.response_model,
+        fields.input_tokens,
+        fields.output_tokens,
+        fields.cache_read_tokens,
+        fields.cache_write_tokens,
+        fields.reasoning_tokens,
+        fields.cost_usd,
+        list(fields.finish_reasons),
+        fields.tool_name,
+        fields.agent_name,
+        fields.conversation_id,
+        fields.error_type,
+        fields.is_model_call,
+        fields.counts_toward_totals,
+        received_ns,
+    )
+
+
+def _stored(row: Sequence[Any]) -> StoredSpan:
+    events: list[dict[str, Any]] = json.loads(row[14])
+    links: list[dict[str, Any]] = json.loads(row[15])
+    attributes: Attributes = json.loads(row[12])
+    span = Span(
+        trace_id=row[0],
+        span_id=row[1],
+        parent_span_id=row[2],
+        name=row[3],
+        kind=int(row[4]),
+        start_ns=int(row[5]),
+        end_ns=int(row[6]),
+        status_code=int(row[7]),
+        status_message=row[8],
+        scope_name=row[10],
+        scope_version=row[11],
+        attributes=attributes,
+        resource=json.loads(row[13]),
+        events=tuple(
+            SpanEvent(name=e["name"], time_ns=int(e["time_ns"]), attributes=e["attributes"])
+            for e in events
+        ),
+        links=tuple(
+            SpanLink(trace_id=k["trace_id"], span_id=k["span_id"], attributes=k["attributes"])
+            for k in links
+        ),
+    )
+    return StoredSpan(span=span, fields=genai.read(span))
