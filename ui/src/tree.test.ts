@@ -57,8 +57,8 @@ describe("layout", () => {
     expect(result.rows[1]!.durationNs).toBe(1);
   });
 
-  it("shows spans with a missing parent as orphan roots", () => {
-    const result = layout([span("a", null, 0, 10), span("b", "missing", 5, 6)]);
+  it("shows spans with a missing parent as orphan roots after the true root", () => {
+    const result = layout([span("a", null, 3, 10), span("b", "missing", 1, 6)]);
     expect(result.rows.map((row) => [row.span.span_id, row.depth, row.orphan])).toEqual([
       ["a", 0, false],
       ["b", 0, true],

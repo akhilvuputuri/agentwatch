@@ -13,8 +13,16 @@ export interface TraceSummary {
   output_tokens: number;
   cache_read_tokens: number;
   cost_usd: number | null;
+  /** Model calls that reported no cost; above zero, cost_usd is a lower bound. */
+  calls_without_cost: number;
   models: string[];
   complete: boolean;
+}
+
+export interface TracePage {
+  traces: TraceSummary[];
+  /** Cursor for the next (older) page, or null when this was the last. */
+  next: string | null;
 }
 
 export interface GenAIFields {
@@ -75,14 +83,13 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   return (await response.json()) as T;
 }
 
-export async function listTraces(query: TraceQuery, signal?: AbortSignal): Promise<TraceSummary[]> {
+export async function listTraces(query: TraceQuery, signal?: AbortSignal): Promise<TracePage> {
   const params = new URLSearchParams();
   if (query.limit !== undefined) params.set("limit", String(query.limit));
   if (query.before) params.set("before", query.before);
   if (query.service) params.set("service", query.service);
   if (query.errors) params.set("errors", "1");
-  const body = await getJson<{ traces: TraceSummary[] }>(`api/traces?${params}`, signal);
-  return body.traces;
+  return getJson<TracePage>(`api/traces?${params}`, signal);
 }
 
 export async function getTrace(traceId: string, signal?: AbortSignal): Promise<SpanRecord[]> {

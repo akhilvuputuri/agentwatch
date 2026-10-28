@@ -8,7 +8,7 @@ from hypothesis import strategies as st
 
 from agentwatch import genai
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, Value
-from agentwatch.store import Store
+from agentwatch.store import Cursor, Store
 
 T1 = "a" * 32
 T2 = "b" * 32
@@ -132,6 +132,7 @@ def test_summary_totals_skip_aggregate_spans() -> None:
         1500,
     )
     assert summary.cost_usd == pytest.approx(0.3)
+    assert summary.calls_without_cost == 0
     assert summary.models == ("m1", "m2")
     assert summary.complete
 
@@ -170,7 +171,7 @@ def test_paging_and_filters() -> None:
     )
     assert [t.trace_id for t in store.traces()] == [T2, T1]
     assert [t.trace_id for t in store.traces(limit=1)] == [T2]
-    assert [t.trace_id for t in store.traces(before_ns=200)] == [T1]
+    assert [t.trace_id for t in store.traces(before=Cursor(200, T2))] == [T1]
     assert [t.trace_id for t in store.traces(service="one")] == [T1]
     assert [t.trace_id for t in store.traces(errors_only=True)] == [T2]
     assert store.services() == ["one", "two"]
@@ -231,11 +232,102 @@ def test_totals_match_a_direct_sum(rows: list[tuple[str | None, int, float | Non
         )
     store.insert(spans, received_ns=1)
     [summary] = store.traces()
+    # Tokens add up over model calls; cost over every span except agent wrappers.
+    model_calls = [row for row in rows if row[0] in ("chat", "embeddings")]
+    assert summary.input_tokens == sum(tokens for _, tokens, _ in model_calls)
     counted = [row for row in rows if row[0] != "invoke_agent"]
-    assert summary.input_tokens == sum(tokens for _, tokens, _ in counted)
     costs = [cost for _, _, cost in counted if cost is not None]
     if costs:
         assert summary.cost_usd == pytest.approx(sum(costs))
     else:
         assert summary.cost_usd is None
     assert summary.model_calls == sum(1 for op, _, _ in rows if op in ("chat", "embeddings"))
+
+
+def test_paging_reaches_every_trace_with_equal_start_times() -> None:
+    store = Store()
+    ids = [f"{n:032x}" for n in range(1, 6)]
+    store.insert([span(trace, "1" * 16, None, 100, 110) for trace in ids], received_ns=1)
+    seen: list[str] = []
+    cursor = None
+    while True:
+        page = store.traces(limit=2, before=cursor)
+        if not page:
+            break
+        seen.extend(t.trace_id for t in page)
+        cursor = page[-1].cursor
+    assert seen == ids
+
+
+def test_true_root_wins_over_an_earlier_orphan() -> None:
+    store = Store()
+    store.insert(
+        [span(T1, "1" * 16, "9" * 16, 1, 5), span(T1, "2" * 16, None, 2, 9)], received_ns=1
+    )
+    [summary] = store.traces()
+    assert summary.root_name == "span 22"
+    assert summary.complete
+
+
+def test_cost_is_marked_partial_when_a_model_call_has_none() -> None:
+    store = Store()
+    root = "1" * 16
+    unpriced = Span(
+        trace_id=T1,
+        span_id="3" * 16,
+        parent_span_id=root,
+        name="chat",
+        start_ns=5,
+        end_ns=6,
+        attributes={genai.OPERATION: "chat"},
+    )
+    store.insert(
+        [span(T1, root, None, 0, 10), chat(T1, "2" * 16, root, 1, tokens=10, cost=0.5), unpriced], 1
+    )
+    [summary] = store.traces()
+    assert summary.cost_usd == pytest.approx(0.5)
+    assert summary.calls_without_cost == 1
+
+
+def test_non_finite_and_oversized_values_are_stored_safely() -> None:
+    store = Store()
+    weird = Span(
+        trace_id=T1,
+        span_id="1" * 16,
+        parent_span_id=None,
+        name="chat",
+        start_ns=0,
+        end_ns=1,
+        attributes={
+            genai.OPERATION: "chat",
+            genai.INPUT_TOKENS: "9" * 40,
+            genai.OUTPUT_TOKENS: 2**63,
+            genai.COST_USD: float("nan"),
+            "ratio": float("inf"),
+        },
+    )
+    store.insert([weird], received_ns=1)
+    [stored] = store.trace(T1)
+    assert stored.span.attributes["ratio"] == "inf"
+    assert stored.fields.input_tokens is None
+    assert stored.fields.output_tokens is None
+    assert stored.fields.cost_usd is None
+
+
+def test_duplicate_spans_in_one_batch_keep_the_last() -> None:
+    store = Store()
+    store.insert([span(T1, "1" * 16, None, 0, 1), span(T1, "1" * 16, None, 0, 7)], received_ns=1)
+    assert store.trace(T1)[0].span.end_ns == 7
+
+
+def test_services_list_root_services() -> None:
+    store = Store()
+    root = "1" * 16
+    store.insert(
+        [
+            span(T1, root, None, 0, 9, service="front"),
+            span(T1, "2" * 16, root, 1, 2, service="back"),
+        ],
+        received_ns=1,
+    )
+    assert store.services() == ["front"]

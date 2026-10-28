@@ -63,7 +63,10 @@ export function layout(spans: SpanRecord[]): Layout {
     });
     for (const child of (children.get(span.span_id) ?? []).sort(byStart)) visit(child, depth + 1);
   };
-  for (const root of roots.sort(byStart)) visit(root, 0);
+  // A span with no parent at all is the trace's root; orphans (parent never received) follow.
+  const rootFirst = (a: SpanRecord, b: SpanRecord) =>
+    Number(a.parent_span_id !== null) - Number(b.parent_span_id !== null) || byStart(a, b);
+  for (const root of roots.sort(rootFirst)) visit(root, 0);
   // Spans caught in a parent cycle have no root; show them flat rather than dropping them.
   for (const span of [...spans].sort(byStart)) visit(span, 0);
   return { rows, startNs: start, totalNs: Number(end - start) };

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -66,9 +67,11 @@ class Span:
 
 
 def jsonable(value: Value) -> Any:
-    """Convert a span value to something `json.dumps` accepts. Bytes become hex."""
+    """Convert a span value to strict JSON. Bytes become hex; NaN and infinities become strings."""
     if isinstance(value, bytes):
         return value.hex()
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
     if isinstance(value, list):
         return [jsonable(item) for item in value]
     if isinstance(value, dict):

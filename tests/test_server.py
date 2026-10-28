@@ -49,7 +49,8 @@ def spans() -> list[Span]:
 
 def client(tmp_path: Path | None = None) -> tuple[TestClient, Store]:
     store = Store()
-    return TestClient(server.create_app(store, ui_dir=tmp_path)), store
+    app = server.create_app(store, ui_dir=tmp_path, allowed_hosts=("testserver",))
+    return TestClient(app), store
 
 
 def test_protobuf_ingest_answers_in_protobuf() -> None:
@@ -108,8 +109,12 @@ def test_read_api() -> None:
     # Absolute timestamps are strings so JavaScript keeps every digit.
     assert listing[0]["start_ns"] == "1761000000123456789"
     assert listing[0]["cost_usd"] == 0.01
-    before = http.get("/api/traces", params={"before": listing[0]["start_ns"]}).json()
-    assert before == {"traces": []}
+    page = http.get("/api/traces", params={"limit": 1}).json()
+    assert page["next"] == f"{listing[0]['start_ns']}:{TRACE}"
+    assert http.get("/api/traces", params={"before": page["next"]}).json() == {
+        "traces": [],
+        "next": None,
+    }
     detail = http.get(f"/api/traces/{TRACE}").json()
     assert [s["span_id"] for s in detail["spans"]] == ["1" * 16, "2" * 16]
     assert detail["spans"][1]["genai"]["input_tokens"] == 50
@@ -123,6 +128,7 @@ def test_read_api_errors() -> None:
     assert http.get("/api/traces/xyz").status_code == 400
     assert http.get(f"/api/traces/{'d' * 32}").status_code == 404
     assert http.get("/api/traces", params={"limit": "many"}).status_code == 400
+    assert http.get("/api/traces", params={"before": "12"}).status_code == 400
 
 
 def test_serves_built_ui(tmp_path: Path) -> None:
@@ -134,3 +140,66 @@ def test_serves_built_ui(tmp_path: Path) -> None:
 def test_without_ui_root_explains() -> None:
     http, _ = client(Path("/nonexistent"))
     assert "no UI" in http.get("/").text
+
+
+def test_partial_success_is_reported() -> None:
+    http, store = client()
+    document = to_otlp_json(encode(spans()))
+    bad = dict(document["resourceSpans"][0]["scopeSpans"][0]["spans"][0])
+    bad["spanId"] = "0" * 16
+    document["resourceSpans"][0]["scopeSpans"][0]["spans"].append(bad)
+    response = http.post("/v1/traces", json=document)
+    assert response.status_code == 200
+    assert response.json()["partialSuccess"]["rejectedSpans"] == "1"
+    assert store.span_count() == 2
+
+
+def test_unsupported_media_type_is_415() -> None:
+    http, _ = client()
+    response = http.post("/v1/traces", content=b"{}", headers={"content-type": "text/plain"})
+    assert response.status_code == 415
+
+
+def test_nan_attribute_does_not_break_the_trace_view() -> None:
+    http, _ = client()
+    document = to_otlp_json(encode(spans()))
+    attributes = document["resourceSpans"][0]["scopeSpans"][0]["spans"][1]["attributes"]
+    attributes.append({"key": "score", "value": {"doubleValue": "NaN"}})
+    assert http.post("/v1/traces", json=document).status_code == 200
+    detail = http.get(f"/api/traces/{TRACE}")
+    assert detail.status_code == 200
+    assert detail.json()["spans"][1]["attributes"]["score"] == "nan"
+
+
+def test_other_host_names_are_refused() -> None:
+    store = Store()
+    http = TestClient(server.create_app(store), base_url="http://127.0.0.1:4318")
+    assert http.get("/healthz").status_code == 200
+    assert http.get("/healthz", headers={"host": "localhost:4318"}).status_code == 200
+    assert http.get("/healthz", headers={"host": "[::1]:4318"}).status_code == 200
+    assert http.get("/api/traces", headers={"host": "evil.example:4318"}).status_code == 403
+    response = http.post(
+        "/v1/traces",
+        content=b"{}",
+        headers={"content-type": "application/json", "origin": "http://evil.example"},
+    )
+    assert response.status_code == 403
+    same = http.post(
+        "/v1/traces",
+        content=b"{}",
+        headers={"content-type": "application/json", "origin": "http://127.0.0.1:4318"},
+    )
+    assert same.status_code == 200
+
+
+def test_any_host_when_allowed() -> None:
+    http = TestClient(server.create_app(Store(), allowed_hosts=("*",)))
+    assert http.get("/healthz", headers={"host": "box.lan"}).status_code == 200
+
+
+def test_host_name_parsing() -> None:
+    assert server.host_name("LocalHost:4318") == "localhost"
+    assert server.host_name("[::1]:4318") == "::1"
+    assert server.host_name("::1") == "::1"
+    assert server.host_name("user@127.0.0.1:80") == "127.0.0.1"
+    assert server.host_name("[broken") == ""

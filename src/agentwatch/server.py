@@ -3,29 +3,45 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import asdict
 from importlib import resources
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
+from google.protobuf import json_format
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceResponse,
 )
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import Headers
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from agentwatch import otlp
 from agentwatch.spans import jsonable
-from agentwatch.store import Store, StoredSpan, TraceSummary
+from agentwatch.store import Cursor, Store, StoredSpan, TraceSummary
 
 # Largest compressed request accepted before decoding.
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
-def create_app(store: Store, *, ui_dir: Path | None = None) -> Starlette:
+
+def create_app(
+    store: Store,
+    *,
+    ui_dir: Path | None = None,
+    allowed_hosts: Sequence[str] = LOOPBACK_HOSTS,
+) -> Starlette:
+    """`allowed_hosts` are the Host header names served; "*" allows any (no rebinding guard)."""
+
     async def ingest(request: Request) -> Response:
         content_type = request.headers.get("content-type", "")
         declared = request.headers.get("content-length")
@@ -36,45 +52,58 @@ def create_app(store: Store, *, ui_dir: Path | None = None) -> Starlette:
             body.extend(chunk)
             if len(body) > MAX_REQUEST_BYTES:
                 return PlainTextResponse("request too large", status_code=413)
+        encoding = request.headers.get("content-encoding")
         try:
-            spans = otlp.decode(bytes(body), content_type, request.headers.get("content-encoding"))
+            decoded = await run_in_threadpool(otlp.decode, bytes(body), content_type, encoding)
+        except otlp.UnsupportedMediaType as error:
+            return PlainTextResponse(str(error), status_code=415)
         except otlp.OtlpError as error:
             return PlainTextResponse(str(error), status_code=400)
-        store.insert(spans, time.time_ns())
+        await run_in_threadpool(store.insert, decoded.spans, time.time_ns())
+        response = ExportTraceServiceResponse()
+        if decoded.rejected:
+            response.partial_success.rejected_spans = decoded.rejected
+            response.partial_success.error_message = decoded.error
         if content_type.split(";", 1)[0].strip().lower() == otlp.JSON:
-            return JSONResponse({})
-        return Response(ExportTraceServiceResponse().SerializeToString(), media_type=otlp.PROTOBUF)
+            return JSONResponse(json_format.MessageToDict(response))
+        return Response(response.SerializeToString(), media_type=otlp.PROTOBUF)
 
     async def traces(request: Request) -> Response:
         query = request.query_params
         try:
-            limit = int(query.get("limit", "50"))
+            limit = max(1, min(int(query.get("limit", "50")), 500))
             before = query.get("before")
-            before_ns = None if before in (None, "") else int(before)
+            cursor = None if before in (None, "") else Cursor.decode(before)
         except ValueError:
-            return PlainTextResponse("limit and before must be integers", status_code=400)
-        summaries = store.traces(
+            return PlainTextResponse(
+                "limit must be an integer and before a cursor from `next`", status_code=400
+            )
+        summaries = await run_in_threadpool(
+            store.traces,
             limit=limit,
-            before_ns=before_ns,
+            before=cursor,
             service=query.get("service") or None,
             errors_only=query.get("errors") in ("1", "true"),
         )
-        return JSONResponse({"traces": [_summary_json(summary) for summary in summaries]})
+        following = summaries[-1].cursor.encode() if len(summaries) == limit else None
+        return JSONResponse(
+            {"traces": [_summary_json(summary) for summary in summaries], "next": following}
+        )
 
     async def trace(request: Request) -> Response:
         trace_id = str(request.path_params["trace_id"]).lower()
         if len(trace_id) != 32 or any(c not in "0123456789abcdef" for c in trace_id):
             return PlainTextResponse("trace ID must be 32 hex characters", status_code=400)
-        spans = store.trace(trace_id)
+        spans = await run_in_threadpool(store.trace, trace_id)
         if not spans:
             return PlainTextResponse("trace not found", status_code=404)
         return JSONResponse({"trace_id": trace_id, "spans": [_span_json(s) for s in spans]})
 
     async def services(_: Request) -> Response:
-        return JSONResponse({"services": store.services()})
+        return JSONResponse({"services": await run_in_threadpool(store.services)})
 
     async def health(_: Request) -> Response:
-        return JSONResponse({"ok": True, "spans": store.span_count()})
+        return JSONResponse({"ok": True, "spans": await run_in_threadpool(store.span_count)})
 
     routes: list[Route | Mount] = [
         Route("/v1/traces", ingest, methods=["POST"]),
@@ -88,7 +117,39 @@ def create_app(store: Store, *, ui_dir: Path | None = None) -> Starlette:
         routes.append(Mount("/", StaticFiles(directory=static, html=True), name="ui"))
     else:
         routes.append(Route("/", _no_ui))
-    return Starlette(routes=routes)
+    middleware = [Middleware(HostGuard, allowed=tuple(allowed_hosts))]
+    return Starlette(routes=routes, middleware=middleware)
+
+
+class HostGuard:
+    """Refuse requests for other host names, so a web page cannot reach this local server
+    by DNS rebinding, and cross-origin browser requests to it."""
+
+    def __init__(self, app: ASGIApp, allowed: tuple[str, ...]) -> None:
+        self.app = app
+        self.any = "*" in allowed
+        self.allowed = frozenset(host.lower().strip("[]") for host in allowed)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or self.any:
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        origin = headers.get("origin")
+        if host_name(headers.get("host", "")) not in self.allowed or (
+            origin is not None and host_name(urlsplit(origin).netloc) not in self.allowed
+        ):
+            await PlainTextResponse("host not allowed", status_code=403)(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+def host_name(authority: str) -> str:
+    """The host part of a Host header or URL authority, lowercased, without port or brackets."""
+    authority = authority.strip().lower().rpartition("@")[2]
+    if authority.startswith("["):
+        return authority[1 : authority.find("]")] if "]" in authority else ""
+    return authority.split(":", 1)[0] if authority.count(":") <= 1 else authority
 
 
 async def _no_ui(_: Request) -> Response:

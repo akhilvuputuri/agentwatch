@@ -29,6 +29,13 @@ def main(argv: list[str] | None = None) -> int:
         help="port for OTLP/HTTP and the UI (default: %(default)s)",
     )
     serve.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="also accept requests addressed to this host name (repeatable; '*' for any)",
+    )
+    serve.add_argument(
         "--demo",
         action="store_true",
         help="load the synthetic demo dataset into an in-memory database",
@@ -41,25 +48,29 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "serve":
-        return _serve(args.db, args.host, args.port, args.demo)
+        return _serve(args.db, args.host, args.port, args.demo, args.allow_host)
     return _demo(args.db, args.traces, args.seed)
 
 
-def _serve(db: Path, host: str, port: int, demo: bool) -> int:
+def _serve(db: Path, host: str, port: int, demo: bool, extra_hosts: list[str]) -> int:
     import uvicorn
 
     from agentwatch import demo as dataset
-    from agentwatch.server import create_app
+    from agentwatch.server import LOOPBACK_HOSTS, create_app
     from agentwatch.store import Store
 
     store = Store(None if demo else db)
     if demo:
         now = time.time_ns()
         store.insert(dataset.generate(end_ns=now), now)
-    if host not in ("127.0.0.1", "localhost", "::1"):
+    allowed = [*LOOPBACK_HOSTS, *extra_hosts]
+    if host not in ("0.0.0.0", "::"):
+        allowed.append(host)
+    if host not in LOOPBACK_HOSTS:
         print(
             f"warning: binding to {host}; agentwatch has no authentication, "
-            "so anyone who can reach this port can read and write traces",
+            "so anyone who can reach this port can read and write traces. "
+            "Clients must address it by a name passed with --allow-host",
             file=sys.stderr,
         )
     where = "in-memory demo data" if demo else str(db)
@@ -67,7 +78,9 @@ def _serve(db: Path, host: str, port: int, demo: bool) -> int:
         f"agentwatch on http://{host}:{port} ({where}); OTLP endpoint http://{host}:{port}/v1/traces"
     )
     try:
-        uvicorn.run(create_app(store), host=host, port=port, log_level="warning")
+        uvicorn.run(
+            create_app(store, allowed_hosts=allowed), host=host, port=port, log_level="warning"
+        )
     finally:
         store.close()
     return 0

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 from collections.abc import Iterable, Sequence
@@ -67,6 +68,7 @@ _COLUMNS = (
     "received_ns"
 )
 _PLACEHOLDERS = ", ".join("?" for _ in _COLUMNS.split(","))
+_INSERT_CHUNK = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,14 +86,56 @@ class TraceSummary:
     output_tokens: int
     cache_read_tokens: int
     cost_usd: float | None
+    # Model calls that reported no cost; when above zero, cost_usd is a lower bound.
+    calls_without_cost: int
     models: tuple[str, ...]
     complete: bool
+
+    @property
+    def cursor(self) -> Cursor:
+        return Cursor(self.start_ns, self.trace_id)
+
+
+@dataclass(frozen=True, slots=True)
+class Cursor:
+    """A position in the trace list: traces sort by start time descending, then by ID."""
+
+    start_ns: int
+    trace_id: str
+
+    def encode(self) -> str:
+        return f"{self.start_ns}:{self.trace_id}"
+
+    @staticmethod
+    def decode(value: str) -> Cursor:
+        start, _, trace_id = value.partition(":")
+        if not start.lstrip("-").isdigit() or len(trace_id) != 32:
+            raise ValueError("cursor must be <start_ns>:<trace_id>")
+        int(trace_id, 16)
+        return Cursor(int(start), trace_id.lower())
 
 
 @dataclass(frozen=True, slots=True)
 class StoredSpan:
     span: Span
     fields: genai.GenAI
+
+
+# A trace's root: among spans whose parent is absent from the trace, a span with no parent
+# at all wins over an orphan, then the earliest. `complete` is whether that root has no parent.
+_ROOTS = """
+roots AS (
+    SELECT
+        s.trace_id,
+        arg_min(s.name, (s.parent_span_id IS NOT NULL, s.start_ns, s.span_id)) AS root_name,
+        arg_min(s.service_name, (s.parent_span_id IS NOT NULL, s.start_ns, s.span_id)) AS service_name,
+        bool_or(s.parent_span_id IS NULL) AS complete
+    FROM spans s
+    LEFT JOIN spans p ON p.trace_id = s.trace_id AND p.span_id = s.parent_span_id
+    WHERE p.span_id IS NULL
+    GROUP BY s.trace_id
+)
+"""
 
 
 class Store:
@@ -119,18 +163,27 @@ class Store:
 
     def insert(self, spans: Iterable[Span], received_ns: int) -> int:
         """Insert spans; a re-sent span (same trace and span ID) replaces the earlier copy."""
-        rows = [_row(span, received_ns) for span in spans]
+        latest: dict[tuple[str, str], Span] = {}
+        for span in spans:
+            latest[(span.trace_id, span.span_id)] = span
+        rows = [_row(span, received_ns) for span in latest.values()]
         if not rows:
             return 0
         with self._lock:
             self._db.execute("BEGIN")
             try:
-                self._db.executemany(
-                    f"INSERT OR REPLACE INTO spans ({_COLUMNS}) VALUES ({_PLACEHOLDERS})", rows
-                )
+                # One multi-row statement per chunk is several times faster than executemany.
+                for start in range(0, len(rows), _INSERT_CHUNK):
+                    chunk = rows[start : start + _INSERT_CHUNK]
+                    values = ", ".join(f"({_PLACEHOLDERS})" for _ in chunk)
+                    self._db.execute(
+                        f"INSERT OR REPLACE INTO spans ({_COLUMNS}) VALUES {values}",
+                        [value for row in chunk for value in row],
+                    )
                 self._db.execute("COMMIT")
             except BaseException:
-                self._db.execute("ROLLBACK")
+                with contextlib.suppress(duckdb.Error):
+                    self._db.execute("ROLLBACK")
                 raise
         return len(rows)
 
@@ -140,9 +193,10 @@ class Store:
         return 0 if row is None else int(row[0])
 
     def services(self) -> list[str]:
+        """Services of trace roots, the values the trace list filters on."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT DISTINCT service_name FROM spans ORDER BY service_name"
+                f"WITH {_ROOTS} SELECT DISTINCT service_name FROM roots ORDER BY service_name"
             ).fetchall()
         return [str(row[0]) for row in rows]
 
@@ -150,25 +204,27 @@ class Store:
         self,
         *,
         limit: int = 50,
-        before_ns: int | None = None,
+        before: Cursor | None = None,
         service: str | None = None,
         errors_only: bool = False,
     ) -> list[TraceSummary]:
-        """Most recent traces first, paged by the trace start time."""
+        """Most recent traces first. Page with the last trace's `cursor` as `before`."""
         filters: list[str] = []
         params: list[Any] = []
         if service is not None:
             filters.append("service_name = ?")
             params.append(service)
-        if before_ns is not None:
-            filters.append("start_ns < ?")
-            params.append(before_ns)
+        if before is not None:
+            # Traces sharing a start time are ordered by ID, so the cursor needs both.
+            filters.append("(start_ns < ? OR (start_ns = ? AND trace_id > ?))")
+            params.extend([before.start_ns, before.start_ns, before.trace_id])
         if errors_only:
             filters.append("error_count > 0")
         where = f"WHERE {' AND '.join(filters)}" if filters else ""
         params.append(max(1, min(limit, 500)))
         query = f"""
-            WITH totals AS (
+            WITH {_ROOTS},
+            totals AS (
                 SELECT
                     trace_id,
                     min(start_ns) AS start_ns,
@@ -177,24 +233,14 @@ class Store:
                     count(*) FILTER (WHERE status_code = {STATUS_ERROR}) AS error_count,
                     count(*) FILTER (WHERE is_model_call) AS model_calls,
                     count(*) FILTER (WHERE operation = 'execute_tool') AS tool_calls,
-                    coalesce(sum(input_tokens) FILTER (WHERE counts_toward_totals), 0) AS input_tokens,
-                    coalesce(sum(output_tokens) FILTER (WHERE counts_toward_totals), 0) AS output_tokens,
-                    coalesce(sum(cache_read_tokens) FILTER (WHERE counts_toward_totals), 0) AS cache_read,
+                    coalesce(sum(input_tokens) FILTER (WHERE is_model_call), 0) AS input_tokens,
+                    coalesce(sum(output_tokens) FILTER (WHERE is_model_call), 0) AS output_tokens,
+                    coalesce(sum(cache_read_tokens) FILTER (WHERE is_model_call), 0) AS cache_read,
                     sum(cost_usd) FILTER (WHERE counts_toward_totals) AS cost_usd,
+                    count(*) FILTER (WHERE is_model_call AND cost_usd IS NULL) AS calls_without_cost,
                     list(DISTINCT coalesce(response_model, request_model) ORDER BY coalesce(response_model, request_model))
                         FILTER (WHERE is_model_call AND coalesce(response_model, request_model) IS NOT NULL) AS models
                 FROM spans GROUP BY trace_id
-            ),
-            roots AS (
-                SELECT
-                    s.trace_id,
-                    arg_min(s.name, s.start_ns) AS root_name,
-                    arg_min(s.service_name, s.start_ns) AS service_name,
-                    count(*) FILTER (WHERE s.parent_span_id IS NULL) > 0 AS complete
-                FROM spans s
-                LEFT JOIN spans p ON p.trace_id = s.trace_id AND p.span_id = s.parent_span_id
-                WHERE p.span_id IS NULL
-                GROUP BY s.trace_id
             ),
             joined AS (
                 SELECT t.*, r.root_name, r.service_name, r.complete
@@ -202,7 +248,7 @@ class Store:
             )
             SELECT trace_id, root_name, service_name, start_ns, end_ns - start_ns, span_count,
                    error_count, model_calls, tool_calls, input_tokens, output_tokens, cache_read,
-                   cost_usd, coalesce(models, []), complete
+                   cost_usd, calls_without_cost, coalesce(models, []), complete
             FROM joined {where}
             ORDER BY start_ns DESC, trace_id
             LIMIT ?
@@ -224,8 +270,9 @@ class Store:
                 output_tokens=int(row[10]),
                 cache_read_tokens=int(row[11]),
                 cost_usd=None if row[12] is None else float(row[12]),
-                models=tuple(row[13]),
-                complete=bool(row[14]),
+                calls_without_cost=int(row[13]),
+                models=tuple(row[14]),
+                complete=bool(row[15]),
             )
             for row in rows
         ]

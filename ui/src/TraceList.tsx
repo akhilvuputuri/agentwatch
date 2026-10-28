@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listServices, listTraces, type TraceSummary } from "./api";
 import { count, duration, share, timestamp, usd } from "./format";
 
@@ -9,7 +9,9 @@ export function TraceList() {
   const [errors, setErrors] = useState(false);
   const [services, setServices] = useState<string[]>([]);
   const [traces, setTraces] = useState<TraceSummary[]>([]);
-  const [more, setMore] = useState(false);
+  const [next, setNext] = useState<string | null>(null);
+  // Aborts a "load older" request when the filters change under it.
+  const older = useRef<AbortController | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [reload, setReload] = useState(0);
@@ -22,11 +24,12 @@ export function TraceList() {
 
   useEffect(() => {
     const controller = new AbortController();
+    older.current?.abort();
     setLoading(true);
     listTraces({ limit: PAGE, service, errors }, controller.signal).then(
       (page) => {
-        setTraces(page);
-        setMore(page.length === PAGE);
+        setTraces(page.traces);
+        setNext(page.next);
         setError(null);
         setLoading(false);
       },
@@ -40,17 +43,23 @@ export function TraceList() {
   }, [service, errors, reload]);
 
   const loadMore = useCallback(() => {
-    const last = traces.at(-1);
-    if (!last) return;
-    listTraces({ limit: PAGE, service, errors, before: last.start_ns }).then(
+    if (!next) return;
+    older.current?.abort();
+    const controller = new AbortController();
+    older.current = controller;
+    listTraces({ limit: PAGE, service, errors, before: next }, controller.signal).then(
       (page) => {
-        const known = new Set(traces.map((t) => t.trace_id));
-        setTraces([...traces, ...page.filter((t) => !known.has(t.trace_id))]);
-        setMore(page.length === PAGE);
+        setTraces((current) => {
+          const known = new Set(current.map((t) => t.trace_id));
+          return [...current, ...page.traces.filter((t) => !known.has(t.trace_id))];
+        });
+        setNext(page.next);
       },
-      (reason: unknown) => setError(String(reason)),
+      (reason: unknown) => {
+        if (!controller.signal.aborted) setError(String(reason));
+      },
     );
-  }, [traces, service, errors]);
+  }, [next, service, errors]);
 
   return (
     <section>
@@ -115,7 +124,17 @@ export function TraceList() {
                   <td className="num">{count(trace.input_tokens)}</td>
                   <td className="num">{share(trace.cache_read_tokens, trace.input_tokens)}</td>
                   <td className="num">{count(trace.output_tokens)}</td>
-                  <td className="num">{usd(trace.cost_usd)}</td>
+                  <td
+                    className="num"
+                    title={
+                      trace.calls_without_cost > 0
+                        ? `${trace.calls_without_cost} model call(s) reported no cost`
+                        : undefined
+                    }
+                  >
+                    {trace.calls_without_cost > 0 && trace.cost_usd !== null ? "≥ " : ""}
+                    {usd(trace.cost_usd)}
+                  </td>
                   <td>
                     {trace.error_count > 0 ? (
                       <span className="badge bad">{trace.error_count} error{trace.error_count > 1 ? "s" : ""}</span>
@@ -130,7 +149,7 @@ export function TraceList() {
           </table>
         </div>
       )}
-      {more && (
+      {next && (
         <button type="button" className="more" onClick={loadMore}>
           Load older traces
         </button>

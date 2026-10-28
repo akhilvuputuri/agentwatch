@@ -7,6 +7,7 @@ attribute, so `agentwatch.usage.cost_usd` is this project's extension.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from agentwatch.spans import Attributes, Span, Value
@@ -73,7 +74,7 @@ class GenAI:
 
     @property
     def counts_toward_totals(self) -> bool:
-        """Leaf spans whose tokens and cost add up to a trace total."""
+        """Spans whose cost adds up to a trace total (tokens count model calls only)."""
         return self.operation not in AGGREGATE_OPERATIONS
 
 
@@ -123,23 +124,28 @@ def _texts(attrs: Attributes, key: str) -> tuple[str, ...]:
     return ()
 
 
+# Counts are stored as signed 64-bit integers; anything larger is not a real count.
+_MAX_COUNT = 2**63 - 1
+
+
 def _count(attrs: Attributes, key: str) -> int | None:
     value = _lookup(attrs, key)
     if isinstance(value, bool):
         return None
+    number: int | None = None
     if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, float) and value.is_integer() and value >= 0:
-        return int(value)
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
-    return None
+        number = value
+    elif (isinstance(value, float) and math.isfinite(value) and value.is_integer()) or (
+        isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 19
+    ):
+        number = int(value)
+    return number if number is not None and 0 <= number <= _MAX_COUNT else None
 
 
 def _money(attrs: Attributes, key: str) -> float | None:
     value = _lookup(attrs, key)
     if isinstance(value, bool):
         return None
-    if isinstance(value, int | float) and value >= 0 and value == value and value != float("inf"):
+    if isinstance(value, int | float) and math.isfinite(value) and 0 <= value < 1e15:
         return float(value)
     return None

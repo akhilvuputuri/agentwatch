@@ -6,7 +6,9 @@ span, stores everything in a local DuckDB file and shows it in a web UI: a trace
 cache share and cost per trace, and a span waterfall for each trace.
 
 It runs on one machine for one person. There is no authentication, so it binds to `127.0.0.1` by
-default.
+default and refuses requests addressed to any other host name, which blocks DNS-rebinding and
+cross-origin browser requests. To reach it from another machine, bind with `--host` and name the
+address clients will use with `--allow-host`.
 
 > Status: early development (phase 1 of the plan in
 > [chief-agent#323](https://github.com/akhilvuputuri/chief-agent/issues/323): tracing in). Cost and
@@ -33,7 +35,7 @@ compressed.
 
 | Attribute | Used for |
 | --- | --- |
-| `gen_ai.operation.name` | `chat`, `text_completion`, `generate_content` and `embeddings` count as model calls; `execute_tool` as tool calls; `invoke_agent` draws an agent span |
+| `gen_ai.operation.name` | `chat`, `completion`, `text_completion`, `generate_content` and `embeddings` count as model calls; `execute_tool` as tool calls; `invoke_agent` draws an agent span |
 | `gen_ai.provider.name` (or legacy `gen_ai.system`) | provider |
 | `gen_ai.request.model`, `gen_ai.response.model` | model |
 | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | tokens (legacy `prompt_tokens`/`completion_tokens` accepted) |
@@ -43,8 +45,9 @@ compressed.
 | `gen_ai.tool.name`, `gen_ai.agent.name` | labels |
 | `agentwatch.usage.cost_usd` | cost in US dollars (the conventions define no cost attribute) |
 
-Trace totals add up tokens and cost from every span except `invoke_agent`, `create_agent` and
-`invoke_workflow`, so an agent span that repeats its children's usage is not counted twice. See
+Trace token totals add up model calls only. Cost adds up every span except `invoke_agent`,
+`create_agent` and `invoke_workflow`, so an agent span that repeats its children's cost is not
+counted twice; when a model call reports no cost, the trace's cost is shown as a lower bound. See
 [docs/design.md](docs/design.md) for the storage model and API.
 
 ## Develop

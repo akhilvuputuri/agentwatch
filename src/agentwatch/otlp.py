@@ -6,6 +6,7 @@ import base64
 import gzip
 import json
 import zlib
+from dataclasses import dataclass
 from typing import Any, cast
 
 from google.protobuf import json_format
@@ -28,13 +29,30 @@ class OtlpError(ValueError):
     """The request body is not a valid OTLP trace export."""
 
 
+class UnsupportedMediaType(OtlpError):
+    """The content type is neither OTLP protobuf nor OTLP JSON."""
+
+
+@dataclass(frozen=True, slots=True)
+class Decoded:
+    """Valid spans, plus how many were rejected and why (OTLP partial success)."""
+
+    spans: list[Span]
+    rejected: int = 0
+    error: str = ""
+
+
+# OTLP timestamps are unsigned 64-bit; storage is signed 64-bit (good until year 2262).
+MAX_TIME_NS = 2**63 - 1
+
+
 def decompress(body: bytes, encoding: str | None) -> bytes:
     encoding = (encoding or "identity").strip().lower()
     if encoding in ("", "identity"):
         data = body
     elif encoding == "gzip":
         try:
-            data = _bounded(zlib.decompressobj(16 + zlib.MAX_WBITS), body)
+            data = _gunzip(body)
         except (OSError, zlib.error, EOFError, gzip.BadGzipFile) as error:
             raise OtlpError(f"invalid gzip body: {error}") from error
     elif encoding == "deflate":
@@ -47,6 +65,25 @@ def decompress(body: bytes, encoding: str | None) -> bytes:
     if len(data) > MAX_BODY_BYTES:
         raise OtlpError("body too large")
     return data
+
+
+def _gunzip(body: bytes) -> bytes:
+    """Decompress every gzip member; a stream may concatenate several."""
+    parts: list[bytes] = []
+    size = 0
+    rest = body
+    while True:
+        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        part: bytes = decoder.decompress(rest, MAX_BODY_BYTES + 1 - size)
+        size += len(part)
+        if size > MAX_BODY_BYTES or decoder.unconsumed_tail:
+            raise OtlpError("body too large")
+        if not decoder.eof:
+            raise OtlpError("compressed body is truncated")
+        parts.append(part)
+        rest = decoder.unused_data
+        if not rest:
+            return b"".join(parts)
 
 
 def _bounded(decoder: Any, body: bytes) -> bytes:
@@ -83,7 +120,7 @@ def parse_request(body: bytes, content_type: str) -> ExportTraceServiceRequest:
         except json_format.ParseError as error:
             raise OtlpError(f"invalid OTLP JSON: {error}") from error
         return request
-    raise OtlpError(f"unsupported content type: {content_type or '(none)'}")
+    raise UnsupportedMediaType(f"unsupported content type: {content_type or '(none)'}")
 
 
 def _hex_ids_to_base64(document: dict[str, Any]) -> dict[str, Any]:
@@ -116,8 +153,11 @@ def _objects(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)]  # pyright: ignore[reportUnknownVariableType]
 
 
-def spans_from_request(request: ExportTraceServiceRequest) -> list[Span]:
+def spans_from_request(request: ExportTraceServiceRequest) -> Decoded:
+    """Convert every valid span. Invalid spans are counted and skipped, not fatal."""
     spans: list[Span] = []
+    rejected = 0
+    first_error = ""
     for resource_spans in request.resource_spans:
         resource = attributes(resource_spans.resource.attributes)
         for scope_spans in resource_spans.scope_spans:
@@ -125,10 +165,11 @@ def spans_from_request(request: ExportTraceServiceRequest) -> list[Span]:
             for span in scope_spans.spans:
                 trace_id = span.trace_id.hex()
                 span_id = span.span_id.hex()
-                if len(trace_id) != 32 or len(span_id) != 16:
-                    raise OtlpError("span has an invalid trace or span ID")
-                if trace_id == "0" * 32 or span_id == "0" * 16:
-                    raise OtlpError("span has an all-zero trace or span ID")
+                problem = _problem(span, trace_id, span_id)
+                if problem:
+                    rejected += 1
+                    first_error = first_error or problem
+                    continue
                 parent = span.parent_span_id.hex() or None
                 if parent == "0" * 16:
                     parent = None
@@ -165,10 +206,27 @@ def spans_from_request(request: ExportTraceServiceRequest) -> list[Span]:
                         ),
                     )
                 )
-    return spans
+    if rejected:
+        return Decoded(spans, rejected, f"{rejected} span(s) rejected; first: {first_error}")
+    return Decoded(spans)
 
 
-def decode(body: bytes, content_type: str, content_encoding: str | None = None) -> list[Span]:
+def _problem(span: Any, trace_id: str, span_id: str) -> str:
+    if len(trace_id) != 32 or len(span_id) != 16:
+        return "invalid trace or span ID length"
+    if trace_id == "0" * 32 or span_id == "0" * 16:
+        return "all-zero trace or span ID"
+    parent = span.parent_span_id.hex()
+    if parent and len(parent) != 16:
+        return "invalid parent span ID length"
+    if span.start_time_unix_nano > MAX_TIME_NS or span.end_time_unix_nano > MAX_TIME_NS:
+        return "timestamp out of range"
+    if any(event.time_unix_nano > MAX_TIME_NS for event in span.events):
+        return "event timestamp out of range"
+    return ""
+
+
+def decode(body: bytes, content_type: str, content_encoding: str | None = None) -> Decoded:
     return spans_from_request(parse_request(decompress(body, content_encoding), content_type))
 
 

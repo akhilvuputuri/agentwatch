@@ -47,12 +47,12 @@ def sample() -> Span:
 
 def test_protobuf_round_trip() -> None:
     body = encode([sample()]).SerializeToString()
-    assert otlp.decode(body, "application/x-protobuf") == [sample()]
+    assert otlp.decode(body, "application/x-protobuf").spans == [sample()]
 
 
 def test_json_with_hex_ids_round_trip() -> None:
     body = json.dumps(to_otlp_json(encode([sample()]))).encode()
-    assert otlp.decode(body, "application/json; charset=utf-8") == [sample()]
+    assert otlp.decode(body, "application/json; charset=utf-8").spans == [sample()]
 
 
 def test_hand_written_otlp_json() -> None:
@@ -90,7 +90,7 @@ def test_hand_written_otlp_json() -> None:
             }
         ]
     }
-    [span] = otlp.decode(json.dumps(body).encode(), "application/json")
+    [span] = otlp.decode(json.dumps(body).encode(), "application/json").spans
     assert span.trace_id == TRACE
     assert span.parent_span_id is None
     assert span.attributes == {"gen_ai.usage.input_tokens": 77, "flag": True}
@@ -103,7 +103,7 @@ def test_hand_written_otlp_json() -> None:
 def test_compressed_bodies(encoding: str) -> None:
     raw = encode([sample()]).SerializeToString()
     body = gzip.compress(raw) if encoding == "gzip" else zlib.compress(raw)
-    assert otlp.decode(body, "application/x-protobuf", encoding) == [sample()]
+    assert otlp.decode(body, "application/x-protobuf", encoding).spans == [sample()]
 
 
 def test_truncated_gzip_is_rejected() -> None:
@@ -121,7 +121,6 @@ def test_decompression_bomb_is_rejected() -> None:
 @pytest.mark.parametrize(
     ("body", "content_type", "message"),
     [
-        (b"{}", "text/plain", "unsupported content type"),
         (b"\xff\xff", "application/x-protobuf", "invalid protobuf"),
         (b"[1]", "application/json", "must be an object"),
         (b"{", "application/json", "invalid JSON"),
@@ -139,16 +138,38 @@ def test_invalid_bodies(body: bytes, content_type: str, message: str) -> None:
         otlp.decode(body, content_type)
 
 
-def test_invalid_ids_are_rejected() -> None:
+def test_invalid_spans_are_rejected_individually() -> None:
     zero = Span(
         trace_id="0" * 32, span_id=SPAN, parent_span_id=None, name="x", start_ns=0, end_ns=0
     )
-    with pytest.raises(otlp.OtlpError, match="all-zero"):
-        otlp.decode(encode([zero]).SerializeToString(), "application/x-protobuf")
-    request = encode([sample()])
-    request.resource_spans[0].scope_spans[0].spans[0].span_id = b"\x01"
-    with pytest.raises(otlp.OtlpError, match="invalid trace or span ID"):
-        otlp.decode(request.SerializeToString(), "application/x-protobuf")
+    request = encode([zero, sample()])
+    spans = request.resource_spans[0].scope_spans[0].spans
+    short = spans.add()
+    short.CopyFrom(spans[1])
+    short.span_id = b"\x01"
+    late = spans.add()
+    late.CopyFrom(spans[1])
+    late.end_time_unix_nano = 2**63 + 6
+    decoded = otlp.decode(request.SerializeToString(), "application/x-protobuf")
+    assert decoded.spans == [sample()]
+    assert decoded.rejected == 3
+    assert "all-zero" in decoded.error
+
+
+def test_concatenated_gzip_members() -> None:
+    first = encode([sample()]).SerializeToString()
+    other = Span(
+        trace_id=TRACE, span_id=PARENT, parent_span_id=None, name="root", start_ns=1, end_ns=2
+    )
+    # Concatenated protobuf messages merge their repeated fields.
+    body = gzip.compress(first) + gzip.compress(encode([other]).SerializeToString())
+    decoded = otlp.decode(body, "application/x-protobuf", "gzip")
+    assert [span.name for span in decoded.spans] == [sample().name, "root"]
+
+
+def test_unsupported_content_type() -> None:
+    with pytest.raises(otlp.UnsupportedMediaType):
+        otlp.decode(b"{}", "text/plain")
 
 
 def test_unknown_encoding_is_rejected() -> None:
@@ -160,7 +181,7 @@ def test_unknown_encoding_is_rejected() -> None:
 @given(st.lists(span_strategy(), min_size=1, max_size=4))
 def test_protobuf_and_json_decode_identically(spans: list[Span]) -> None:
     request = encode(spans)
-    from_protobuf = otlp.decode(request.SerializeToString(), "application/x-protobuf")
-    from_json = otlp.decode(json.dumps(to_otlp_json(request)).encode(), "application/json")
+    from_protobuf = otlp.decode(request.SerializeToString(), "application/x-protobuf").spans
+    from_json = otlp.decode(json.dumps(to_otlp_json(request)).encode(), "application/json").spans
     assert from_protobuf == from_json
     assert sorted(from_protobuf, key=repr) == sorted(spans, key=repr)
