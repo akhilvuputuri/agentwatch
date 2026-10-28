@@ -331,3 +331,30 @@ def test_services_list_root_services() -> None:
         received_ns=1,
     )
     assert store.services() == ["front"]
+
+
+def test_legacy_model_spans_without_an_operation_count() -> None:
+    store = Store()
+    legacy = Span(
+        trace_id=T1,
+        span_id="1" * 16,
+        parent_span_id=None,
+        name="openai.chat",
+        start_ns=0,
+        end_ns=1,
+        attributes={
+            "gen_ai.system": "openai",
+            "gen_ai.request.model": "m",
+            "gen_ai.usage.prompt_tokens": 100,
+        },
+    )
+    store.insert([legacy], received_ns=1)
+    [summary] = store.traces()
+    assert (summary.model_calls, summary.input_tokens) == (1, 100)
+
+
+def test_cursor_decoding_is_strict() -> None:
+    assert Cursor.decode(f"5:{'A' * 32}") == Cursor(5, "a" * 32)
+    for bad in ("5", f"x:{'a' * 32}", f"5:0x{'a' * 30}", f"5:{'a_' * 16}", "\u0665:" + "a" * 32):
+        with pytest.raises(ValueError, match="cursor"):
+            Cursor.decode(bad)

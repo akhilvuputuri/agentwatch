@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+import duckdb
 from google.protobuf import json_format
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceResponse,
@@ -59,7 +60,11 @@ def create_app(
             return PlainTextResponse(str(error), status_code=415)
         except otlp.OtlpError as error:
             return PlainTextResponse(str(error), status_code=400)
-        await run_in_threadpool(store.insert, decoded.spans, time.time_ns())
+        try:
+            await run_in_threadpool(store.insert, decoded.spans, time.time_ns())
+        except duckdb.Error as error:
+            # A value the decoder let through but the database refused; not worth a retry.
+            return PlainTextResponse(f"could not store spans: {type(error).__name__}", 400)
         response = ExportTraceServiceResponse()
         if decoded.rejected:
             response.partial_success.rejected_spans = decoded.rejected
@@ -137,7 +142,7 @@ class HostGuard:
         headers = Headers(scope=scope)
         origin = headers.get("origin")
         if host_name(headers.get("host", "")) not in self.allowed or (
-            origin is not None and host_name(urlsplit(origin).netloc) not in self.allowed
+            origin is not None and (urlsplit(origin).hostname or "") not in self.allowed
         ):
             await PlainTextResponse("host not allowed", status_code=403)(scope, receive, send)
             return
@@ -145,8 +150,8 @@ class HostGuard:
 
 
 def host_name(authority: str) -> str:
-    """The host part of a Host header or URL authority, lowercased, without port or brackets."""
-    authority = authority.strip().lower().rpartition("@")[2]
+    """The host part of a Host header, lowercased, without port or brackets."""
+    authority = authority.strip().lower()
     if authority.startswith("["):
         return authority[1 : authority.find("]")] if "]" in authority else ""
     return authority.split(":", 1)[0] if authority.count(":") <= 1 else authority

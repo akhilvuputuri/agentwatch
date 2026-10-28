@@ -219,6 +219,9 @@ def _problem(span: Any, trace_id: str, span_id: str) -> str:
     parent = span.parent_span_id.hex()
     if parent and len(parent) != 16:
         return "invalid parent span ID length"
+    # Proto3 enums accept any integer; only the defined kinds and status codes are stored.
+    if not 0 <= span.kind <= 5 or not 0 <= span.status.code <= 2:
+        return "unknown span kind or status code"
     if span.start_time_unix_nano > MAX_TIME_NS or span.end_time_unix_nano > MAX_TIME_NS:
         return "timestamp out of range"
     if any(event.time_unix_nano > MAX_TIME_NS for event in span.events):

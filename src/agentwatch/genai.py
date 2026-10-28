@@ -70,7 +70,12 @@ class GenAI:
 
     @property
     def is_model_call(self) -> bool:
-        return self.operation in MODEL_OPERATIONS
+        if self.operation is not None:
+            return self.operation in MODEL_OPERATIONS
+        # Older instrumentations send a model and usage without an operation name.
+        return self.model is not None and (
+            self.input_tokens is not None or self.output_tokens is not None
+        )
 
     @property
     def counts_toward_totals(self) -> bool:

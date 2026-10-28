@@ -25,6 +25,7 @@ export function TraceList() {
   useEffect(() => {
     const controller = new AbortController();
     older.current?.abort();
+    setNext(null);
     setLoading(true);
     listTraces({ limit: PAGE, service, errors }, controller.signal).then(
       (page) => {

@@ -25,7 +25,8 @@ rebinds its own domain to 127.0.0.1 therefore cannot read or write traces.
 2. Protobuf bodies parse directly. JSON bodies follow OTLP/JSON, which writes trace and span IDs
    as hex; they are rewritten to base64 and then parsed by protobuf's JSON mapping, so both
    encodings share one code path. Unknown JSON fields are ignored, as OTLP requires.
-3. Spans with malformed or all-zero IDs, or timestamps above 2^63-1 ns, are skipped and
+3. Spans with malformed or all-zero IDs, an undefined kind or status code, or timestamps above
+   2^63-1 ns, are skipped and
    reported through OTLP partial success (`rejected_spans`, `error_message`); the rest are stored.
    An all-zero parent ID means no parent.
 
@@ -50,7 +51,8 @@ Trace summaries are computed at query time:
 - tokens sum over model calls; cost sums over spans whose operation is not `invoke_agent`,
   `create_agent` or `invoke_workflow`, and is null when no span reported one;
   `calls_without_cost` counts model calls with no cost, in which case the cost is a lower bound;
-- model calls count `chat`, `text_completion`, `generate_content`, `embeddings` and `completion`.
+- model calls count `chat`, `text_completion`, `generate_content`, `embeddings` and `completion`,
+  plus spans with no operation that name a model and report tokens (older instrumentations).
 
 ## API
 

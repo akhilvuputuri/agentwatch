@@ -109,10 +109,15 @@ class Cursor:
     @staticmethod
     def decode(value: str) -> Cursor:
         start, _, trace_id = value.partition(":")
-        if not start.lstrip("-").isdigit() or len(trace_id) != 32:
+        trace_id = trace_id.lower()
+        if (
+            not start.isascii()
+            or not start.lstrip("-").isdigit()
+            or len(trace_id) != 32
+            or any(c not in "0123456789abcdef" for c in trace_id)
+        ):
             raise ValueError("cursor must be <start_ns>:<trace_id>")
-        int(trace_id, 16)
-        return Cursor(int(start), trace_id.lower())
+        return Cursor(int(start), trace_id)
 
 
 @dataclass(frozen=True, slots=True)

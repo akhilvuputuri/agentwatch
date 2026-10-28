@@ -201,5 +201,16 @@ def test_host_name_parsing() -> None:
     assert server.host_name("LocalHost:4318") == "localhost"
     assert server.host_name("[::1]:4318") == "::1"
     assert server.host_name("::1") == "::1"
-    assert server.host_name("user@127.0.0.1:80") == "127.0.0.1"
+    assert server.host_name("evil.com:80@127.0.0.1") != "127.0.0.1"
     assert server.host_name("[broken") == ""
+
+
+def test_unknown_enum_values_are_rejected_per_span() -> None:
+    http, store = client()
+    document = to_otlp_json(encode(spans()))
+    document["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["kind"] = 1000
+    document["resourceSpans"][0]["scopeSpans"][0]["spans"][1]["status"] = {"code": 300}
+    response = http.post("/v1/traces", json=document)
+    assert response.status_code == 200
+    assert response.json()["partialSuccess"]["rejectedSpans"] == "2"
+    assert store.span_count() == 0
