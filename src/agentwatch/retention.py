@@ -24,8 +24,8 @@ class Retention:
         *,
         clock: Callable[[], int] = time.time_ns,
     ) -> None:
-        if days < 1:
-            raise ValueError("retention must be at least one day")
+        if not 1 <= days <= 36500:
+            raise ValueError("retention must be from one day to 100 years")
         self.store = store
         self.days = days
         self.clock = clock
@@ -54,8 +54,14 @@ class Retention:
         self._thread = threading.Thread(target=loop, name="agentwatch-retention", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout_s: float = 5) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=30)
-            self._thread = None
+            self._thread.join(timeout=timeout_s)
+            if not self._thread.is_alive():
+                self._thread = None
+
+    @property
+    def running(self) -> bool:
+        """Whether the background thread is still working (after stop(): mid-call)."""
+        return self._thread is not None and self._thread.is_alive()

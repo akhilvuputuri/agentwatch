@@ -40,7 +40,8 @@ def score(trace: int, created_ns: int, n: int = 0) -> Score:
 def test_prune_deletes_old_traces_with_their_scores_and_judgements() -> None:
     db = Store()
     old, new, kept_for_run = NOW - 91 * DAY_NS, NOW - DAY_NS, NOW - 200 * DAY_NS
-    db.insert([span(1, old), span(2, new), span(3, kept_for_run)], received_ns=old)
+    for n, at in ((1, old), (2, new), (3, kept_for_run)):
+        db.insert([span(n, at)], received_ns=at)
     db.upsert_scores([score(1, old), score(2, new), score(9, old), score(8, new)])
     with db.transaction() as conn:
         conn.execute(
@@ -72,7 +73,8 @@ def test_a_trace_is_kept_while_any_of_its_spans_is_recent() -> None:
         start_ns=NOW - 1,
         end_ns=NOW,
     )
-    db.insert([span(1, NOW - 100 * DAY_NS), late], received_ns=NOW)
+    db.insert([span(1, NOW - 100 * DAY_NS)], received_ns=NOW - 100 * DAY_NS)
+    db.insert([late], received_ns=NOW)
     assert db.prune(NOW - 90 * DAY_NS) == 0
 
 
@@ -81,14 +83,35 @@ def test_memory_limits(value: str) -> None:
     Store(memory_limit=value).close()
 
 
-@pytest.mark.parametrize("value", ["256", "lots", "1GB'; DROP TABLE spans; --"])
+@pytest.mark.parametrize("value", ["256", "lots", "1GB'; DROP TABLE spans; --", "0MB", "10MB"])
 def test_bad_memory_limits_are_refused(value: str) -> None:
-    with pytest.raises(ValueError, match="memory limit"):
+    with pytest.raises(ValueError, match="memory limit must"):
         Store(memory_limit=value)
 
 
 def test_retention_needs_a_day() -> None:
-    with pytest.raises(ValueError, match="at least one day"):
+    with pytest.raises(ValueError, match="one day to 100 years"):
         Retention(Store(), 0)
     with pytest.raises(SystemExit):
+        cli.main(["serve", "--retain-days", "200000"])
+    with pytest.raises(SystemExit):
         cli.main(["serve", "--retain-days", "0"])
+
+
+def test_age_is_the_arrival_time_not_the_exporters_clock() -> None:
+    db = Store()
+    # Microseconds sent as nanoseconds: the span claims 1970, but it arrived just now.
+    db.insert([span(1, 1_700_000_000_000_000)], received_ns=NOW)
+    assert db.prune(NOW - 90 * DAY_NS) == 0
+
+
+def test_experiment_run_scores_are_kept_even_without_spans() -> None:
+    db = Store()
+    old = NOW - 200 * DAY_NS
+    db.upsert_scores([score(5, old)])
+    with db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO run_items VALUES ('r', 'i', ?, NULL, NULL, 0, 0, 0)", [f"{5:032x}"]
+        )
+    db.prune(NOW - 90 * DAY_NS)
+    assert [row[0] for row in db.query("SELECT id FROM scores")] == ["s5-0"]

@@ -5,8 +5,10 @@
 .ruff_cache
 **/__pycache__
 dist
-*.duckdb
-*.duckdb.wal
+**/*.duckdb
+**/*.duckdb.wal
+.env*
+**/.env*
 src/agentwatch/static
 ui/node_modules
 ui/dist

@@ -64,8 +64,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "serve":
-        if args.retain_days is not None and args.retain_days < 1:
-            parser.error("--retain-days must be at least 1")
+        if args.retain_days is not None and not 1 <= args.retain_days <= 36500:
+            parser.error("--retain-days must be from 1 to 36500")
         return _serve(
             args.db,
             args.host,
@@ -133,10 +133,14 @@ def _serve(
             log_level="warning",
         )
     finally:
-        runner.stop()
+        # Within a container's stop grace period: an in-flight judge call or prune is left
+        # to the daemon threads, and the database is closed only if they have finished
+        # (DuckDB replays its log at the next start otherwise).
+        runner.stop(timeout_s=3)
         if retention is not None:
-            retention.stop()
-        store.close()
+            retention.stop(timeout_s=3)
+        if not runner.running and (retention is None or not retention.running):
+            store.close()
     return 0
 
 

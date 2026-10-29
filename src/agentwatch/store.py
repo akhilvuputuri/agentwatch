@@ -635,17 +635,19 @@ class Store:
                 raise
 
     def prune(self, before_ns: int) -> int:
-        """Deletes traces that ended before `before_ns`, with their scores and judgements.
+        """Deletes traces last received before `before_ns`, with their scores and judgements.
 
-        Traces of experiment runs are kept, since their runs still show them. Scores and
-        judgements older than the cutoff whose trace is gone (or never arrived) go too.
-        Returns the number of traces deleted.
+        Age is the server's own arrival time, not the exporter's span times, so a client with
+        a wrong clock (or microseconds sent as nanoseconds) cannot get a new trace deleted.
+        Traces and scores of experiment runs are kept, since their runs still show them.
+        Scores and judgements older than the cutoff whose trace is gone (or never arrived) go
+        too. Returns the number of traces deleted.
         """
         with self.transaction() as db:
             db.execute(
                 """CREATE OR REPLACE TEMP TABLE pruned AS
                 SELECT trace_id FROM spans GROUP BY trace_id
-                HAVING max(end_ns) < ? AND trace_id NOT IN (SELECT trace_id FROM run_items)""",
+                HAVING max(received_ns) < ? AND trace_id NOT IN (SELECT trace_id FROM run_items)""",
                 [before_ns],
             )
             count = db.execute("SELECT count(*) FROM pruned").fetchone()
@@ -653,7 +655,8 @@ class Store:
             for table in ("scores", "judgements"):
                 db.execute(
                     f"DELETE FROM {table} WHERE created_ns < ? "
-                    "AND trace_id NOT IN (SELECT DISTINCT trace_id FROM spans)",
+                    "AND trace_id NOT IN (SELECT DISTINCT trace_id FROM spans) "
+                    "AND trace_id NOT IN (SELECT trace_id FROM run_items)",
                     [before_ns],
                 )
             db.execute("DROP TABLE pruned")
@@ -1016,8 +1019,12 @@ class Store:
 
 def _memory(value: str) -> str:
     """A DuckDB memory size such as 256MB or 1GiB, checked so it can be inlined in SQL."""
-    if not re.fullmatch(r"\d{1,6}(?:\.\d{1,3})?\s*(?:[KMGT]i?B)", value.strip(), re.IGNORECASE):
+    match = re.fullmatch(r"(\d{1,6}(?:\.\d{1,3})?)\s*([KMGT])(i?)B", value.strip(), re.IGNORECASE)
+    if not match:
         raise ValueError(f"memory limit must look like 256MB or 1GiB, not {value!r}")
+    unit = (1024 if match.group(3) else 1000) ** ("KMGT".index(match.group(2).upper()) + 1)
+    if float(match.group(1)) * unit < 64 * 1000**2:
+        raise ValueError("memory limit must be at least 64MB")
     return value.strip()
 
 
