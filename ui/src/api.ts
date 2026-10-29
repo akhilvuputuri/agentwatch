@@ -19,6 +19,66 @@ export interface TraceSummary {
   complete: boolean;
   session_id: string | null;
   user_id: string | null;
+  scores: ScoreAggregate[];
+}
+
+export interface ScoreAggregate {
+  name: string;
+  data_type: ScoreType;
+  count: number;
+  mean: number | null;
+  label: string | null;
+}
+
+export type ScoreType = "NUMERIC" | "BOOLEAN" | "CATEGORICAL";
+
+export interface Score {
+  id: string;
+  trace_id: string;
+  span_id: string | null;
+  name: string;
+  data_type: ScoreType;
+  value: number | null;
+  label: string | null;
+  source: "API" | "ANNOTATION" | "EVAL";
+  comment: string | null;
+  created_ns: string;
+}
+
+export interface TraceDetail {
+  trace_id: string;
+  session_id: string | null;
+  user_id: string | null;
+  spans: SpanRecord[];
+  scores: Score[];
+}
+
+export interface NewScore {
+  trace_id: string;
+  span_id?: string;
+  name: string;
+  value?: number | boolean;
+  label?: string;
+  comment?: string;
+}
+
+/** Adds a score as a human annotation and returns it as stored. */
+export async function addScore(score: NewScore): Promise<Score> {
+  const response = await fetch("api/scores?source=annotation", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(score),
+  });
+  if (!response.ok) throw new Error(`${response.status} ${(await response.text()).trim()}`);
+  const body = (await response.json()) as { scores: Score[] };
+  return body.scores[0]!;
+}
+
+export async function deleteScore(id: string): Promise<void> {
+  const response = await fetch(`api/scores/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`${response.status} ${(await response.text()).trim()}`);
+  }
 }
 
 export interface TracePage {
@@ -100,9 +160,8 @@ export async function listTraces(query: TraceQuery, signal?: AbortSignal): Promi
   return getJson<TracePage>(`api/traces?${params}`, signal);
 }
 
-export async function getTrace(traceId: string, signal?: AbortSignal): Promise<SpanRecord[]> {
-  const body = await getJson<{ spans: SpanRecord[] }>(`api/traces/${traceId}`, signal);
-  return body.spans;
+export async function getTrace(traceId: string, signal?: AbortSignal): Promise<TraceDetail> {
+  return getJson<TraceDetail>(`api/traces/${traceId}`, signal);
 }
 
 export async function listServices(signal?: AbortSignal): Promise<string[]> {
@@ -188,6 +247,17 @@ export interface SeriesPoint {
   model_p95_ms: number | null;
 }
 
+export interface ScoreRow {
+  name: string;
+  data_type: ScoreType;
+  count: number;
+  mean: number | null;
+  min: number | null;
+  max: number | null;
+  labels: Record<string, number>;
+  sources: Record<string, number>;
+}
+
 export interface Metrics {
   window: { start_ns: string; end_ns: string; bucket_ns: number; service: string | null };
   overview: MetricsOverview;
@@ -195,6 +265,7 @@ export interface Metrics {
   by_tool: ToolRow[];
   by_agent: AgentRow[];
   series: SeriesPoint[];
+  scores: ScoreRow[];
 }
 
 export type MetricsRange = { kind: "last"; hours: number } | { kind: "all" };

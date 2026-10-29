@@ -211,7 +211,7 @@ def test_new_databases_match_migrated_ones(tmp_path: Path) -> None:
     fresh = Store(tmp_path / "fresh.duckdb")
     version_one_database(tmp_path / "old.duckdb")
     upgraded = Store(tmp_path / "old.duckdb")
-    describe = "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'spans' ORDER BY column_name"
+    describe = "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_name IN ('spans', 'scores') ORDER BY table_name, column_name"
     assert fresh.query(describe) == upgraded.query(describe)
 
 

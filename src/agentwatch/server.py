@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Sequence
 from dataclasses import asdict
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import duckdb
 from google.protobuf import json_format
+from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceResponse
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceResponse,
 )
@@ -25,7 +27,8 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from agentwatch import metrics, otlp
+from agentwatch import metrics, otlp, scores
+from agentwatch.scores import Score
 from agentwatch.spans import jsonable
 from agentwatch.store import (
     Cursor,
@@ -41,6 +44,8 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 DAY_NS = 24 * 3600 * 1_000_000_000
+MAX_SCORE_REQUEST_BYTES = 1024 * 1024
+MAX_SCORES_PER_REQUEST = 1000
 # Traces returned with one session.
 SESSION_TRACES = 500
 
@@ -55,17 +60,12 @@ def create_app(
 
     async def ingest(request: Request) -> Response:
         content_type = request.headers.get("content-type", "")
-        declared = request.headers.get("content-length")
-        if declared is not None and declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
+        body = await _read_body(request)
+        if body is None:
             return PlainTextResponse("request too large", status_code=413)
-        body = bytearray()
-        async for chunk in request.stream():
-            body.extend(chunk)
-            if len(body) > MAX_REQUEST_BYTES:
-                return PlainTextResponse("request too large", status_code=413)
         encoding = request.headers.get("content-encoding")
         try:
-            decoded = await run_in_threadpool(otlp.decode, bytes(body), content_type, encoding)
+            decoded = await run_in_threadpool(otlp.decode, body, content_type, encoding)
         except otlp.UnsupportedMediaType as error:
             return PlainTextResponse(str(error), status_code=415)
         except otlp.OtlpError as error:
@@ -82,6 +82,78 @@ def create_app(
         if content_type.split(";", 1)[0].strip().lower() == otlp.JSON:
             return JSONResponse(json_format.MessageToDict(response))
         return Response(response.SerializeToString(), media_type=otlp.PROTOBUF)
+
+    async def ingest_logs(request: Request) -> Response:
+        """OTLP logs: gen_ai.evaluation.result events become scores; other records are ignored."""
+        content_type = request.headers.get("content-type", "")
+        body = await _read_body(request)
+        if body is None:
+            return PlainTextResponse("request too large", status_code=413)
+        encoding = request.headers.get("content-encoding")
+        try:
+            decoded = await run_in_threadpool(otlp.decode_logs, body, content_type, encoding)
+        except otlp.UnsupportedMediaType as error:
+            return PlainTextResponse(str(error), status_code=415)
+        except otlp.OtlpError as error:
+            return PlainTextResponse(str(error), status_code=400)
+        await run_in_threadpool(store.upsert_scores, decoded.scores)
+        response = ExportLogsServiceResponse()
+        if decoded.rejected:
+            response.partial_success.rejected_log_records = decoded.rejected
+            response.partial_success.error_message = decoded.error
+        if content_type.split(";", 1)[0].strip().lower() == otlp.JSON:
+            return JSONResponse(json_format.MessageToDict(response))
+        return Response(response.SerializeToString(), media_type=otlp.PROTOBUF)
+
+    async def post_scores(request: Request) -> Response:
+        """One score object, or {"scores": [...]}; all are validated before any is stored."""
+        # Requiring JSON makes any cross-origin browser request preflight, which this server
+        # never answers, so a page elsewhere cannot submit a form here.
+        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media != otlp.JSON:
+            return PlainTextResponse("send application/json", status_code=415)
+        body = await _read_body(request, MAX_SCORE_REQUEST_BYTES)
+        if body is None:
+            return PlainTextResponse("request too large", status_code=413)
+        try:
+            document = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return PlainTextResponse("body must be JSON", status_code=400)
+        items: Any
+        if isinstance(document, dict) and "scores" in document:
+            items = cast(dict[str, Any], document)["scores"]
+        else:
+            items = [cast(Any, document)]
+        if (
+            not isinstance(items, list)
+            or not 1 <= len(cast(list[Any], items)) <= MAX_SCORES_PER_REQUEST
+        ):
+            return PlainTextResponse(
+                f'send one score or 1 to {MAX_SCORES_PER_REQUEST} under "scores"', status_code=400
+            )
+        source = (
+            scores.ANNOTATION if request.query_params.get("source") == "annotation" else scores.API
+        )
+        try:
+            found = [scores.from_api(item, source=source) for item in cast(list[Any], items)]
+        except scores.ScoreError as error:
+            return PlainTextResponse(str(error), status_code=400)
+        try:
+            await run_in_threadpool(store.upsert_scores, found)
+        except scores.ScoreConflict as error:
+            return PlainTextResponse(str(error), status_code=409)
+        return JSONResponse(
+            {"ids": [score.id for score in found], "scores": [_score_json(s) for s in found]},
+            status_code=201,
+        )
+
+    async def delete_score(request: Request) -> Response:
+        removed = await run_in_threadpool(store.delete_score, str(request.path_params["score_id"]))
+        return (
+            Response(status_code=204)
+            if removed
+            else PlainTextResponse("score not found", status_code=404)
+        )
 
     async def traces(request: Request) -> Response:
         query = request.query_params
@@ -114,7 +186,17 @@ def create_app(
         spans = await run_in_threadpool(store.trace, trace_id)
         if not spans:
             return PlainTextResponse("trace not found", status_code=404)
-        return JSONResponse({"trace_id": trace_id, "spans": [_span_json(s) for s in spans]})
+        found = await run_in_threadpool(store.scores, trace_id)
+        [summary] = await run_in_threadpool(store.traces, limit=1, trace=trace_id)
+        return JSONResponse(
+            {
+                "trace_id": trace_id,
+                "session_id": summary.session_id,
+                "user_id": summary.user_id,
+                "spans": [_span_json(s) for s in spans],
+                "scores": [_score_json(score) for score in found],
+            }
+        )
 
     async def metrics_view(request: Request) -> Response:
         query = request.query_params
@@ -179,6 +261,9 @@ def create_app(
 
     routes: list[Route | Mount] = [
         Route("/v1/traces", ingest, methods=["POST"]),
+        Route("/v1/logs", ingest_logs, methods=["POST"]),
+        Route("/api/scores", post_scores, methods=["POST"]),
+        Route("/api/scores/{score_id}", delete_score, methods=["DELETE"]),
         Route("/api/traces", traces),
         Route("/api/traces/{trace_id}", trace),
         Route("/api/metrics", metrics_view),
@@ -225,12 +310,39 @@ class HostGuard:
             return
         headers = Headers(scope=scope)
         origin = headers.get("origin")
-        if host_name(headers.get("host", "")) not in self.allowed or (
-            origin is not None and (urlsplit(origin).hostname or "") not in self.allowed
+        host = headers.get("host", "")
+        if host_name(host) not in self.allowed or (
+            origin is not None and not _same_origin(origin, host, self.allowed)
         ):
             await PlainTextResponse("host not allowed", status_code=403)(scope, receive, send)
             return
         await self.app(scope, receive, send)
+
+
+def _same_origin(origin: str, host: str, allowed: frozenset[str]) -> bool:
+    """A browser Origin names an allowed host on the same port as the request's Host header.
+
+    Comparing ports keeps a page served from another local port (another dev server, say)
+    from writing here, although both are on localhost.
+    """
+    try:
+        parts = urlsplit(origin)
+        origin_port = parts.port or {"http": 80, "https": 443}.get(parts.scheme)
+    except ValueError:
+        return False
+    if (parts.hostname or "") not in allowed:
+        return False
+    return origin_port == host_port(host, parts.scheme)
+
+
+def host_port(authority: str, scheme: str = "http") -> int | None:
+    """The port of a Host header, or the scheme's default when it has none."""
+    authority = authority.strip()
+    tail = authority.rsplit("]", 1)[-1] if authority.startswith("[") else authority
+    if tail.count(":") == 1:
+        port = tail.rsplit(":", 1)[1]
+        return int(port) if port.isdigit() else None
+    return {"http": 80, "https": 443}.get(scheme)
 
 
 def host_name(authority: str) -> str:
@@ -261,6 +373,26 @@ def _bundled_ui() -> Path | None:
 def _summary_json(summary: TraceSummary) -> dict[str, Any]:
     data = asdict(summary)
     data["start_ns"] = str(summary.start_ns)
+    return data
+
+
+async def _read_body(request: Request, limit: int | None = None) -> bytes | None:
+    """The request body, or None when it is larger than `limit` (default MAX_REQUEST_BYTES)."""
+    limit = MAX_REQUEST_BYTES if limit is None else limit
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > limit:
+        return None
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > limit:
+            return None
+    return bytes(body)
+
+
+def _score_json(score: Score) -> dict[str, Any]:
+    data = asdict(score)
+    data["created_ns"] = str(score.created_ns)
     return data
 
 

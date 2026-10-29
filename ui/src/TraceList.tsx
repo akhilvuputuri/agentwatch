@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { links, listServices, listTraces, type TraceSummary } from "./api";
-import { count, duration, share, timestamp, usd } from "./format";
+import { count, duration, scoreText, share, timestamp, usd } from "./format";
 
 const PAGE = 50;
 
@@ -122,6 +122,7 @@ export function TraceList({ session, user }: { session?: string; user?: string }
                 <th className="num">Cached</th>
                 <th className="num">Output</th>
                 <th className="num">Cost</th>
+                <th>Scores</th>
                 <th>Status</th>
               </tr>
             </thead>
@@ -164,6 +165,15 @@ export function TraceList({ session, user }: { session?: string; user?: string }
                   >
                     {trace.calls_without_cost > 0 && trace.cost_usd !== null ? "≥ " : ""}
                     {usd(trace.cost_usd)}
+                  </td>
+                  <td>
+                    <div className="score-badges">
+                      {trace.scores.map((s) => (
+                        <span key={s.name} className="score-badge" title={`${s.count} score${s.count > 1 ? "s" : ""}`}>
+                          {s.name} {scoreText(s.data_type, s.mean, s.label, s.count)}
+                        </span>
+                      ))}
+                    </div>
                   </td>
                   <td>
                     {trace.error_count > 0 ? (

@@ -105,6 +105,7 @@ def metrics(store: Store, window: Window) -> dict[str, Any]:
         "by_tool": _rows(store, _BY_TOOL, params),
         "by_agent": _rows(store, _BY_AGENT.replace("{depth}", str(MAX_DEPTH)), params),
         "series": _series(store, window, bucket),
+        "scores": _scores(store, params),
     }
 
 
@@ -317,6 +318,28 @@ def _series(store: Store, window: Window, bucket: int) -> list[dict[str, Any]]:
             }
         )
     return series
+
+
+# Scores recorded in the window on traces in scope, by name: how many, the mean, minimum and
+# maximum of numeric and boolean values, and counts of labels and sources.
+_SCORES = f"""
+    WITH {_SCOPE}
+    SELECT name, any_value(data_type) AS data_type, count(*) AS count,
+           avg(value) AS mean, min(value) AS min, max(value) AS max,
+           histogram(label) FILTER (WHERE label IS NOT NULL) AS labels,
+           histogram(source) AS sources
+    FROM scores
+    WHERE created_ns >= ?3 AND created_ns < ?4 AND trace_id IN (SELECT trace_id FROM traces)
+    GROUP BY name
+    ORDER BY count DESC, name
+"""
+
+
+def _scores(store: Store, params: list[Any]) -> list[dict[str, Any]]:
+    rows = _rows(store, _SCORES, params)
+    for row in rows:
+        row["labels"] = row["labels"] or {}
+    return rows
 
 
 def _models(store: Store, params: list[Any]) -> list[dict[str, Any]]:

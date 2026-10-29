@@ -1,20 +1,27 @@
-import { useEffect, useMemo, useState } from "react";
-import { getTrace, links, STATUS_ERROR, type SpanRecord } from "./api";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { getTrace, links, STATUS_ERROR, type Score, type TraceDetail } from "./api";
 import { count, duration, timestamp, usd } from "./format";
+import { ScorePanel } from "./ScorePanel";
 import { layout, type Row } from "./tree";
 
 export function TraceView({ traceId }: { traceId: string }) {
-  const [spans, setSpans] = useState<SpanRecord[] | null>(null);
+  const [detail, setDetail] = useState<TraceDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const spans = detail?.spans ?? null;
+  const setScores = useCallback(
+    (update: (scores: Score[]) => Score[]) =>
+      setDetail((current) => (current ? { ...current, scores: update(current.scores) } : current)),
+    [],
+  );
 
   useEffect(() => {
     const controller = new AbortController();
-    setSpans(null);
+    setDetail(null);
     setError(null);
     getTrace(traceId, controller.signal).then(
       (result) => {
-        setSpans(result);
+        setDetail(result);
         setSelected(null);
       },
       (reason: unknown) => {
@@ -28,11 +35,12 @@ export function TraceView({ traceId }: { traceId: string }) {
   const chosen = view.rows.find((row) => row.span.span_id === selected) ?? view.rows[0];
 
   if (error) return <p className="error">Could not load trace: {error}</p>;
-  if (!spans) return <p className="muted">Loading…</p>;
+  if (!detail || !spans) return <p className="muted">Loading…</p>;
 
   const root = view.rows[0]?.span;
-  const sessionId = spans.find((s) => s.genai.conversation_id)?.genai.conversation_id ?? null;
-  const userId = spans.find((s) => s.genai.user_id)?.genai.user_id ?? null;
+  // The trace's own session and user, chosen as in the trace list (root span first).
+  const sessionId = detail.session_id;
+  const userId = detail.user_id;
   return (
     <section className="trace">
       <p>
@@ -55,6 +63,13 @@ export function TraceView({ traceId }: { traceId: string }) {
           </>
         )}
       </p>
+      <ScorePanel
+        traceId={traceId}
+        spanId={chosen?.span.span_id ?? null}
+        spanName={chosen?.span.name ?? null}
+        scores={detail.scores}
+        onChange={setScores}
+      />
       <div className="split">
         <div className="waterfall" role="tree" aria-label="Span tree">
           {view.rows.map((row) => (

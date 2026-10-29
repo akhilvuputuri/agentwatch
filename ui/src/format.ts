@@ -11,16 +11,11 @@ export function duration(ns: number): string {
   if (ms < 1000) return `${ms.toFixed(ms < 10 ? 1 : 0)} ms`;
   const s = ms / 1000;
   if (s < 60) return `${s.toFixed(s < 10 ? 2 : 1)} s`;
-  if (s < 3600) {
-    const minutes = Math.floor(s / 60);
-    return `${minutes} m ${Math.round(s - minutes * 60)} s`;
-  }
-  if (s < 86400) {
-    const hours = Math.floor(s / 3600);
-    return `${hours} h ${Math.round((s - hours * 3600) / 60)} m`;
-  }
-  const days = Math.floor(s / 86400);
-  return `${days} d ${Math.round((s - days * 86400) / 3600)} h`;
+  // Whole smaller units, rounded down, so a remainder never reads "60 s" or "24 h".
+  const whole = Math.floor(s);
+  if (whole < 3600) return `${Math.floor(whole / 60)} m ${whole % 60} s`;
+  if (whole < 86400) return `${Math.floor(whole / 3600)} h ${Math.floor((whole % 3600) / 60)} m`;
+  return `${Math.floor(whole / 86400)} d ${Math.floor((whole % 86400) / 3600)} h`;
 }
 
 export function count(value: number | null | undefined): string {
@@ -83,4 +78,17 @@ export function usdTick(value: number): string {
 export function msTick(value: number): string {
   if (value === 0) return "0";
   return value < 1000 ? `${Number(value.toPrecision(3))} ms` : `${Number((value / 1000).toPrecision(3))} s`;
+}
+
+/** A score for display: the mean for numbers, yes/no (or a share) for booleans, else the label. */
+export function scoreText(type: "NUMERIC" | "BOOLEAN" | "CATEGORICAL", value: number | null, label: string | null, count = 1): string {
+  if (type === "BOOLEAN" && value !== null) {
+    if (count > 1) return `${Math.round(value * 100)}% yes`;
+    return value >= 0.5 ? "yes" : "no";
+  }
+  if (type === "NUMERIC" && value !== null) {
+    const text = Math.abs(value) >= 100 || Number.isInteger(value) ? String(Math.round(value * 100) / 100) : value.toFixed(2);
+    return label ? `${text} (${label})` : text;
+  }
+  return label ?? "–";
 }
