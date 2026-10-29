@@ -87,6 +87,29 @@ _PLACEHOLDER = re.compile(r"\{(input|output)\}")
 Post = Callable[[str, dict[str, str], bytes, float], Any]
 
 
+@dataclass(frozen=True, slots=True)
+class JudgePolicy:
+    """What this server lets any judge do, set when it starts (`agentwatch serve`), so a
+    caller of the unauthenticated API cannot point a judge at another endpoint to receive a
+    key, or raise its spending. Empty tuples allow any endpoint or key variable."""
+
+    endpoints: tuple[str, ...] = ()
+    key_envs: tuple[str, ...] = ()
+    max_daily: int = 10_000
+
+    def problem(self, judge: Judge) -> str | None:
+        if self.endpoints and judge.base_url not in self.endpoints:
+            return f"this server allows judges to call only {', '.join(self.endpoints)}"
+        if self.key_envs and (judge.api_key_env or "") not in self.key_envs:
+            return f"this server allows judges only the key in {', '.join(self.key_envs)}"
+        if judge.daily_limit > self.max_daily:
+            return f"this server allows at most {self.max_daily} judge calls a day"
+        return None
+
+
+OPEN = JudgePolicy()
+
+
 class JudgeError(ValueError):
     """A judge definition that cannot be stored, with the reason."""
 
@@ -152,7 +175,9 @@ _JUDGEMENT_COLUMNS = (
 # --- Definitions -------------------------------------------------------------------------
 
 
-def create_judge(store: Store, body: Any, *, now_ns: int | None = None) -> Judge:
+def create_judge(
+    store: Store, body: Any, *, now_ns: int | None = None, policy: JudgePolicy = OPEN
+) -> Judge:
     data = _object(body)
     unknown = [key for key in data if key not in (*_FIXED, *_EDITABLE)]
     if unknown:
@@ -167,6 +192,8 @@ def create_judge(store: Store, body: Any, *, now_ns: int | None = None) -> Judge
     created = time.time_ns() if now_ns is None else now_ns
     judge = _validated(defaults | data, judge_id=uuid.uuid4().hex, created_ns=created)
     judge = replace(judge, enabled_ns=created if judge.enabled else None)
+    if problem := policy.problem(judge):
+        raise JudgeError(problem)
     with store.transaction() as db:
         if db.execute("SELECT 1 FROM judges WHERE name = ?", [judge.name]).fetchone():
             raise Conflict(f"a judge named {judge.name!r} already exists")
@@ -192,7 +219,14 @@ _EDITABLE = (
 )
 
 
-def update_judge(store: Store, judge_id: str, body: Any, *, now_ns: int | None = None) -> Judge:
+def update_judge(
+    store: Store,
+    judge_id: str,
+    body: Any,
+    *,
+    now_ns: int | None = None,
+    policy: JudgePolicy = OPEN,
+) -> Judge:
     data = _object(body)
     fixed = [key for key in data if key in _FIXED]
     unknown = [key for key in data if key not in _EDITABLE and key not in _FIXED]
@@ -205,6 +239,8 @@ def update_judge(store: Store, judge_id: str, body: Any, *, now_ns: int | None =
         judge = _validated(
             asdict(current) | data, judge_id=current.id, created_ns=current.created_ns
         )
+        if problem := policy.problem(judge):
+            raise JudgeError(problem)
         if judge.enabled and not current.enabled:
             # Switched on: from now, never the backlog since it was created or last on.
             judge = replace(judge, enabled_ns=time.time_ns() if now_ns is None else now_ns)
@@ -334,6 +370,11 @@ def _sessions_only(value: Any) -> bool:
     return value
 
 
+def judge_endpoint(value: str) -> str:
+    """A policy endpoint, normalised exactly as a judge's base URL is."""
+    return _base_url(value)
+
+
 def _base_url(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise JudgeError("base_url is required, such as https://openrouter.ai/api/v1")
@@ -449,8 +490,11 @@ def ask(
     *,
     post: Post,
     env: Mapping[str, str],
+    policy: JudgePolicy = OPEN,
 ) -> Verdict:
     """One model call for one trace. Raises JudgeError with a reason on any failure."""
+    if problem := policy.problem(judge):
+        raise JudgeError(problem)
     # One pass, so a trace whose input contains "{output}" is not filled in twice.
     question = _PLACEHOLDER.sub(
         lambda m: content[0] if m.group(1) == "input" else content[1], judge.prompt
@@ -565,8 +609,10 @@ class JudgeRunner:
         env: Mapping[str, str] | None = None,
         clock: Callable[[], int] = time.time_ns,
         settle_ns: int = SETTLE_NS,
+        policy: JudgePolicy = OPEN,
     ) -> None:
         self.store = store
+        self.policy = policy
         self.post = post
         self.env: Mapping[str, str] = os.environ if env is None else env
         self.clock = clock
@@ -611,6 +657,10 @@ class JudgeRunner:
         return recorded
 
     def _run_judge(self, judge: Judge) -> int:
+        if problem := self.policy.problem(judge):
+            # Set before this policy, or in the database by hand: never called.
+            self.problems[judge.id] = problem
+            return 0
         if judge.api_key_env and not self.env.get(judge.api_key_env):
             # Traces wait until the key is available, rather than being marked failed.
             self.problems[judge.id] = f"{judge.api_key_env} is not set"
@@ -627,6 +677,9 @@ class JudgeRunner:
                 break
             if not judge.enabled:
                 break
+            if problem := self.policy.problem(judge):
+                self.problems[judge.id] = problem
+                break
             if not sampled(judge.id, trace_id, judge.sample_rate):
                 self._record(judge, trace_id, NOT_SAMPLED)
             elif (content := trace_content(self.store.trace(trace_id))) is None:
@@ -635,7 +688,7 @@ class JudgeRunner:
                 self._record(judge, trace_id, OVER_LIMIT)
             elif self._record(judge, trace_id, PENDING):
                 try:
-                    verdict = ask(judge, content, post=self.post, env=self.env)
+                    verdict = ask(judge, content, post=self.post, env=self.env, policy=self.policy)
                 except JudgeError as error:
                     self._finish(judge, trace_id, detail=str(error))
                 else:

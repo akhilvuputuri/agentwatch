@@ -325,6 +325,8 @@ def create_app(
         await run_in_threadpool(store.upsert_price, price)
         return JSONResponse({"price": _price_json(price)}, status_code=201)
 
+    policy = judge_runner.policy if judge_runner else judges.OPEN
+
     def judge_json(judge: judges.Judge) -> dict[str, Any]:
         return asdict(judge) | {
             "created_ns": str(judge.created_ns),
@@ -342,7 +344,8 @@ def create_app(
         if isinstance(body, Response):
             return body
         return await _judge_call(
-            lambda: {"judge": judge_json(judges.create_judge(store, body))}, status=201
+            lambda: {"judge": judge_json(judges.create_judge(store, body, policy=policy))},
+            status=201,
         )
 
     async def judge_detail(request: Request) -> Response:
@@ -357,7 +360,7 @@ def create_app(
         if isinstance(body, Response):
             return body
         return await _judge_call(
-            lambda: {"judge": judge_json(judges.update_judge(store, judge_id, body))}
+            lambda: {"judge": judge_json(judges.update_judge(store, judge_id, body, policy=policy))}
         )
 
     async def judge_judgements(request: Request) -> Response:
@@ -396,7 +399,7 @@ def create_app(
             if content is None:
                 raise judges.JudgeError("this trace captured no output to judge")
             try:
-                verdict = judges.ask(judge, content, post=post, env=env)
+                verdict = judges.ask(judge, content, post=post, env=env, policy=policy)
             except judges.JudgeError as error:
                 raise ModelFailure(str(error)) from error
             return {"verdict": asdict(verdict)}

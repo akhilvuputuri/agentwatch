@@ -521,3 +521,74 @@ def test_openrouter_is_asked_to_report_cost() -> None:
     trace(db2, 1)
     runner(db2, other).run_once()
     assert "usage" not in other.requests[0][2]
+
+
+POLICY = judges.JudgePolicy(
+    endpoints=("https://models.example/v1",), key_envs=("JUDGE_API_KEY",), max_daily=5
+)
+
+
+@pytest.mark.parametrize(
+    ("fields", "reason"),
+    [
+        ({"base_url": "https://attacker.example/v1"}, "call only"),
+        ({"api_key_env": "OTHER_API_KEY"}, "only the key"),
+        ({"api_key_env": None}, "only the key"),
+        ({"daily_limit": 6}, "at most 5"),
+    ],
+)
+def test_the_server_policy_limits_what_any_judge_may_do(
+    fields: dict[str, Any], reason: str
+) -> None:
+    db = Store()
+    with pytest.raises(judges.JudgeError, match=reason):
+        judges.create_judge(db, JUDGE | fields, now_ns=CREATED, policy=POLICY)
+    judge = judges.create_judge(db, JUDGE, now_ns=CREATED, policy=POLICY)
+    with pytest.raises(judges.JudgeError, match=reason):
+        judges.update_judge(db, judge.id, fields, policy=POLICY)
+
+
+def test_a_judge_outside_the_policy_never_calls_its_endpoint() -> None:
+    db = Store()
+    # Created before the policy existed (or written to the database by hand).
+    judge = make(db, base_url="https://attacker.example/v1")
+    trace(db, 1)
+    model = FakeModel()
+    run = judges.JudgeRunner(
+        db,
+        post=model,
+        env={"JUDGE_API_KEY": "k"},
+        clock=lambda: CREATED + 60 * SECOND,
+        policy=POLICY,
+    )
+    assert run.run_once() == 0
+    assert model.requests == []
+    assert run.problems[judge.id].startswith("this server allows judges to call only")
+    with pytest.raises(judges.JudgeError, match="call only"):
+        judges.ask(
+            judge, ("in", "out", "1" * 16), post=model, env={"JUDGE_API_KEY": "k"}, policy=POLICY
+        )
+    assert model.requests == []
+
+
+def test_the_api_applies_the_runners_policy() -> None:
+    db = Store()
+    model = FakeModel()
+    run = judges.JudgeRunner(db, post=model, env={"JUDGE_API_KEY": "k"}, policy=POLICY)
+    http = TestClient(server.create_app(db, allowed_hosts=("testserver",), judge_runner=run))
+    bad = http.post("/api/judges", json=JUDGE | {"base_url": "https://attacker.example/v1"})
+    assert bad.status_code == 400
+    assert "call only" in bad.text
+    assert http.post("/api/judges", json=JUDGE).status_code == 201
+
+
+def test_serve_refuses_a_pinned_key_without_a_pinned_endpoint() -> None:
+    from agentwatch import cli
+
+    with pytest.raises(SystemExit):
+        cli.main(["serve", "--judge-key-env", "OPENROUTER_API_KEY"])
+    with pytest.raises(SystemExit):
+        cli.main(["serve", "--judge-endpoint", "openrouter.ai/api/v1"])  # no scheme
+    assert (
+        judges.judge_endpoint(" https://openrouter.ai/api/v1/ ") == "https://openrouter.ai/api/v1"
+    )
