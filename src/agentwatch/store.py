@@ -128,12 +128,13 @@ class StoredSpan:
 
 # A trace's root: among spans whose parent is absent from the trace, a span with no parent
 # at all wins over an orphan, then the earliest. `complete` is whether that root has no parent.
-_ROOTS = """
+ROOTS_SQL = """
 roots AS (
     SELECT
         s.trace_id,
         arg_min(s.name, (s.parent_span_id IS NOT NULL, s.start_ns, s.span_id)) AS root_name,
         arg_min(s.service_name, (s.parent_span_id IS NOT NULL, s.start_ns, s.span_id)) AS service_name,
+        arg_min(s.start_ns, (s.parent_span_id IS NOT NULL, s.start_ns, s.span_id)) AS root_start_ns,
         bool_or(s.parent_span_id IS NULL) AS complete
     FROM spans s
     LEFT JOIN spans p ON p.trace_id = s.trace_id AND p.span_id = s.parent_span_id
@@ -192,6 +193,20 @@ class Store:
                 raise
         return len(rows)
 
+    def query(self, sql: str, params: Sequence[Any] = (), *, with_names: bool = False) -> list[Any]:
+        """Run a read query. With `with_names`, rows are dicts keyed by column name."""
+        with self._lock:
+            cursor = self._db.execute(sql, list(params))
+            rows = cursor.fetchall()
+            names = [column[0] for column in cursor.description or []]
+        if with_names:
+            return [dict(zip(names, row, strict=True)) for row in rows]
+        return rows
+
+    def query_one(self, sql: str, params: Sequence[Any] = ()) -> Any:
+        rows = self.query(sql, params)
+        return rows[0] if rows else None
+
     def span_count(self) -> int:
         with self._lock:
             row = self._db.execute("SELECT count(*) FROM spans").fetchone()
@@ -201,7 +216,7 @@ class Store:
         """Services of trace roots, the values the trace list filters on."""
         with self._lock:
             rows = self._db.execute(
-                f"WITH {_ROOTS} SELECT DISTINCT service_name FROM roots ORDER BY service_name"
+                f"WITH {ROOTS_SQL} SELECT DISTINCT service_name FROM roots ORDER BY service_name"
             ).fetchall()
         return [str(row[0]) for row in rows]
 
@@ -228,7 +243,7 @@ class Store:
         where = f"WHERE {' AND '.join(filters)}" if filters else ""
         params.append(max(1, min(limit, 500)))
         query = f"""
-            WITH {_ROOTS},
+            WITH {ROOTS_SQL},
             totals AS (
                 SELECT
                     trace_id,

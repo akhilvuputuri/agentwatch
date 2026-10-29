@@ -44,3 +44,35 @@ export function timestamp(ns: string): string {
     second: "2-digit",
   });
 }
+
+/** A bucket width in words: "minute", "15 minutes", "hour", "6 hours", "day", "week". */
+export function period(ns: number): string {
+  const minutes = Math.round(ns / 6e10);
+  const units: [number, string][] = [
+    [7 * 24 * 60, "week"],
+    [24 * 60, "day"],
+    [60, "hour"],
+    [1, "minute"],
+  ];
+  for (const [size, name] of units) {
+    if (minutes >= size && minutes % size === 0) {
+      const n = minutes / size;
+      return n === 1 ? name : `${n} ${name}s`;
+    }
+  }
+  return duration(ns);
+}
+
+/** Axis money: as few decimals as the step needs. */
+export function usdTick(value: number): string {
+  if (value === 0) return "$0";
+  if (value >= 100) return `$${value.toFixed(0)}`;
+  if (value >= 1) return `$${Number(value.toFixed(2))}`;
+  return `$${Number(value.toPrecision(2))}`;
+}
+
+/** Axis duration from milliseconds: 0, 500 ms, 2.5 s. */
+export function msTick(value: number): string {
+  if (value === 0) return "0";
+  return value < 1000 ? `${Number(value.toPrecision(3))} ms` : `${Number((value / 1000).toPrecision(3))} s`;
+}

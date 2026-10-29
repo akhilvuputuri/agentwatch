@@ -63,7 +63,54 @@ strings, because they exceed JavaScript's exact integer range. Durations are num
   ties ordered by trace ID. The response's `next` is the cursor (`<start_ns>:<trace_id>`) for the
   following page, or null.
 - `GET /api/traces/<trace_id>`: every span, with the extracted `genai` fields.
+- `GET /api/metrics?from=<ns>&to=<ns>&service=<name>` (or `range=all`; the default is the last 24
+  hours): the dashboard's figures, below.
 - `GET /api/services` (root services, the values the list filters on), `GET /healthz`.
+
+## Dashboard metrics
+
+`metrics.py` computes the dashboard's figures for a window and, optionally, a service. The service
+filter selects traces by their root's service, the same rule as the trace list, so a trace's calls
+made by other services are included. Within that, there are two populations:
+
+- **Calls** (model and tool calls, tokens, cost, latency): spans that started in the window.
+- **Traces** (count, duration and cost per trace): traces whose root started in the window, with
+  all of their spans, including any that ran past its end. A trace's root is chosen as in the
+  trace list, so a trace whose root never arrived counts where its earliest orphan started.
+
+The figures are descriptive: counts, sums and interpolated percentiles (`quantile_cont`), with no
+intervals or comparisons; those belong to the statistics engine. Durations are clamped at zero,
+because an exporter can send an end before the start.
+
+- **Overview:** traces; model and tool calls and failures; token sums (model calls only); cost (as
+  for trace totals) and model calls without cost; model-call latency p50/p95; per-trace duration
+  and cost p50/p95 and mean.
+- **By model** (`response_model`, else `request_model`): calls, failures, tokens, cost, latency
+  p50/p95/max, error types and finish reasons. Finish reasons come from a separate query, so a
+  call reporting two reasons is counted once in `calls` and once under each reason. When one model
+  name was served by several providers, the provider shown is any one of them.
+- **By tool:** calls, failures, latency p50/p95/max, error types.
+- **By agent:** `invoke_agent` runs, failures and duration p50/p95, plus the model calls, tool calls
+  and other priced spans each agent made itself. A span belongs to its nearest `invoke_agent`
+  ancestor (a recursive walk up the parents, at most 64 levels), so a parent's figures exclude its
+  child agents'. Spans with no agent ancestor form one row flagged `unowned`, kept apart from any
+  agent of the same name.
+- **Series:** the smallest of 1, 5 or 15 minutes, 1, 3, 6 or 12 hours, a day or a week that gives at
+  most 72 buckets; for windows longer than about 72 weeks, a whole number of weeks. Buckets start
+  on whole multiples of their width since the Unix epoch, so day buckets are UTC days (the UI labels
+  them in UTC) and week buckets start on Thursdays. Empty buckets are returned with zero counts and
+  null cost and latency. Calls count in the bucket where they started, traces in the bucket where
+  their root started.
+
+`range=all` covers the earliest start to the latest start or end of the matching spans (so a span
+with an end before its start is still included), capped at the largest timestamp, or the last day
+when nothing is stored.
+
+The UI shows these as stat tiles, a cost and a model-call bar chart and a p50/p95 latency line
+chart (each with a data table), and the three breakdown tables. The page itself is served with
+`Cache-Control: no-cache` and files under the URL path `assets/` (content-hashed names) as
+immutable, so an upgraded install never keeps loading an old bundle. Hover readouts are hidden from
+screen readers; each chart's data table carries the same values.
 
 ## UI
 
