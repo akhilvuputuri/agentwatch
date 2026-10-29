@@ -370,6 +370,11 @@ def _sessions_only(value: Any) -> bool:
     return value
 
 
+def judge_endpoint(value: str) -> str:
+    """A policy endpoint, normalised exactly as a judge's base URL is."""
+    return _base_url(value)
+
+
 def _base_url(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise JudgeError("base_url is required, such as https://openrouter.ai/api/v1")
@@ -671,6 +676,9 @@ class JudgeRunner:
             except NotFound:
                 break
             if not judge.enabled:
+                break
+            if problem := self.policy.problem(judge):
+                self.problems[judge.id] = problem
                 break
             if not sampled(judge.id, trace_id, judge.sample_rate):
                 self._record(judge, trace_id, NOT_SAMPLED)

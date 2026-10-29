@@ -345,12 +345,14 @@ as traces arrive, not over a dataset.
 
 **Server policy.** The API has no login, so whoever can reach it could otherwise point a judge
 at their own HTTPS server and receive the key it sends, or raise its daily limit to spend it.
-`agentwatch serve --judge-endpoint URL --judge-key-env NAME --judge-max-daily N` (each
-repeatable, the last a cap) restricts every judge to those endpoints, those key variables and
+`agentwatch serve --judge-endpoint URL --judge-key-env NAME --judge-max-daily N` (the first
+two repeatable) restricts every judge to those endpoints, those key variables and
 at most that limit. The policy is checked when a judge is created or changed, before each
 pass (a judge outside it is skipped with its reason as its problem, and never calls), and in
 `ask` itself, so trial calls obey it too. Without the flags, any HTTPS endpoint, any
-`…_API_KEY` variable and up to 10,000 calls a day are allowed.
+`…_API_KEY` variable and up to 10,000 calls a day are allowed. `--judge-key-env` is refused
+without `--judge-endpoint`, since a pinned key could otherwise still be sent anywhere, and
+endpoints are checked and normalised at start-up as judges' base URLs are.
 
 API: `GET/POST /api/judges`, `GET/PATCH/DELETE /api/judges/<id>` (each judge with its last 24
 hours of outcome counts, calls, cost and any problem), `GET /api/judges/<id>/judgements?limit=`,

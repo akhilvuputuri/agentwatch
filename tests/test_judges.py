@@ -580,3 +580,15 @@ def test_the_api_applies_the_runners_policy() -> None:
     assert bad.status_code == 400
     assert "call only" in bad.text
     assert http.post("/api/judges", json=JUDGE).status_code == 201
+
+
+def test_serve_refuses_a_pinned_key_without_a_pinned_endpoint() -> None:
+    from agentwatch import cli
+
+    with pytest.raises(SystemExit):
+        cli.main(["serve", "--judge-key-env", "OPENROUTER_API_KEY"])
+    with pytest.raises(SystemExit):
+        cli.main(["serve", "--judge-endpoint", "openrouter.ai/api/v1"])  # no scheme
+    assert (
+        judges.judge_endpoint(" https://openrouter.ai/api/v1/ ") == "https://openrouter.ai/api/v1"
+    )

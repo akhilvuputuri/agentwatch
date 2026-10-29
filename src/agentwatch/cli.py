@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from agentwatch.judges import JudgePolicy
+from agentwatch.judges import JudgePolicy, judge_endpoint
 
 DEFAULT_DB = Path(
     os.environ.get("AGENTWATCH_DB", Path.home() / ".agentwatch" / "agentwatch.duckdb")
@@ -89,6 +89,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         if not 1 <= args.judge_max_daily <= 10_000:
             parser.error("--judge-max-daily must be from 1 to 10000")
+        if args.judge_key_env and not args.judge_endpoint:
+            # A key pinned without an endpoint could still be sent to any server.
+            parser.error("--judge-key-env needs --judge-endpoint")
+        try:
+            endpoints = tuple(judge_endpoint(u) for u in args.judge_endpoint)
+        except ValueError as error:
+            parser.error(f"--judge-endpoint: {error}")
         if args.retain_days is not None and not 1 <= args.retain_days <= 36500:
             parser.error("--retain-days must be from 1 to 36500")
         return _serve(
@@ -100,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
             retain_days=args.retain_days,
             memory_limit=args.memory_limit,
             judge_policy=JudgePolicy(
-                endpoints=tuple(u.strip().rstrip("/") for u in args.judge_endpoint),
+                endpoints=endpoints,
                 key_envs=tuple(args.judge_key_env),
                 max_daily=args.judge_max_daily,
             ),
