@@ -122,7 +122,8 @@ def test_genai_names_win_and_invalid_values_fall_through() -> None:
     )
     assert fields.operation == "chat"
     assert fields.input_tokens == 9
-    assert fields.request_model == "fallback-model"
+    # OpenInference's llm.model_name names the response model.
+    assert (fields.request_model, fields.model) == (None, "fallback-model")
 
 
 def test_openinference_spans_count_in_trace_totals() -> None:
@@ -212,3 +213,42 @@ def test_new_databases_match_migrated_ones(tmp_path: Path) -> None:
     upgraded = Store(tmp_path / "old.duckdb")
     describe = "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'spans' ORDER BY column_name"
     assert fresh.query(describe) == upgraded.query(describe)
+
+
+def test_rederivation_reads_in_chunks_and_matches_ingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "db.duckdb"
+    db = Store(path)
+    spans = [
+        span(
+            {
+                "openinference.span.kind": "LLM",
+                "llm.model_name": "m",
+                "llm.token_count.prompt": i,
+                # Bytes and NaN change form when stored; both paths must agree.
+                "session.id": bytes([i % 256, 1]),
+                "llm.cost.total": float("nan") if i % 2 else 0.25,
+            },
+            f"{i + 1:016x}",
+        )
+        for i in range(23)
+    ]
+    db.insert(spans, received_ns=1)
+    at_ingest = db.query(
+        "SELECT span_id, conversation_id, input_tokens, cost_usd FROM spans ORDER BY span_id"
+    )
+    db.close()
+    # Force a re-read, a few rows per chunk.
+    raw = duckdb.connect(str(path))
+    raw.execute("UPDATE meta SET value = '0' WHERE key = 'derivation'")
+    raw.execute("UPDATE spans SET conversation_id = NULL, input_tokens = NULL, cost_usd = NULL")
+    raw.close()
+    monkeypatch.setattr(store, "_REDERIVE_CHUNK", 5)
+    reopened = Store(path)
+    after = reopened.query(
+        "SELECT span_id, conversation_id, input_tokens, cost_usd FROM spans ORDER BY span_id"
+    )
+    assert after == at_ingest
+    assert at_ingest[1][1] == "0101"
+    reopened.close()

@@ -47,8 +47,9 @@ DERIVATION_VERSION = 2
 # Other names for each field, in priority order after the GenAI name.
 ALIASES: dict[str, tuple[str, ...]] = {
     PROVIDER: (PROVIDER_LEGACY, "llm.provider", "llm.system"),
-    REQUEST_MODEL: ("llm.request.model_name", "llm.model_name"),
-    RESPONSE_MODEL: ("llm.response.model_name",),
+    REQUEST_MODEL: ("llm.request.model_name",),
+    # OpenInference: llm.model_name equals the response model when that is known.
+    RESPONSE_MODEL: ("llm.response.model_name", "llm.model_name"),
     INPUT_TOKENS: (
         "gen_ai.usage.prompt_tokens",
         "llm.token_count.prompt",
@@ -74,7 +75,9 @@ ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 # OpenInference span kinds as GenAI operation names. Kinds with no GenAI equivalent keep
-# their own name, lowercased, as the conventions allow for custom operations.
+# their own name, lowercased, as the conventions allow for custom operations; such a span is
+# then never treated as a model call, even if it carries a model and tokens. CHAIN spans
+# wrap other spans, so like invoke_workflow they are excluded from cost totals.
 OPENINFERENCE_KINDS: dict[str, str] = {
     "LLM": "chat",
     "EMBEDDING": "embeddings",
@@ -139,6 +142,34 @@ class GenAI:
     def counts_toward_totals(self) -> bool:
         """Spans whose cost adds up to a trace total (tokens count model calls only)."""
         return self.operation not in AGGREGATE_OPERATIONS
+
+
+def attribute_keys() -> tuple[str, ...]:
+    """Every attribute name read() can look at, so callers can fetch only these."""
+    names = [
+        OPERATION,
+        PROVIDER,
+        REQUEST_MODEL,
+        RESPONSE_MODEL,
+        INPUT_TOKENS,
+        OUTPUT_TOKENS,
+        CACHE_READ_TOKENS,
+        CACHE_WRITE_TOKENS,
+        REASONING_TOKENS,
+        COST_USD,
+        FINISH_REASONS,
+        TOOL_NAME,
+        AGENT_NAME,
+        CONVERSATION_ID,
+        ERROR_TYPE,
+        USER_ID,
+        "openinference.span.kind",
+        "llm.request.type",
+        "traceloop.span.kind",
+    ]
+    for key in list(names):
+        names.extend(ALIASES.get(key, ()))
+    return tuple(dict.fromkeys(names))
 
 
 def read(span: Span) -> GenAI:

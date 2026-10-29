@@ -39,13 +39,16 @@ Each field is read from the OpenTelemetry GenAI conventions first, then from
 (Phoenix and its instrumentations), then from OpenLLMetry (Traceloop), so spans from any of the
 three show up the same way.
 
-| Field | GenAI | OpenInference | OpenLLMetry and older names |
+Within a row, names are tried left to right: current GenAI names, then deprecated GenAI names
+(listed in the GenAI column after a semicolon), then OpenInference, then OpenLLMetry.
+
+| Field | GenAI | OpenInference | OpenLLMetry |
 | --- | --- | --- | --- |
 | Operation | `gen_ai.operation.name` | `openinference.span.kind` (`LLM` → chat, `TOOL` → execute_tool, `AGENT` → invoke_agent, `CHAIN` → invoke_workflow, `EMBEDDING`, `RETRIEVER`; others lowercased) | `llm.request.type`, `traceloop.span.kind` |
-| Provider | `gen_ai.provider.name` | `llm.provider`, `llm.system` | `gen_ai.system` |
-| Model | `gen_ai.response.model`, `gen_ai.request.model` | `llm.response.model_name`, `llm.request.model_name`, `llm.model_name` | |
-| Input / output tokens | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | `llm.token_count.prompt`, `llm.token_count.completion` | `gen_ai.usage.prompt_tokens`, `gen_ai.usage.completion_tokens`, `llm.usage.*` |
-| Cache read / write | `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens` | `llm.token_count.prompt_details.cache_read`, `…cache_write` | `gen_ai.usage.cache_creation.input_tokens` |
+| Provider | `gen_ai.provider.name`; `gen_ai.system` | `llm.provider`, `llm.system` | |
+| Model | `gen_ai.response.model`, `gen_ai.request.model` | `llm.response.model_name`, `llm.model_name` (response), `llm.request.model_name` | |
+| Input / output tokens | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`; `gen_ai.usage.prompt_tokens`, `gen_ai.usage.completion_tokens` | `llm.token_count.prompt`, `llm.token_count.completion` | `llm.usage.prompt_tokens`, `llm.usage.completion_tokens` |
+| Cache read / write | `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens`; `gen_ai.usage.cache_creation.input_tokens` | `llm.token_count.prompt_details.cache_read`, `…cache_write` | |
 | Reasoning tokens | `gen_ai.usage.reasoning.output_tokens` | `llm.token_count.completion_details.reasoning` | |
 | Cost (USD) | none in the conventions; `agentwatch.usage.cost_usd` | `llm.cost.total` | |
 | Finish reasons | `gen_ai.response.finish_reasons` | `llm.finish_reason` | |
@@ -54,7 +57,9 @@ three show up the same way.
 | Error | `error.type` | | |
 
 `chat`, `completion`, `text_completion`, `generate_content` and `embeddings` count as model calls,
-as do spans with no operation that name a model and report tokens.
+as do spans with no operation that name a model and report tokens. OpenInference `CHAIN` spans,
+like `invoke_workflow` and `invoke_agent`, wrap other spans, so their cost is not added to trace
+totals; a trace whose only priced span is a chain shows no cost.
 
 Trace token totals add up model calls only. Cost adds up every span except `invoke_agent`,
 `create_agent` and `invoke_workflow`, so an agent span that repeats its children's cost is not

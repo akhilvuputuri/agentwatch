@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import time
@@ -14,6 +15,7 @@ DEFAULT_DB = Path(
 
 
 def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="agentwatch: %(message)s")
     parser = argparse.ArgumentParser(prog="agentwatch", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 

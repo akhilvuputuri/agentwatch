@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
+import tempfile
 import threading
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +90,30 @@ _DERIVED = (
     "counts_toward_totals",
     "user_id",
 )
+_DERIVED_TYPES = {
+    "trace_id": "VARCHAR",
+    "span_id": "VARCHAR",
+    "operation": "VARCHAR",
+    "provider": "VARCHAR",
+    "request_model": "VARCHAR",
+    "response_model": "VARCHAR",
+    "input_tokens": "BIGINT",
+    "output_tokens": "BIGINT",
+    "cache_read_tokens": "BIGINT",
+    "cache_write_tokens": "BIGINT",
+    "reasoning_tokens": "BIGINT",
+    "cost_usd": "DOUBLE",
+    "finish_reasons": "VARCHAR[]",
+    "tool_name": "VARCHAR",
+    "agent_name": "VARCHAR",
+    "conversation_id": "VARCHAR",
+    "error_type": "VARCHAR",
+    "is_model_call": "BOOLEAN",
+    "counts_toward_totals": "BOOLEAN",
+    "user_id": "VARCHAR",
+}
+_REDERIVE_CHUNK = 5000
+log = logging.getLogger("agentwatch")
 
 _COLUMNS = (
     "trace_id, span_id, parent_span_id, name, kind, start_ns, end_ns, status_code, "
@@ -183,6 +209,8 @@ class Store:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._db = duckdb.connect(target)
+        # A library must not draw progress bars on the server's stderr.
+        self._db.execute("SET enable_progress_bar = false")
         with self._lock:
             self._migrate()
             self._rederive()
@@ -218,50 +246,61 @@ class Store:
                 raise
 
     def _rederive(self) -> None:
-        """Re-read every stored span's attributes when the extraction rules have changed."""
+        """Re-read every stored span's attributes when the extraction rules have changed.
+
+        One scan reads only the attribute keys genai.read uses, a chunk at a time, and the new
+        values go to a newline-delimited JSON file that DuckDB loads in one UPDATE. Python's
+        memory stays proportional to a chunk, and full prompts never leave DuckDB.
+        """
         current = str(genai.DERIVATION_VERSION)
-        stored = self._meta("derivation")
-        if stored == current:
+        if self._meta("derivation") == current:
             return
-        rows = self._db.execute("SELECT trace_id, span_id, attributes FROM spans").fetchall()
+        total_row = self._db.execute("SELECT count(*) FROM spans").fetchone()
+        total = 0 if total_row is None else int(total_row[0])
+        if total:
+            log.info("re-reading %d stored spans for extraction rules version %s", total, current)
+        types = ", ".join(f"'{name}': '{kind}'" for name, kind in _DERIVED_TYPES.items())
+        # Only the keys genai.read looks at, so large attributes (full prompts) stay in DuckDB.
+        keys = genai.attribute_keys()
+        paths = "[" + ", ".join("'$.\"" + key + "\"'" for key in keys) + "]"
         assignments = ", ".join(f"{column} = d.{column}" for column in _DERIVED)
-        self._db.execute("BEGIN")
-        try:
-            self._db.execute(
-                "CREATE TEMP TABLE derived AS SELECT trace_id, span_id, "
-                + ", ".join(_DERIVED)
-                + " FROM spans LIMIT 0"
-            )
-            for start in range(0, len(rows), _INSERT_CHUNK):
-                chunk = rows[start : start + _INSERT_CHUNK]
-                values: list[Any] = []
-                for trace_id, span_id, attributes in chunk:
-                    span = Span(
-                        trace_id=trace_id,
-                        span_id=span_id,
-                        parent_span_id=None,
-                        name="",
-                        start_ns=0,
-                        end_ns=0,
-                        attributes=json.loads(attributes),
+        # Only rows whose values change are rewritten; a rule change usually touches few.
+        changed = " OR ".join(f"spans.{column} IS DISTINCT FROM d.{column}" for column in _DERIVED)
+        with tempfile.TemporaryDirectory(prefix="agentwatch-") as folder:
+            path = Path(folder) / "derived.ndjson"
+            with path.open("w", encoding="utf-8") as out:
+                # One scan, fetched a chunk at a time from DuckDB's streaming result.
+                result = self._db.execute(
+                    f"SELECT trace_id, span_id, json_extract(attributes, {paths}) FROM spans"
+                )
+                while rows := result.fetchmany(_REDERIVE_CHUNK):
+                    for trace_id, span_id, extracted in rows:
+                        attributes: Attributes = {
+                            key: json.loads(value)
+                            for key, value in zip(keys, extracted, strict=True)
+                            if value is not None
+                        }
+                        # Only the attributes matter: genai.read looks at nothing else.
+                        span = Span(trace_id, span_id, None, "", 0, 0, attributes=attributes)
+                        values = dict(zip(_DERIVED, _derived(genai.read(span)), strict=True))
+                        out.write(json.dumps({"trace_id": trace_id, "span_id": span_id, **values}))
+                        out.write("\n")
+            self._db.execute("BEGIN")
+            try:
+                if total:
+                    self._db.execute(
+                        f"UPDATE spans SET {assignments} "
+                        f"FROM read_json(?, format = 'newline_delimited', columns = {{{types}}}) d "
+                        "WHERE spans.trace_id = d.trace_id AND spans.span_id = d.span_id "
+                        f"AND ({changed})",
+                        [str(path)],
                     )
-                    values.extend((trace_id, span_id, *_derived(genai.read(span))))
-                marks = "(" + ", ".join("?" for _ in range(len(_DERIVED) + 2)) + ")"
-                self._db.execute(
-                    f"INSERT INTO derived VALUES {', '.join(marks for _ in chunk)}", values
-                )
-            if rows:
-                self._db.execute(
-                    f"UPDATE spans SET {assignments} FROM derived d "
-                    "WHERE spans.trace_id = d.trace_id AND spans.span_id = d.span_id"
-                )
-            self._db.execute("DROP TABLE derived")
-            self._set_meta("derivation", current)
-            self._db.execute("COMMIT")
-        except BaseException:
-            with contextlib.suppress(duckdb.Error):
-                self._db.execute("ROLLBACK")
-            raise
+                self._set_meta("derivation", current)
+                self._db.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(duckdb.Error):
+                    self._db.execute("ROLLBACK")
+                raise
 
     def close(self) -> None:
         with self._lock:
@@ -407,7 +446,10 @@ class Store:
 
 
 def _row(span: Span, received_ns: int) -> Sequence[Any]:
-    fields = genai.read(span)
+    # Read the attributes in the form they are stored (bytes as hex, NaN as "nan"), so a
+    # later re-derivation from storage gives exactly the same values.
+    stored_attributes: Attributes = jsonable(span.attributes)
+    fields = genai.read(replace(span, attributes=stored_attributes))
     return (
         span.trace_id,
         span.span_id,
