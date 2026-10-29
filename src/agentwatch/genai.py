@@ -1,13 +1,22 @@
-"""Read OpenTelemetry GenAI semantic-convention attributes off a span.
+"""Read LLM attributes off a span, whichever convention the instrumentation used.
 
-Names follow open-telemetry/semantic-conventions-genai (development status). Older names that
-instrumentations still emit are accepted as fallbacks. Cost has no standard
-attribute, so `agentwatch.usage.cost_usd` is this project's extension.
+Three conventions are in common use, and each field is read from the first one present:
+
+1. OpenTelemetry GenAI (open-telemetry/semantic-conventions-genai, development status),
+   including names it has since renamed or deprecated;
+2. OpenInference (Arize, used by Phoenix and many instrumentations);
+3. OpenLLMetry (Traceloop), for the names it kept outside the GenAI conventions.
+
+Cost has no GenAI attribute, so `agentwatch.usage.cost_usd` is this project's extension,
+with OpenInference's `llm.cost.total` as a fallback.
+
+DERIVATION_VERSION changes whenever these rules change, so stored spans are re-read.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from agentwatch.spans import Attributes, Span, Value
@@ -30,12 +39,63 @@ AGENT_ID = "gen_ai.agent.id"
 CONVERSATION_ID = "gen_ai.conversation.id"
 ERROR_TYPE = "error.type"
 COST_USD = "agentwatch.usage.cost_usd"
+USER_ID = "user.id"
 
-LEGACY_ALIASES: dict[str, tuple[str, ...]] = {
-    INPUT_TOKENS: ("gen_ai.usage.prompt_tokens",),
-    OUTPUT_TOKENS: ("gen_ai.usage.completion_tokens",),
+# Bump when the rules below change; the store then re-reads every stored span.
+DERIVATION_VERSION = 2
+
+# Other names for each field, in priority order after the GenAI name.
+ALIASES: dict[str, tuple[str, ...]] = {
+    PROVIDER: (PROVIDER_LEGACY, "llm.provider", "llm.system"),
+    REQUEST_MODEL: ("llm.request.model_name",),
+    # OpenInference: llm.model_name equals the response model when that is known.
+    RESPONSE_MODEL: ("llm.response.model_name", "llm.model_name"),
+    INPUT_TOKENS: (
+        "gen_ai.usage.prompt_tokens",
+        "llm.token_count.prompt",
+        "llm.usage.prompt_tokens",
+    ),
+    OUTPUT_TOKENS: (
+        "gen_ai.usage.completion_tokens",
+        "llm.token_count.completion",
+        "llm.usage.completion_tokens",
+    ),
+    CACHE_READ_TOKENS: ("llm.token_count.prompt_details.cache_read",),
     # Renamed in semantic-conventions-genai (changelog 440).
-    CACHE_WRITE_TOKENS: ("gen_ai.usage.cache_creation.input_tokens",),
+    CACHE_WRITE_TOKENS: (
+        "gen_ai.usage.cache_creation.input_tokens",
+        "llm.token_count.prompt_details.cache_write",
+    ),
+    REASONING_TOKENS: ("llm.token_count.completion_details.reasoning",),
+    COST_USD: ("llm.cost.total",),
+    FINISH_REASONS: ("llm.finish_reason",),
+    TOOL_NAME: ("tool.name",),
+    AGENT_NAME: ("agent.name",),
+    CONVERSATION_ID: ("session.id",),
+}
+
+# OpenInference span kinds as GenAI operation names. Kinds with no GenAI equivalent keep
+# their own name, lowercased, as the conventions allow for custom operations; such a span is
+# then never treated as a model call, even if it carries a model and tokens. CHAIN spans
+# wrap other spans, so like invoke_workflow they are excluded from cost totals.
+OPENINFERENCE_KINDS: dict[str, str] = {
+    "LLM": "chat",
+    "EMBEDDING": "embeddings",
+    "TOOL": "execute_tool",
+    "AGENT": "invoke_agent",
+    "CHAIN": "invoke_workflow",
+    "RETRIEVER": "retrieval",
+}
+# OpenLLMetry's span kinds, and its request types for model calls.
+TRACELOOP_KINDS: dict[str, str] = {
+    "workflow": "invoke_workflow",
+    "agent": "invoke_agent",
+    "tool": "execute_tool",
+}
+TRACELOOP_REQUEST_TYPES: dict[str, str] = {
+    "chat": "chat",
+    "completion": "text_completion",
+    "embedding": "embeddings",
 }
 
 # Operations that are one call to a model; tokens and cost are summed over these.
@@ -63,6 +123,7 @@ class GenAI:
     agent_name: str | None
     conversation_id: str | None
     error_type: str | None
+    user_id: str | None = None
 
     @property
     def model(self) -> str | None:
@@ -83,11 +144,39 @@ class GenAI:
         return self.operation not in AGGREGATE_OPERATIONS
 
 
+def attribute_keys() -> tuple[str, ...]:
+    """Every attribute name read() can look at, so callers can fetch only these."""
+    names = [
+        OPERATION,
+        PROVIDER,
+        REQUEST_MODEL,
+        RESPONSE_MODEL,
+        INPUT_TOKENS,
+        OUTPUT_TOKENS,
+        CACHE_READ_TOKENS,
+        CACHE_WRITE_TOKENS,
+        REASONING_TOKENS,
+        COST_USD,
+        FINISH_REASONS,
+        TOOL_NAME,
+        AGENT_NAME,
+        CONVERSATION_ID,
+        ERROR_TYPE,
+        USER_ID,
+        "openinference.span.kind",
+        "llm.request.type",
+        "traceloop.span.kind",
+    ]
+    for key in list(names):
+        names.extend(ALIASES.get(key, ()))
+    return tuple(dict.fromkeys(names))
+
+
 def read(span: Span) -> GenAI:
     attrs = span.attributes
     return GenAI(
-        operation=_text(attrs, OPERATION),
-        provider=_text(attrs, PROVIDER) or _text(attrs, PROVIDER_LEGACY),
+        operation=_operation(attrs),
+        provider=_text(attrs, PROVIDER),
         request_model=_text(attrs, REQUEST_MODEL),
         response_model=_text(attrs, RESPONSE_MODEL),
         input_tokens=_count(attrs, INPUT_TOKENS),
@@ -101,54 +190,86 @@ def read(span: Span) -> GenAI:
         agent_name=_text(attrs, AGENT_NAME),
         conversation_id=_text(attrs, CONVERSATION_ID),
         error_type=_text(attrs, ERROR_TYPE),
+        user_id=_text(attrs, USER_ID),
     )
 
 
-def _lookup(attrs: Attributes, key: str) -> Value:
-    if key in attrs:
-        return attrs[key]
-    for alias in LEGACY_ALIASES.get(key, ()):
-        if alias in attrs:
-            return attrs[alias]
+def _operation(attrs: Attributes) -> str | None:
+    operation = _text(attrs, OPERATION)
+    if operation is not None:
+        return operation
+    kind = attrs.get("openinference.span.kind")
+    if isinstance(kind, str) and kind:
+        return OPENINFERENCE_KINDS.get(kind.upper(), kind.lower())
+    request_type = attrs.get("llm.request.type")
+    if isinstance(request_type, str) and request_type in TRACELOOP_REQUEST_TYPES:
+        return TRACELOOP_REQUEST_TYPES[request_type]
+    traceloop_kind = attrs.get("traceloop.span.kind")
+    if isinstance(traceloop_kind, str):
+        return TRACELOOP_KINDS.get(traceloop_kind)
+    return None
+
+
+def _values(attrs: Attributes, key: str) -> list[Value]:
+    """The value under each name for this field that is present, in priority order."""
+    return [attrs[name] for name in (key, *ALIASES.get(key, ())) if name in attrs]
+
+
+def _first[T](attrs: Attributes, key: str, parse: Callable[[Value], T | None]) -> T | None:
+    for value in _values(attrs, key):
+        parsed = parse(value)
+        if parsed is not None:
+            return parsed
     return None
 
 
 def _text(attrs: Attributes, key: str) -> str | None:
-    value = _lookup(attrs, key)
-    if isinstance(value, str) and value != "":
-        return value
-    return None
+    return _first(attrs, key, _as_text)
 
 
 def _texts(attrs: Attributes, key: str) -> tuple[str, ...]:
-    value = _lookup(attrs, key)
+    return _first(attrs, key, _as_texts) or ()
+
+
+def _count(attrs: Attributes, key: str) -> int | None:
+    return _first(attrs, key, _as_count)
+
+
+def _money(attrs: Attributes, key: str) -> float | None:
+    return _first(attrs, key, _as_money)
+
+
+def _as_text(value: Value) -> str | None:
+    return value if isinstance(value, str) and value != "" else None
+
+
+def _as_texts(value: Value) -> tuple[str, ...] | None:
     if isinstance(value, str):
-        return (value,) if value else ()
+        return (value,) if value else None
     if isinstance(value, list):
-        return tuple(item for item in value if isinstance(item, str) and item)
-    return ()
+        texts = tuple(item for item in value if isinstance(item, str) and item)
+        return texts or None
+    return None
 
 
 # Counts are stored as signed 64-bit integers; anything larger is not a real count.
 _MAX_COUNT = 2**63 - 1
 
 
-def _count(attrs: Attributes, key: str) -> int | None:
-    value = _lookup(attrs, key)
+def _as_count(value: Value) -> int | None:
     if isinstance(value, bool):
         return None
     number: int | None = None
     if isinstance(value, int):
         number = value
-    elif (isinstance(value, float) and math.isfinite(value) and value.is_integer()) or (
-        isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 19
-    ):
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():  # noqa: SIM114
+        number = int(value)
+    elif isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 19:
         number = int(value)
     return number if number is not None and 0 <= number <= _MAX_COUNT else None
 
 
-def _money(attrs: Attributes, key: str) -> float | None:
-    value = _lookup(attrs, key)
+def _as_money(value: Value) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int | float) and math.isfinite(value) and 0 <= value < 1e15:

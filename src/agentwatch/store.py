@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
+import tempfile
 import threading
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +17,10 @@ import duckdb
 from agentwatch import genai
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
+# The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
+# database and an upgraded one end up identical.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL);
 CREATE TABLE IF NOT EXISTS spans (
@@ -59,13 +63,65 @@ CREATE TABLE IF NOT EXISTS spans (
 CREATE INDEX IF NOT EXISTS spans_start ON spans (start_ns);
 """
 
+# Statements that take the schema from version N-1 to N.
+MIGRATIONS: dict[int, tuple[str, ...]] = {
+    2: ("ALTER TABLE spans ADD COLUMN user_id VARCHAR",),
+}
+
+# Columns computed from a span's attributes by genai.read. They are re-read for every stored
+# span when genai.DERIVATION_VERSION changes, so rule changes apply to old data too.
+_DERIVED = (
+    "operation",
+    "provider",
+    "request_model",
+    "response_model",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "cost_usd",
+    "finish_reasons",
+    "tool_name",
+    "agent_name",
+    "conversation_id",
+    "error_type",
+    "is_model_call",
+    "counts_toward_totals",
+    "user_id",
+)
+_DERIVED_TYPES = {
+    "trace_id": "VARCHAR",
+    "span_id": "VARCHAR",
+    "operation": "VARCHAR",
+    "provider": "VARCHAR",
+    "request_model": "VARCHAR",
+    "response_model": "VARCHAR",
+    "input_tokens": "BIGINT",
+    "output_tokens": "BIGINT",
+    "cache_read_tokens": "BIGINT",
+    "cache_write_tokens": "BIGINT",
+    "reasoning_tokens": "BIGINT",
+    "cost_usd": "DOUBLE",
+    "finish_reasons": "VARCHAR[]",
+    "tool_name": "VARCHAR",
+    "agent_name": "VARCHAR",
+    "conversation_id": "VARCHAR",
+    "error_type": "VARCHAR",
+    "is_model_call": "BOOLEAN",
+    "counts_toward_totals": "BOOLEAN",
+    "user_id": "VARCHAR",
+}
+_REDERIVE_CHUNK = 5000
+log = logging.getLogger("agentwatch")
+
 _COLUMNS = (
     "trace_id, span_id, parent_span_id, name, kind, start_ns, end_ns, status_code, "
     "status_message, service_name, scope_name, scope_version, attributes, resource, events, "
     "links, operation, provider, request_model, response_model, input_tokens, output_tokens, "
     "cache_read_tokens, cache_write_tokens, reasoning_tokens, cost_usd, finish_reasons, "
     "tool_name, agent_name, conversation_id, error_type, is_model_call, counts_toward_totals, "
-    "received_ns"
+    "received_ns, user_id"
 )
 _PLACEHOLDERS = ", ".join("?" for _ in _COLUMNS.split(","))
 _INSERT_CHUNK = 200
@@ -153,15 +209,98 @@ class Store:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._db = duckdb.connect(target)
+        # A library must not draw progress bars on the server's stderr.
+        self._db.execute("SET enable_progress_bar = false")
         with self._lock:
-            self._db.execute(_SCHEMA)
-            row = self._db.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()
-            if row is None:
-                self._db.execute("INSERT INTO meta VALUES ('schema', ?)", [str(SCHEMA_VERSION)])
-            elif int(row[0]) != SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"database schema {row[0]} is not supported (expected {SCHEMA_VERSION})"
+            self._migrate()
+            self._rederive()
+
+    def _meta(self, key: str) -> str | None:
+        row = self._db.execute("SELECT value FROM meta WHERE key = ?", [key]).fetchone()
+        return None if row is None else str(row[0])
+
+    def _set_meta(self, key: str, value: str) -> None:
+        self._db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", [key, value])
+
+    def _migrate(self) -> None:
+        self._db.execute(_SCHEMA)
+        stored = self._meta("schema")
+        version = 1 if stored is None else int(stored)
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema {version} is newer than this agentwatch supports "
+                f"({SCHEMA_VERSION}); upgrade agentwatch"
+            )
+        if stored is None:
+            self._set_meta("schema", "1")
+        for target in range(version + 1, SCHEMA_VERSION + 1):
+            self._db.execute("BEGIN")
+            try:
+                for statement in MIGRATIONS[target]:
+                    self._db.execute(statement)
+                self._set_meta("schema", str(target))
+                self._db.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(duckdb.Error):
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def _rederive(self) -> None:
+        """Re-read every stored span's attributes when the extraction rules have changed.
+
+        One scan reads only the attribute keys genai.read uses, a chunk at a time, and the new
+        values go to a newline-delimited JSON file that DuckDB loads in one UPDATE. Python's
+        memory stays proportional to a chunk, and full prompts never leave DuckDB.
+        """
+        current = str(genai.DERIVATION_VERSION)
+        if self._meta("derivation") == current:
+            return
+        total_row = self._db.execute("SELECT count(*) FROM spans").fetchone()
+        total = 0 if total_row is None else int(total_row[0])
+        if total:
+            log.info("re-reading %d stored spans for extraction rules version %s", total, current)
+        types = ", ".join(f"'{name}': '{kind}'" for name, kind in _DERIVED_TYPES.items())
+        # Only the keys genai.read looks at, so large attributes (full prompts) stay in DuckDB.
+        keys = genai.attribute_keys()
+        paths = "[" + ", ".join("'$.\"" + key + "\"'" for key in keys) + "]"
+        assignments = ", ".join(f"{column} = d.{column}" for column in _DERIVED)
+        # Only rows whose values change are rewritten; a rule change usually touches few.
+        changed = " OR ".join(f"spans.{column} IS DISTINCT FROM d.{column}" for column in _DERIVED)
+        with tempfile.TemporaryDirectory(prefix="agentwatch-") as folder:
+            path = Path(folder) / "derived.ndjson"
+            with path.open("w", encoding="utf-8") as out:
+                # One scan, fetched a chunk at a time from DuckDB's streaming result.
+                result = self._db.execute(
+                    f"SELECT trace_id, span_id, json_extract(attributes, {paths}) FROM spans"
                 )
+                while rows := result.fetchmany(_REDERIVE_CHUNK):
+                    for trace_id, span_id, extracted in rows:
+                        attributes: Attributes = {
+                            key: json.loads(value)
+                            for key, value in zip(keys, extracted, strict=True)
+                            if value is not None
+                        }
+                        # Only the attributes matter: genai.read looks at nothing else.
+                        span = Span(trace_id, span_id, None, "", 0, 0, attributes=attributes)
+                        values = dict(zip(_DERIVED, _derived(genai.read(span)), strict=True))
+                        out.write(json.dumps({"trace_id": trace_id, "span_id": span_id, **values}))
+                        out.write("\n")
+            self._db.execute("BEGIN")
+            try:
+                if total:
+                    self._db.execute(
+                        f"UPDATE spans SET {assignments} "
+                        f"FROM read_json(?, format = 'newline_delimited', columns = {{{types}}}) d "
+                        "WHERE spans.trace_id = d.trace_id AND spans.span_id = d.span_id "
+                        f"AND ({changed})",
+                        [str(path)],
+                    )
+                self._set_meta("derivation", current)
+                self._db.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(duckdb.Error):
+                    self._db.execute("ROLLBACK")
+                raise
 
     def close(self) -> None:
         with self._lock:
@@ -307,7 +446,10 @@ class Store:
 
 
 def _row(span: Span, received_ns: int) -> Sequence[Any]:
-    fields = genai.read(span)
+    # Read the attributes in the form they are stored (bytes as hex, NaN as "nan"), so a
+    # later re-derivation from storage gives exactly the same values.
+    stored_attributes: Attributes = jsonable(span.attributes)
+    fields = genai.read(replace(span, attributes=stored_attributes))
     return (
         span.trace_id,
         span.span_id,
@@ -335,6 +477,15 @@ def _row(span: Span, received_ns: int) -> Sequence[Any]:
                 for k in span.links
             ]
         ),
+        *_derived(fields)[:-1],
+        received_ns,
+        fields.user_id,
+    )
+
+
+def _derived(fields: genai.GenAI) -> tuple[Any, ...]:
+    """Values for the _DERIVED columns, in order."""
+    return (
         fields.operation,
         fields.provider,
         fields.request_model,
@@ -352,7 +503,7 @@ def _row(span: Span, received_ns: int) -> Sequence[Any]:
         fields.error_type,
         fields.is_model_call,
         fields.counts_toward_totals,
-        received_ns,
+        fields.user_id,
     )
 
 
