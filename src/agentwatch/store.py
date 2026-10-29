@@ -18,7 +18,7 @@ from agentwatch import genai
 from agentwatch.scores import Score, ScoreConflict, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
 # database and an upgraded one end up identical.
@@ -116,6 +116,28 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             created_ns BIGINT NOT NULL
         )""",
         "CREATE INDEX dataset_items_dataset ON dataset_items (dataset_id)",
+    ),
+    6: (
+        """CREATE TABLE runs (
+            id VARCHAR PRIMARY KEY,
+            dataset_id VARCHAR NOT NULL,
+            name VARCHAR NOT NULL,
+            description VARCHAR,
+            metadata JSON NOT NULL,
+            created_ns BIGINT NOT NULL,
+            UNIQUE (dataset_id, name)
+        )""",
+        """CREATE TABLE run_items (
+            run_id VARCHAR NOT NULL,
+            item_id VARCHAR NOT NULL,
+            trace_id VARCHAR NOT NULL,
+            output JSON,
+            error VARCHAR,
+            start_ns BIGINT NOT NULL,
+            end_ns BIGINT NOT NULL,
+            created_ns BIGINT NOT NULL,
+            PRIMARY KEY (run_id, item_id)
+        )""",
     ),
 }
 REPORTED = "reported"
@@ -529,6 +551,14 @@ class Store:
 
     def insert(self, spans: Iterable[Span], received_ns: int) -> int:
         """Insert spans; a re-sent span (same trace and span ID) replaces the earlier copy."""
+        spans = list(spans)
+        if not spans:
+            return 0
+        with self.transaction():
+            return self.write_spans(spans, received_ns)
+
+    def write_spans(self, spans: Iterable[Span], received_ns: int) -> int:
+        """insert() without its own transaction: call only inside `with store.transaction()`."""
         latest: dict[tuple[str, str], Span] = {}
         for span in spans:
             latest[(span.trace_id, span.span_id)] = span
@@ -536,24 +566,16 @@ class Store:
         if not rows:
             return 0
         event_scores = [score for span in latest.values() for score in from_span_events(span)]
-        with self._lock:
-            self._db.execute("BEGIN")
-            try:
-                # One multi-row statement per chunk is several times faster than executemany.
-                for start in range(0, len(rows), _INSERT_CHUNK):
-                    chunk = rows[start : start + _INSERT_CHUNK]
-                    values = ", ".join(f"({_PLACEHOLDERS})" for _ in chunk)
-                    self._db.execute(
-                        f"INSERT OR REPLACE INTO spans ({_COLUMNS}) VALUES {values}",
-                        [value for row in chunk for value in row],
-                    )
-                self._write_scores(self._without_conflicts(event_scores))
-                self._apply_prices(sorted({span.trace_id for span in latest.values()}))
-                self._db.execute("COMMIT")
-            except BaseException:
-                with contextlib.suppress(duckdb.Error):
-                    self._db.execute("ROLLBACK")
-                raise
+        # One multi-row statement per chunk is several times faster than executemany.
+        for start in range(0, len(rows), _INSERT_CHUNK):
+            chunk = rows[start : start + _INSERT_CHUNK]
+            values = ", ".join(f"({_PLACEHOLDERS})" for _ in chunk)
+            self._db.execute(
+                f"INSERT OR REPLACE INTO spans ({_COLUMNS}) VALUES {values}",
+                [value for row in chunk for value in row],
+            )
+        self._write_scores(self._without_conflicts(event_scores))
+        self._apply_prices(sorted({span.trace_id for span in latest.values()}))
         return len(rows)
 
     def query(self, sql: str, params: Sequence[Any] = (), *, with_names: bool = False) -> list[Any]:
@@ -743,16 +765,13 @@ class Store:
         """
         if not found:
             return 0
-        with self._lock:
-            self._db.execute("BEGIN")
-            try:
-                self._check_conflicts(found)
-                self._write_scores(found)
-                self._db.execute("COMMIT")
-            except BaseException:
-                with contextlib.suppress(duckdb.Error):
-                    self._db.execute("ROLLBACK")
-                raise
+        with self.transaction():
+            return self.write_scores(found)
+
+    def write_scores(self, found: Sequence[Score]) -> int:
+        """upsert_scores() without its own transaction: call only inside `store.transaction()`."""
+        self._check_conflicts(found)
+        self._write_scores(found)
         return len(found)
 
     def _check_conflicts(self, found: Sequence[Score]) -> None:

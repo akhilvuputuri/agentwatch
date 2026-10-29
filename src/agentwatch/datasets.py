@@ -116,12 +116,18 @@ def get_dataset(store: Store, dataset_id: str) -> Dataset:
 
 
 def delete_dataset(store: Store, dataset_id: str) -> None:
+    """Remove a dataset, its items and its experiment runs; their traces and scores stay."""
     with store.transaction() as db:
         if not db.execute(
             "DELETE FROM datasets WHERE id = ? RETURNING id", [dataset_id]
         ).fetchone():
             raise NotFound("dataset not found")
         db.execute("DELETE FROM dataset_items WHERE dataset_id = ?", [dataset_id])
+        db.execute(
+            "DELETE FROM run_items WHERE run_id IN (SELECT id FROM runs WHERE dataset_id = ?)",
+            [dataset_id],
+        )
+        db.execute("DELETE FROM runs WHERE dataset_id = ?", [dataset_id])
 
 
 def add_items(store: Store, dataset_id: str, bodies: list[Any]) -> list[Item]:
@@ -234,12 +240,17 @@ def _captured(attributes: Attributes, names: tuple[str, ...]) -> Any:
         if value is None or value == "":
             continue
         if isinstance(value, str):
+            # Standard JSON only; anything else (including NaN) is kept as the text it was.
             try:
-                return json.loads(value)
-            except json.JSONDecodeError:
+                return json.loads(value, parse_constant=_reject_constant)
+            except (ValueError, RecursionError):
                 return value
         return value
     return None
+
+
+def _reject_constant(token: str) -> Any:
+    raise ValueError(f"{token} is not standard JSON")
 
 
 def _item(dataset_id: str, body: Any, now: int) -> Item:

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Dashboard } from "./Dashboard";
 import { DatasetList, DatasetView } from "./Datasets";
 import { Prices } from "./Prices";
+import { RunView } from "./Runs";
 import { SessionList, SessionView } from "./Sessions";
 import { TraceList } from "./TraceList";
 import { TraceView } from "./TraceView";
@@ -12,6 +13,7 @@ export type Route =
   | { page: "prices" }
   | { page: "datasets" }
   | { page: "dataset"; datasetId: string }
+  | { page: "run"; runId: string }
   | { page: "sessions" }
   | { page: "session"; sessionId: string }
   | { page: "trace"; traceId: string };
@@ -21,6 +23,14 @@ export function route(hash: string): Route {
   if (hash === "#/sessions") return { page: "sessions" };
   if (hash === "#/prices") return { page: "prices" };
   if (hash === "#/datasets") return { page: "datasets" };
+  const run = /^#\/run\/(.+)$/.exec(hash);
+  if (run) {
+    try {
+      return { page: "run", runId: decodeURIComponent(run[1]!) };
+    } catch {
+      return { page: "datasets" };
+    }
+  }
   const dataset = /^#\/dataset\/(.+)$/.exec(hash);
   if (dataset) {
     try {
@@ -64,7 +74,7 @@ export function App() {
       ? current.page
       : current.page === "sessions" || current.page === "session"
         ? "sessions"
-        : current.page === "datasets" || current.page === "dataset"
+        : current.page === "datasets" || current.page === "dataset" || current.page === "run"
           ? "datasets"
           : "traces";
   return (
@@ -100,6 +110,8 @@ export function App() {
           <DatasetList />
         ) : current.page === "dataset" ? (
           <DatasetView datasetId={current.datasetId} />
+        ) : current.page === "run" ? (
+          <RunView runId={current.runId} />
         ) : current.page === "sessions" ? (
           <SessionList />
         ) : current.page === "session" ? (

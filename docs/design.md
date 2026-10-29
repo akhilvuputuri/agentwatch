@@ -127,6 +127,44 @@ on any cross-origin browser request, and standard JSON: the `NaN` and `Infinity`
 would accept are refused with 400, since a stored value that cannot be returned would break every
 listing that includes it. Absurdly deep nesting is a 400 as well.
 
+## Experiment runs
+
+A run (schema version 6) runs a dataset through a task, as Langfuse dataset runs and Braintrust
+experiments do. It belongs to one dataset, has a unique name there, and optional description and
+metadata (model, prompt version, commit). A run item records, for one dataset item, the task's
+output (any standard JSON, up to 512 KiB) or error, its start and end, and the trace that holds it.
+
+- `POST /api/datasets/<id>/runs` creates a run (409 on a repeated name); `GET` lists the dataset's
+  runs with, per run: items, errors, mean latency, cost and tokens over the items' traces, and
+  the mean and count of each score name on those traces.
+- `POST /api/runs/<id>/items` records one run item or `{"items": [...]}` in one transaction, all
+  or none (the run and its dataset are re-checked inside it). Each needs `item_id` (an item of the
+  run's dataset), and may carry `output`, `error`, `start_ns`, `end_ns` (not more than a day in
+  the future), `trace_id` (not shared with another item of the run) and `scores` (as for
+  `/api/scores`, without `trace_id`; stored with source `EVAL`). Recording an item again replaces
+  its earlier result; if that result had a synthetic trace, the trace and its scores are removed,
+  so a re-run is not counted twice anywhere.
+- When `trace_id` is given, the caller traced the task itself and its spans arrive by OTLP.
+  Otherwise the server records a one-span trace for the item (service `agentwatch.experiment`,
+  with the item's input and output as `input.value` and `output.value`), so every result has a
+  trace for its scores and for the trace list.
+- `GET /api/runs/<id>` returns the run and its items with their dataset input and expected
+  output and their scores; `DELETE` removes the run and its run items, keeping their traces and
+  scores as trace data.
+
+`agentwatch.client.run_experiment` is a runner that uses only the standard library: it creates a
+run, calls the task on each active item (in a thread pool), applies evaluators to successful
+outputs, and posts each result. An evaluator receives `(input, output, expected_output)` and
+returns a number, boolean, label, score dict or list of those; its function name names the score.
+A task's exception is the item's error. An evaluator's exception, or a score the server would
+refuse (non-finite, nameless, a name over 200 characters), is reported in `evaluator_errors` and
+skipped; a result the server refuses (say, an output over 512 KiB) is reported in `failed_posts`;
+neither stops the run, and the score means count only accepted scores. An unreachable server or a
+non-JSON reply raises `AgentwatchError` with the URL.
+
+Deleting a dataset also removes its runs and run items; their traces and scores stay as trace
+data.
+
 ## Model prices
 
 When a model call reports tokens but no cost, its cost is calculated from a model price, as with
