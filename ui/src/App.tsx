@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Dashboard } from "./Dashboard";
+import { Prices } from "./Prices";
 import { SessionList, SessionView } from "./Sessions";
 import { TraceList } from "./TraceList";
 import { TraceView } from "./TraceView";
@@ -7,6 +8,7 @@ import { TraceView } from "./TraceView";
 export type Route =
   | { page: "traces"; session?: string; user?: string }
   | { page: "dashboard" }
+  | { page: "prices" }
   | { page: "sessions" }
   | { page: "session"; sessionId: string }
   | { page: "trace"; traceId: string };
@@ -14,6 +16,7 @@ export type Route =
 export function route(hash: string): Route {
   if (hash === "#/dashboard") return { page: "dashboard" };
   if (hash === "#/sessions") return { page: "sessions" };
+  if (hash === "#/prices") return { page: "prices" };
   const session = /^#\/session\/(.+)$/.exec(hash);
   if (session) {
     try {
@@ -45,7 +48,11 @@ export function App() {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
   const section =
-    current.page === "dashboard" ? "dashboard" : current.page === "sessions" || current.page === "session" ? "sessions" : "traces";
+    current.page === "dashboard" || current.page === "prices"
+      ? current.page
+      : current.page === "sessions" || current.page === "session"
+        ? "sessions"
+        : "traces";
   return (
     <div className="app">
       <header className="top">
@@ -62,11 +69,16 @@ export function App() {
           <a href="#/dashboard" aria-current={section === "dashboard" ? "page" : undefined}>
             Dashboard
           </a>
+          <a href="#/prices" aria-current={section === "prices" ? "page" : undefined}>
+            Prices
+          </a>
         </nav>
       </header>
       <main>
         {current.page === "dashboard" ? (
           <Dashboard />
+        ) : current.page === "prices" ? (
+          <Prices />
         ) : current.page === "sessions" ? (
           <SessionList />
         ) : current.page === "session" ? (

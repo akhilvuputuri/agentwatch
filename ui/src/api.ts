@@ -103,6 +103,8 @@ export interface GenAIFields {
   error_type: string | null;
   conversation_id: string | null;
   user_id: string | null;
+  /** "reported" by the exporter, or "calculated" from a model price. */
+  cost_source: "reported" | "calculated" | null;
 }
 
 export interface SpanEvent {
@@ -333,3 +335,38 @@ export const links = {
     return query ? `#/?${query}` : "#/";
   },
 };
+
+export interface Price {
+  id: string;
+  match_pattern: string;
+  input_per_million: number;
+  output_per_million: number;
+  cache_read_per_million: number | null;
+  cache_write_per_million: number | null;
+  start_ns: string | null;
+  created_ns: string;
+}
+
+export type NewPrice = Omit<Price, "id" | "created_ns" | "start_ns"> & { start_ns?: string };
+
+export async function listPrices(signal?: AbortSignal): Promise<Price[]> {
+  const body = await getJson<{ prices: Price[] }>("api/prices", signal);
+  return body.prices;
+}
+
+export async function addPrice(price: NewPrice): Promise<Price> {
+  const response = await fetch("api/prices", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(price),
+  });
+  if (!response.ok) throw new Error(`${response.status} ${(await response.text()).trim()}`);
+  return ((await response.json()) as { price: Price }).price;
+}
+
+export async function deletePrice(id: string): Promise<void> {
+  const response = await fetch(`api/prices/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`${response.status} ${(await response.text()).trim()}`);
+  }
+}

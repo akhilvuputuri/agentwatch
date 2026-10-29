@@ -98,6 +98,26 @@ strings, because they exceed JavaScript's exact integer range. Durations are num
   hours): the dashboard's figures, below.
 - `GET /api/services` (root services, the values the list filters on), `GET /healthz`.
 
+## Model prices
+
+When a model call reports tokens but no cost, its cost is calculated from a model price, as with
+Langfuse's model definitions. A price (schema version 4) has a regular expression matched against
+the whole model name (response model, else request model) case-insensitively, prices in US dollars
+per million tokens for input, output, cache reads and cache writes (cache prices default to the
+input price), and an optional time it takes effect. The latest price in effect at the call's start
+applies:
+
+cost = (input − cache read − cache write) × input price + cache read × cache-read price
++ cache write × cache-write price + output × output price, per million.
+
+Input tokens include cached ones, and output tokens include reasoning, as the GenAI conventions
+and OpenInference define them. Each span records `cost_source`: `reported` when the exporter sent a
+cost (never changed), `calculated` when a price applied, or none. Matching runs in DuckDB's regular
+expressions, for new spans at ingest and for every model call whenever a price is added, replaced
+or deleted, or the extraction rules change, so calculated costs always reflect the current prices.
+No prices are built in; `GET`/`POST /api/prices` and `DELETE /api/prices/<id>` manage them, and the
+Prices page in the UI does the same. A pattern DuckDB cannot compile is refused with 400.
+
 ## Scores
 
 A score is a named judgement on a trace, optionally on one of its spans: numeric (any finite
@@ -126,7 +146,8 @@ They come in three ways:
 - The same events attached to a span as span events, read when the span is stored.
 
 An event's score ID is a hash of its trace, span, name, time and result, so a re-sent event or
-span keeps one copy. A span re-sent with a changed or removed evaluation event keeps the scores
+span keeps one copy. An event whose ID is already used on another trace (only possible if an API
+caller chose that ID) is skipped: on `/v1/logs` it counts as rejected in the partial-success reply. A span re-sent with a changed or removed evaluation event keeps the scores
 from the earlier copy. An all-zero span ID on a log record means no span. Scores record when they
 were received, which is the time the dashboard groups them by.
 

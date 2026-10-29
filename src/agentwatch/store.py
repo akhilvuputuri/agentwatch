@@ -18,7 +18,7 @@ from agentwatch import genai
 from agentwatch.scores import Score, ScoreConflict, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
 # database and an upgraded one end up identical.
@@ -82,7 +82,39 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         )""",
         "CREATE INDEX scores_trace ON scores (trace_id)",
     ),
+    4: (
+        "ALTER TABLE spans ADD COLUMN cost_source VARCHAR",
+        "UPDATE spans SET cost_source = 'reported' WHERE cost_usd IS NOT NULL",
+        """CREATE TABLE prices (
+            id VARCHAR PRIMARY KEY,
+            match_pattern VARCHAR NOT NULL,
+            input_per_million DOUBLE NOT NULL,
+            output_per_million DOUBLE NOT NULL,
+            cache_read_per_million DOUBLE,
+            cache_write_per_million DOUBLE,
+            start_ns BIGINT,
+            created_ns BIGINT NOT NULL
+        )""",
+    ),
 }
+REPORTED = "reported"
+CALCULATED = "calculated"
+_PRICE_COLUMNS = (
+    "id, match_pattern, input_per_million, output_per_million, cache_read_per_million, "
+    "cache_write_per_million, start_ns, created_ns"
+)
+
+# Cost of a model call from a price row: fresh input, cache reads and cache writes (each at
+# its own price, or the input price when none is set) and output. Input tokens include the
+# cached ones, as the GenAI conventions and OpenInference both define them; reasoning tokens
+# are part of output.
+_COST = """(
+    greatest(coalesce(s.input_tokens, 0) - coalesce(s.cache_read_tokens, 0)
+             - coalesce(s.cache_write_tokens, 0), 0) * p.input_per_million
+    + coalesce(s.cache_read_tokens, 0) * coalesce(p.cache_read_per_million, p.input_per_million)
+    + coalesce(s.cache_write_tokens, 0) * coalesce(p.cache_write_per_million, p.input_per_million)
+    + coalesce(s.output_tokens, 0) * p.output_per_million
+) / 1e6"""
 _SCORE_COLUMNS = "id, trace_id, span_id, name, data_type, value, label, source, comment, created_ns"
 
 # Columns computed from a span's attributes by genai.read. They are re-read for every stored
@@ -106,6 +138,8 @@ _DERIVED = (
     "is_model_call",
     "counts_toward_totals",
     "user_id",
+    # "reported" when the span carried a cost; "calculated" once a model price applied.
+    "cost_source",
 )
 _DERIVED_TYPES = {
     "trace_id": "VARCHAR",
@@ -128,18 +162,32 @@ _DERIVED_TYPES = {
     "is_model_call": "BOOLEAN",
     "counts_toward_totals": "BOOLEAN",
     "user_id": "VARCHAR",
+    "cost_source": "VARCHAR",
 }
 _REDERIVE_CHUNK = 5000
 log = logging.getLogger("agentwatch")
 
-_COLUMNS = (
-    "trace_id, span_id, parent_span_id, name, kind, start_ns, end_ns, status_code, "
-    "status_message, service_name, scope_name, scope_version, attributes, resource, events, "
-    "links, operation, provider, request_model, response_model, input_tokens, output_tokens, "
-    "cache_read_tokens, cache_write_tokens, reasoning_tokens, cost_usd, finish_reasons, "
-    "tool_name, agent_name, conversation_id, error_type, is_model_call, counts_toward_totals, "
-    "received_ns, user_id"
+# Stored as received, then derived (in _DERIVED order). _row and _stored follow this order.
+_BASE_COLUMNS = (
+    "trace_id",
+    "span_id",
+    "parent_span_id",
+    "name",
+    "kind",
+    "start_ns",
+    "end_ns",
+    "status_code",
+    "status_message",
+    "service_name",
+    "scope_name",
+    "scope_version",
+    "attributes",
+    "resource",
+    "events",
+    "links",
+    "received_ns",
 )
+_COLUMNS = ", ".join((*_BASE_COLUMNS, *_DERIVED))
 _PLACEHOLDERS = ", ".join("?" for _ in _COLUMNS.split(","))
 _INSERT_CHUNK = 200
 
@@ -170,6 +218,20 @@ class TraceSummary:
     @property
     def cursor(self) -> Cursor:
         return Cursor(self.start_ns, self.trace_id)
+
+
+@dataclass(frozen=True, slots=True)
+class Price:
+    """A model price, in US dollars per million tokens."""
+
+    id: str
+    match_pattern: str
+    input_per_million: float
+    output_per_million: float
+    cache_read_per_million: float | None
+    cache_write_per_million: float | None
+    start_ns: int | None
+    created_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +313,9 @@ class Cursor:
 class StoredSpan:
     span: Span
     fields: genai.GenAI
+    # The stored cost: the reported one, or one calculated from a model price.
+    cost_usd: float | None = None
+    cost_source: str | None = None
 
 
 # A trace's root: among spans whose parent is absent from the trace, a span with no parent
@@ -423,6 +488,7 @@ class Store:
                         f"AND ({changed})",
                         [str(path)],
                     )
+                self._apply_prices()
                 self._set_meta("derivation", current)
                 self._db.execute("COMMIT")
             except BaseException:
@@ -454,7 +520,8 @@ class Store:
                         f"INSERT OR REPLACE INTO spans ({_COLUMNS}) VALUES {values}",
                         [value for row in chunk for value in row],
                     )
-                self._write_scores(event_scores)
+                self._write_scores(self._without_conflicts(event_scores))
+                self._apply_prices(sorted({span.trace_id for span in latest.values()}))
                 self._db.execute("COMMIT")
             except BaseException:
                 with contextlib.suppress(duckdb.Error):
@@ -653,16 +720,46 @@ class Store:
         for score in found:
             if traces.setdefault(score.id, score.trace_id) != score.trace_id:
                 raise ScoreConflict(f"score id {score.id!r} is given for two traces")
+        taken = self._ids_on_other_traces(traces)
+        if taken:
+            raise ScoreConflict(f"score id {taken[0]!r} is already used on another trace")
+
+    def _ids_on_other_traces(self, traces: dict[str, str]) -> list[str]:
+        """IDs (of id → trace) already stored on a different trace."""
         ids = list(traces)
+        taken: list[str] = []
         for start in range(0, len(ids), _INSERT_CHUNK):
             chunk = ids[start : start + _INSERT_CHUNK]
             rows = self._db.execute(
                 f"SELECT id, trace_id FROM scores WHERE id IN ({', '.join('?' for _ in chunk)})",
                 chunk,
             ).fetchall()
-            for score_id, trace_id in rows:
-                if traces[score_id] != trace_id:
-                    raise ScoreConflict(f"score id {score_id!r} is already used on another trace")
+            taken.extend(score_id for score_id, trace_id in rows if traces[score_id] != trace_id)
+        return taken
+
+    def _without_conflicts(self, found: Sequence[Score]) -> list[Score]:
+        """Event scores minus any whose ID is already used on another trace."""
+        if not found:
+            return []
+        taken = set(self._ids_on_other_traces({s.id: s.trace_id for s in found}))
+        return [s for s in found if s.id not in taken]
+
+    def insert_event_scores(self, found: Sequence[Score]) -> int:
+        """Store evaluation-event scores, skipping any whose ID is used on another trace.
+
+        Returns how many were skipped.
+        """
+        with self._lock:
+            self._db.execute("BEGIN")
+            try:
+                kept = self._without_conflicts(found)
+                self._write_scores(kept)
+                self._db.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(duckdb.Error):
+                    self._db.execute("ROLLBACK")
+                raise
+        return len(found) - len(kept)
 
     def _write_scores(self, found: Sequence[Score]) -> None:
         latest = {score.id: score for score in found}
@@ -674,6 +771,91 @@ class Store:
                 f"INSERT OR REPLACE INTO scores ({_SCORE_COLUMNS}) VALUES {marks}",
                 [value for row in chunk for value in row],
             )
+
+    def prices(self) -> list[Price]:
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT {_PRICE_COLUMNS} FROM prices ORDER BY match_pattern, start_ns NULLS FIRST, id"
+            ).fetchall()
+        return [Price(*row) for row in rows]
+
+    def check_pattern(self, pattern: str) -> str | None:
+        """None when DuckDB accepts the regular expression, else its error message."""
+        with self._lock:
+            try:
+                self._db.execute("SELECT regexp_full_match('', ?)", [pattern]).fetchone()
+            except duckdb.Error as error:
+                return str(error).splitlines()[0]
+        return None
+
+    def upsert_price(self, price: Price) -> None:
+        """Add or replace a price, then recalculate every calculated cost."""
+        with self._lock:
+            self._db.execute("BEGIN")
+            try:
+                self._db.execute(
+                    f"INSERT OR REPLACE INTO prices ({_PRICE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    astuple(price),
+                )
+                self._apply_prices()
+                self._db.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(duckdb.Error):
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def delete_price(self, price_id: str) -> bool:
+        with self._lock:
+            self._db.execute("BEGIN")
+            try:
+                row = self._db.execute(
+                    "DELETE FROM prices WHERE id = ? RETURNING id", [price_id]
+                ).fetchone()
+                self._apply_prices()
+                self._db.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(duckdb.Error):
+                    self._db.execute("ROLLBACK")
+                raise
+        return row is not None
+
+    def _apply_prices(self, traces: Sequence[str] | None = None) -> None:
+        """Set the cost of model calls that reported none from the best matching price.
+
+        A price matches when its pattern matches the whole model name (case-insensitively) and
+        it took effect by the span's start; the latest to take effect wins. Calls with no
+        match have no cost. Reported costs are never touched. `traces` limits the work to
+        those traces; None recalculates everything.
+        """
+        scope = ""
+        params: list[Any] = []
+        if traces is not None:
+            if not traces:
+                return
+            scope = f"AND s.trace_id IN ({', '.join('?' for _ in traces)})"
+            params = list(traces)
+        self._db.execute(
+            f"UPDATE spans s SET cost_usd = NULL, cost_source = NULL "
+            f"WHERE s.cost_source = '{CALCULATED}' {scope}",
+            params,
+        )
+        self._db.execute(
+            f"""
+            UPDATE spans SET cost_usd = c.cost, cost_source = '{CALCULATED}'
+            FROM (
+                SELECT s.trace_id, s.span_id,
+                       arg_max({_COST}, (coalesce(p.start_ns, -1), p.created_ns, p.id)) AS cost
+                FROM spans s JOIN prices p
+                  ON regexp_full_match(coalesce(s.response_model, s.request_model), p.match_pattern, 'i')
+                 AND (p.start_ns IS NULL OR p.start_ns <= s.start_ns)
+                WHERE s.is_model_call AND s.cost_source IS NULL
+                  AND (s.input_tokens IS NOT NULL OR s.output_tokens IS NOT NULL) {scope}
+                GROUP BY s.trace_id, s.span_id
+            ) c
+            WHERE spans.trace_id = c.trace_id AND spans.span_id = c.span_id
+            """,
+            params,
+        )
 
     def delete_score(self, score_id: str) -> bool:
         with self._lock:
@@ -731,9 +913,8 @@ def _row(span: Span, received_ns: int) -> Sequence[Any]:
                 for k in span.links
             ]
         ),
-        *_derived(fields)[:-1],
         received_ns,
-        fields.user_id,
+        *_derived(fields),
     )
 
 
@@ -758,6 +939,7 @@ def _derived(fields: genai.GenAI) -> tuple[Any, ...]:
         fields.is_model_call,
         fields.counts_toward_totals,
         fields.user_id,
+        REPORTED if fields.cost_usd is not None else None,
     )
 
 
@@ -788,4 +970,10 @@ def _stored(row: Sequence[Any]) -> StoredSpan:
             for k in links
         ),
     )
-    return StoredSpan(span=span, fields=genai.read(span))
+    derived = dict(zip(_DERIVED, row[len(_BASE_COLUMNS) :], strict=True))
+    return StoredSpan(
+        span=span,
+        fields=genai.read(span),
+        cost_usd=derived["cost_usd"],
+        cost_source=derived["cost_source"],
+    )

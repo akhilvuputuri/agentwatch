@@ -54,6 +54,10 @@ Within a row, names are tried left to right: current GenAI names, then deprecate
 | Cache read / write | `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens`; `gen_ai.usage.cache_creation.input_tokens` | `llm.token_count.prompt_details.cache_read`, `…cache_write` | |
 | Reasoning tokens | `gen_ai.usage.reasoning.output_tokens` | `llm.token_count.completion_details.reasoning` | |
 | Cost (USD) | none in the conventions; `agentwatch.usage.cost_usd` | `llm.cost.total` | |
+
+When a model call carries tokens but no cost, agentwatch calculates one from the model prices you
+add on the Prices page (regular-expression model match, US dollars per million tokens, optional
+effective date). No prices are built in.
 | Finish reasons | `gen_ai.response.finish_reasons` | `llm.finish_reason` | |
 | Tool, agent | `gen_ai.tool.name`, `gen_ai.agent.name` | `tool.name`, `agent.name` | |
 | Session, user | `gen_ai.conversation.id`, `user.id` | `session.id`, `user.id` | |
