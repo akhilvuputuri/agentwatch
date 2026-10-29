@@ -8,6 +8,8 @@ describe("format", () => {
     expect(duration(250_000_000)).toBe("250 ms");
     expect(duration(3_210_000_000)).toBe("3.21 s");
     expect(duration(125_000_000_000)).toBe("2 m 5 s");
+    expect(duration(2 * 3600e9 + 30 * 60e9)).toBe("2 h 30 m");
+    expect(duration(46 * 3600e9 + 40 * 60e9)).toBe("1 d 23 h");
     expect(duration(-1)).toBe("–");
   });
   it("counts and money", () => {

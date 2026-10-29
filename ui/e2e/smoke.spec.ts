@@ -9,7 +9,7 @@ test("lists demo traces and opens a span tree", async ({ page }) => {
   await page.getByRole("button", { name: "Load older traces" }).click();
   await expect(rows).toHaveCount(100);
 
-  await rows.first().getByRole("link").click();
+  await rows.first().getByRole("link").first().click();
   await expect(page).toHaveURL(/#\/trace\/[0-9a-f]{32}$/);
   const spans = page.getByTestId("span-row");
   await expect(spans.first()).toBeVisible();

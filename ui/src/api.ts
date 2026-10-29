@@ -17,6 +17,8 @@ export interface TraceSummary {
   calls_without_cost: number;
   models: string[];
   complete: boolean;
+  session_id: string | null;
+  user_id: string | null;
 }
 
 export interface TracePage {
@@ -39,6 +41,8 @@ export interface GenAIFields {
   tool_name: string | null;
   agent_name: string | null;
   error_type: string | null;
+  conversation_id: string | null;
+  user_id: string | null;
 }
 
 export interface SpanEvent {
@@ -73,6 +77,8 @@ export interface TraceQuery {
   before?: string;
   service?: string;
   errors?: boolean;
+  session?: string;
+  user?: string;
 }
 
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -89,6 +95,8 @@ export async function listTraces(query: TraceQuery, signal?: AbortSignal): Promi
   if (query.before) params.set("before", query.before);
   if (query.service) params.set("service", query.service);
   if (query.errors) params.set("errors", "1");
+  if (query.session) params.set("session", query.session);
+  if (query.user) params.set("user", query.user);
   return getJson<TracePage>(`api/traces?${params}`, signal);
 }
 
@@ -207,3 +215,50 @@ export async function getMetrics(
   if (service) params.set("service", service);
   return getJson<Metrics>(`api/metrics?${params}`, signal);
 }
+
+export interface SessionSummary {
+  session_id: string;
+  traces: number;
+  first_start_ns: string;
+  last_start_ns: string;
+  last_end_ns: string;
+  error_count: number;
+  model_calls: number;
+  tool_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number | null;
+  calls_without_cost: number;
+  users: string[];
+  services: string[];
+}
+
+export async function listSessions(
+  query: { before?: string; user?: string; limit?: number },
+  signal?: AbortSignal,
+): Promise<{ sessions: SessionSummary[]; next: string | null }> {
+  const params = new URLSearchParams();
+  if (query.limit !== undefined) params.set("limit", String(query.limit));
+  if (query.before) params.set("before", query.before);
+  if (query.user) params.set("user", query.user);
+  return getJson(`api/sessions?${params}`, signal);
+}
+
+export async function getSession(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<{ session: SessionSummary; traces: TraceSummary[]; truncated: boolean }> {
+  return getJson(`api/sessions/${encodeURIComponent(sessionId)}`, signal);
+}
+
+/** Hash links to the views, with IDs encoded so any session or user string is safe. */
+export const links = {
+  session: (id: string) => `#/session/${encodeURIComponent(id)}`,
+  traces: (filter: { session?: string; user?: string }) => {
+    const params = new URLSearchParams();
+    if (filter.session) params.set("session", filter.session);
+    if (filter.user) params.set("user", filter.user);
+    const query = params.toString();
+    return query ? `#/?${query}` : "#/";
+  },
+};

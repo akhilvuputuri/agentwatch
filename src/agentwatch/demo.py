@@ -71,6 +71,7 @@ def generate(*, traces: int = 120, seed: int = 7, end_ns: int) -> list[Span]:
 
 def _turn(rng: random.Random, ids: _Ids, trace_id: str, start: int) -> list[Span]:
     root = ids.span()
+    conversation = rng.randrange(1, 9)
     spans: list[Span] = []
     model = _MODELS[0] if rng.random() < 0.7 else _MODELS[1]
     clock = start + rng.randrange(2, 20) * 1_000_000
@@ -107,7 +108,8 @@ def _turn(rng: random.Random, ids: _Ids, trace_id: str, start: int) -> list[Span
             attributes={
                 genai.OPERATION: "invoke_agent",
                 genai.AGENT_NAME: "assistant",
-                genai.CONVERSATION_ID: f"demo-{rng.randrange(1, 9)}",
+                genai.CONVERSATION_ID: f"demo-{conversation}",
+                genai.USER_ID: f"user-{conversation % 3 + 1}",
             },
             resource=_resource(),
             scope_name="agentwatch.demo",
