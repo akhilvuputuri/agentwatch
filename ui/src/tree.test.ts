@@ -36,6 +36,7 @@ function span(id: string, parent: string | null, start: number, end: number): Sp
       error_type: null,
       conversation_id: null,
       user_id: null,
+      cost_source: null,
     },
   };
 }

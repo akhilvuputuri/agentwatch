@@ -142,7 +142,8 @@ function SpanDetail({ row }: { row: Row }) {
   if (g.cache_write_tokens !== null) facts.push(["Cache write", count(g.cache_write_tokens)]);
   if (g.output_tokens !== null) facts.push(["Output tokens", count(g.output_tokens)]);
   if (g.reasoning_tokens !== null) facts.push(["Reasoning", count(g.reasoning_tokens)]);
-  if (g.cost_usd !== null) facts.push(["Cost", usd(g.cost_usd)]);
+  if (g.cost_usd !== null)
+    facts.push(["Cost", `${usd(g.cost_usd)}${g.cost_source === "calculated" ? " (from model price)" : ""}`]);
   if (g.finish_reasons.length) facts.push(["Finish", g.finish_reasons.join(", ")]);
   if (g.error_type) facts.push(["Error type", g.error_type]);
   facts.push(["Duration", duration(row.durationNs)]);

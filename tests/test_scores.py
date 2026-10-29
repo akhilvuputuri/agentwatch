@@ -4,7 +4,10 @@ import json
 
 import pytest
 from google.protobuf import json_format
-from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import (
+    ExportLogsServiceRequest,
+    ExportLogsServiceResponse,
+)
 from opentelemetry.proto.logs.v1.logs_pb2 import LogRecord
 from starlette.testclient import TestClient
 
@@ -414,3 +417,33 @@ def test_zero_span_id_in_logs_means_unset() -> None:
     )
     [score] = db.scores(T)
     assert score.span_id is None
+
+
+def test_logs_reject_an_event_whose_score_id_is_taken() -> None:
+    request = ExportLogsServiceRequest()
+    record = LogRecord(
+        event_name=scores.EVALUATION_EVENT, time_unix_nano=5, trace_id=bytes.fromhex(T)
+    )
+    record.attributes.extend(
+        key_values({scores.EVALUATION_NAME: "a", scores.EVALUATION_VALUE: 1.0})
+    )
+    request.resource_logs.add().scope_logs.add().log_records.append(record)
+    taken = scores.from_evaluation(
+        T, None, 5, {scores.EVALUATION_NAME: "a", scores.EVALUATION_VALUE: 1.0}
+    )
+    assert taken is not None
+    db = Store()
+    other = "d" * 32
+    db.upsert_scores(
+        [scores.from_api({"id": taken.id, "trace_id": other, "name": "x", "value": 0})]
+    )
+    response = client(db).post(
+        "/v1/logs",
+        content=request.SerializeToString(),
+        headers={"content-type": "application/x-protobuf"},
+    )
+    assert response.status_code == 200
+    reply = ExportLogsServiceResponse()
+    reply.ParseFromString(response.content)
+    assert reply.partial_success.rejected_log_records == 1
+    assert db.scores(T) == []

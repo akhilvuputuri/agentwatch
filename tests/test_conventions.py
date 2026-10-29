@@ -184,8 +184,10 @@ def test_upgrading_a_version_one_database(tmp_path: Path) -> None:
     assert db.query_one("SELECT value FROM meta WHERE key = 'schema'")[0] == str(
         store.SCHEMA_VERSION
     )
-    row = db.query_one("SELECT operation, input_tokens, is_model_call, user_id FROM spans")
-    assert tuple(row) == ("chat", 40, True, "u")
+    row = db.query_one(
+        "SELECT operation, input_tokens, is_model_call, user_id, cost_source FROM spans"
+    )
+    assert tuple(row) == ("chat", 40, True, "u", None)
     [summary] = db.traces()
     assert summary.model_calls == 1
     db.close()
@@ -211,7 +213,7 @@ def test_new_databases_match_migrated_ones(tmp_path: Path) -> None:
     fresh = Store(tmp_path / "fresh.duckdb")
     version_one_database(tmp_path / "old.duckdb")
     upgraded = Store(tmp_path / "old.duckdb")
-    describe = "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_name IN ('spans', 'scores') ORDER BY table_name, column_name"
+    describe = "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_name IN ('spans', 'scores', 'prices') ORDER BY table_name, column_name"
     assert fresh.query(describe) == upgraded.query(describe)
 
 

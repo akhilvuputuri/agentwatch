@@ -27,11 +27,12 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from agentwatch import metrics, otlp, scores
+from agentwatch import metrics, otlp, prices, scores
 from agentwatch.scores import Score
 from agentwatch.spans import jsonable
 from agentwatch.store import (
     Cursor,
+    Price,
     SessionCursor,
     SessionSummary,
     Store,
@@ -96,11 +97,14 @@ def create_app(
             return PlainTextResponse(str(error), status_code=415)
         except otlp.OtlpError as error:
             return PlainTextResponse(str(error), status_code=400)
-        await run_in_threadpool(store.upsert_scores, decoded.scores)
+        skipped = await run_in_threadpool(store.insert_event_scores, decoded.scores)
         response = ExportLogsServiceResponse()
-        if decoded.rejected:
-            response.partial_success.rejected_log_records = decoded.rejected
-            response.partial_success.error_message = decoded.error
+        rejected = decoded.rejected + skipped
+        if rejected:
+            response.partial_success.rejected_log_records = rejected
+            response.partial_success.error_message = decoded.error or (
+                f"{skipped} record(s) rejected; first: score id already used on another trace"
+            )
         if content_type.split(";", 1)[0].strip().lower() == otlp.JSON:
             return JSONResponse(json_format.MessageToDict(response))
         return Response(response.SerializeToString(), media_type=otlp.PROTOBUF)
@@ -145,6 +149,39 @@ def create_app(
         return JSONResponse(
             {"ids": [score.id for score in found], "scores": [_score_json(s) for s in found]},
             status_code=201,
+        )
+
+    async def list_prices(_: Request) -> Response:
+        found = await run_in_threadpool(store.prices)
+        return JSONResponse({"prices": [_price_json(price) for price in found]})
+
+    async def post_price(request: Request) -> Response:
+        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media != otlp.JSON:
+            return PlainTextResponse("send application/json", status_code=415)
+        body = await _read_body(request, MAX_SCORE_REQUEST_BYTES)
+        if body is None:
+            return PlainTextResponse("request too large", status_code=413)
+        try:
+            price = prices.from_api(json.loads(body))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return PlainTextResponse("body must be JSON", status_code=400)
+        except prices.PriceError as error:
+            return PlainTextResponse(str(error), status_code=400)
+        problem = await run_in_threadpool(store.check_pattern, price.match_pattern)
+        if problem is not None:
+            return PlainTextResponse(
+                f"match_pattern is not a valid regular expression: {problem}", 400
+            )
+        await run_in_threadpool(store.upsert_price, price)
+        return JSONResponse({"price": _price_json(price)}, status_code=201)
+
+    async def delete_price(request: Request) -> Response:
+        removed = await run_in_threadpool(store.delete_price, str(request.path_params["price_id"]))
+        return (
+            Response(status_code=204)
+            if removed
+            else PlainTextResponse("price not found", status_code=404)
         )
 
     async def delete_score(request: Request) -> Response:
@@ -264,6 +301,9 @@ def create_app(
         Route("/v1/logs", ingest_logs, methods=["POST"]),
         Route("/api/scores", post_scores, methods=["POST"]),
         Route("/api/scores/{score_id}", delete_score, methods=["DELETE"]),
+        Route("/api/prices", list_prices, methods=["GET"]),
+        Route("/api/prices", post_price, methods=["POST"]),
+        Route("/api/prices/{price_id}", delete_price, methods=["DELETE"]),
         Route("/api/traces", traces),
         Route("/api/traces/{trace_id}", trace),
         Route("/api/metrics", metrics_view),
@@ -390,6 +430,13 @@ async def _read_body(request: Request, limit: int | None = None) -> bytes | None
     return bytes(body)
 
 
+def _price_json(price: Price) -> dict[str, Any]:
+    data = asdict(price)
+    data["created_ns"] = str(price.created_ns)
+    data["start_ns"] = None if price.start_ns is None else str(price.start_ns)
+    return data
+
+
 def _score_json(score: Score) -> dict[str, Any]:
     data = asdict(score)
     data["created_ns"] = str(score.created_ns)
@@ -437,7 +484,8 @@ def _span_json(stored: StoredSpan) -> dict[str, Any]:
             "cache_read_tokens": fields.cache_read_tokens,
             "cache_write_tokens": fields.cache_write_tokens,
             "reasoning_tokens": fields.reasoning_tokens,
-            "cost_usd": fields.cost_usd,
+            "cost_usd": stored.cost_usd,
+            "cost_source": stored.cost_source,
             "finish_reasons": list(fields.finish_reasons),
             "tool_name": fields.tool_name,
             "agent_name": fields.agent_name,
