@@ -108,19 +108,18 @@ def create_app(
     async def metrics_view(request: Request) -> Response:
         query = request.query_params
         service = query.get("service") or None
-        try:
-            if query.get("range") == "all":
-                bounds = await run_in_threadpool(metrics.data_range, store, service)
-                end = bounds[1] + 1 if bounds else time.time_ns()
-                start = bounds[0] if bounds else end - DAY_NS
-            else:
-                end = int(query["to"]) if query.get("to") else time.time_ns()
-                start = int(query["from"]) if query.get("from") else end - DAY_NS
-        except ValueError:
-            return PlainTextResponse("from and to must be Unix nanoseconds", status_code=400)
-        if not 0 <= start < end <= otlp.MAX_TIME_NS:
-            return PlainTextResponse("need 0 <= from < to", status_code=400)
-        window = metrics.Window(start, end, service)
+        now = time.time_ns()
+        if query.get("range") == "all":
+            window = await run_in_threadpool(metrics.window_for_all, store, service, now)
+        else:
+            raw_to, raw_from = query.get("to", ""), query.get("from", "")
+            if not all(v.isascii() and v.isdigit() for v in (raw_to, raw_from) if v):
+                return PlainTextResponse("from and to must be Unix nanoseconds", status_code=400)
+            end = int(raw_to) if raw_to else now
+            start = int(raw_from) if raw_from else end - DAY_NS
+            if not 0 <= start < end <= otlp.MAX_TIME_NS:
+                return PlainTextResponse("need 0 <= from < to", status_code=400)
+            window = metrics.Window(start, end, service)
         return JSONResponse(await run_in_threadpool(metrics.metrics, store, window))
 
     async def services(_: Request) -> Response:
@@ -150,11 +149,10 @@ class UiFiles(StaticFiles):
     """The built UI. Asset names carry a content hash, so they can be cached for good;
     the page itself must be revalidated, or an upgraded install keeps loading old assets."""
 
-    def file_response(
-        self, full_path: Any, stat_result: Any, scope: Scope, status_code: int = 200
-    ) -> Response:
-        response = super().file_response(full_path, stat_result, scope, status_code)
-        if str(full_path).replace("\\", "/").rsplit("/", 2)[-2:-1] == ["assets"]:
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        # `path` is relative to the mount, so this tests the URL, not the directory name.
+        if path.replace("\\", "/").startswith("assets/") and response.status_code in (200, 304):
             response.headers["cache-control"] = "public, max-age=31536000, immutable"
         else:
             response.headers["cache-control"] = "no-cache"

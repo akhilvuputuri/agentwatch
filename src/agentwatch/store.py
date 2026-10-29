@@ -128,12 +128,13 @@ class StoredSpan:
 
 # A trace's root: among spans whose parent is absent from the trace, a span with no parent
 # at all wins over an orphan, then the earliest. `complete` is whether that root has no parent.
-_ROOTS = """
+ROOTS_SQL = """
 roots AS (
     SELECT
         s.trace_id,
         arg_min(s.name, (s.parent_span_id IS NOT NULL, s.start_ns, s.span_id)) AS root_name,
         arg_min(s.service_name, (s.parent_span_id IS NOT NULL, s.start_ns, s.span_id)) AS service_name,
+        arg_min(s.start_ns, (s.parent_span_id IS NOT NULL, s.start_ns, s.span_id)) AS root_start_ns,
         bool_or(s.parent_span_id IS NULL) AS complete
     FROM spans s
     LEFT JOIN spans p ON p.trace_id = s.trace_id AND p.span_id = s.parent_span_id
@@ -215,7 +216,7 @@ class Store:
         """Services of trace roots, the values the trace list filters on."""
         with self._lock:
             rows = self._db.execute(
-                f"WITH {_ROOTS} SELECT DISTINCT service_name FROM roots ORDER BY service_name"
+                f"WITH {ROOTS_SQL} SELECT DISTINCT service_name FROM roots ORDER BY service_name"
             ).fetchall()
         return [str(row[0]) for row in rows]
 
@@ -242,7 +243,7 @@ class Store:
         where = f"WHERE {' AND '.join(filters)}" if filters else ""
         params.append(max(1, min(limit, 500)))
         query = f"""
-            WITH {_ROOTS},
+            WITH {ROOTS_SQL},
             totals AS (
                 SELECT
                     trace_id,

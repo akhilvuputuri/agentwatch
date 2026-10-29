@@ -154,6 +154,8 @@ export interface ToolRow {
 
 export interface AgentRow {
   agent: string;
+  /** Calls with no invoke_agent ancestor, grouped together. */
+  unowned: boolean;
   runs: number;
   errors: number;
   p50_ms: number | null;

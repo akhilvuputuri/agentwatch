@@ -81,8 +81,9 @@ function Figures({ data }: { data: Metrics }) {
     const point = data.series[index];
     if (!point) return "";
     const date = new Date(nsToMs(BigInt(point.start_ns)));
+    // Day and week buckets are aligned to UTC, so they are labelled in UTC.
     return longBuckets
-      ? date.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+      ? `${date.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" })} UTC`
       : date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   };
   const bucketLabel = (index: number) => `${when(index)} · per ${period(bucketNs)}`;
@@ -194,7 +195,7 @@ function Figures({ data }: { data: Metrics }) {
       <Table
         columns={["Agent", "Runs", "Failed", "p50", "p95", "Model calls", "Tool calls", "Input", "Cost"]}
         rows={data.by_agent.map((a) => [
-          a.agent,
+          a.unowned ? <span className="muted">No agent span</span> : a.agent,
           a.runs,
           share(a.errors, a.runs),
           ms(a.p50_ms),

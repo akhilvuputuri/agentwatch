@@ -8,6 +8,10 @@ describe("niceTicks", () => {
     expect(niceTicks(0.37)).toEqual([0, 0.1, 0.2, 0.3, 0.4]);
     expect(niceTicks(4)).toEqual([0, 1, 2, 3, 4]);
   });
+  it("handles extreme scales", () => {
+    expect(niceTicks(1e-120).length).toBeGreaterThan(1);
+    expect(niceTicks(3e12)).toEqual([0, 1e12, 2e12, 3e12]);
+  });
   it("handles empty data", () => {
     expect(niceTicks(0)).toEqual([0, 1]);
     expect(niceTicks(Number.NaN)).toEqual([0, 1]);

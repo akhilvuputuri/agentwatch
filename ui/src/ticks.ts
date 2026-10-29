@@ -11,6 +11,6 @@ export function niceTicks(max: number, target = 4): number[] {
 }
 
 function roundTo(value: number, step: number) {
-  const digits = Math.max(0, -Math.floor(Math.log10(step)) + 1);
+  const digits = Math.min(100, Math.max(0, -Math.floor(Math.log10(step)) + 1));
   return Number(value.toFixed(digits));
 }

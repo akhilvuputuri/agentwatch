@@ -227,3 +227,123 @@ def test_metrics_endpoint() -> None:
     assert http.get("/api/metrics").status_code == 200
     assert http.get("/api/metrics", params={"from": "x"}).status_code == 400
     assert http.get("/api/metrics", params={"from": T0, "to": T0}).status_code == 400
+
+
+def test_traces_count_where_their_root_starts() -> None:
+    store = Store()
+    ms = 10**6
+    store.insert(
+        [
+            # Root before the window, a call inside it: the call counts, the trace does not.
+            make("1", None, T0 - 10 * ms, 30 * ms, agent("a"), trace="1" * 32),
+            make("2", "1", T0 + 5 * ms, 1 * ms, chat("m", 10, 0.1, []), trace="1" * 32),
+            # A trace whose root never arrived counts where its earliest orphan starts.
+            make("3", "9", T0 + 20 * ms, 1 * ms, chat("m", 10, 0.1, []), trace="2" * 32),
+            make("4", None, T0 + 30 * ms, 1 * ms, agent("a"), trace="3" * 32),
+        ],
+        received_ns=1,
+    )
+    result = metrics.metrics(store, metrics.Window(T0, T0 + HOUR))
+    assert result["overview"]["traces"] == 2
+    assert sum(p["traces"] for p in result["series"]) == 2
+    assert result["overview"]["model_calls"] == 2
+
+
+def test_service_filter_uses_the_root_service() -> None:
+    store = Store()
+    store.insert(
+        [
+            make("1", None, T0, 100, agent("a"), service="front"),
+            make("2", "1", T0 + 1, 10, chat("m", 10, 0.1, []), service="back"),
+        ],
+        received_ns=1,
+    )
+    front = metrics.metrics(store, metrics.Window(T0, T0 + HOUR, "front"))["overview"]
+    assert (front["traces"], front["model_calls"]) == (1, 1)
+    back = metrics.metrics(store, metrics.Window(T0, T0 + HOUR, "back"))["overview"]
+    assert (back["traces"], back["model_calls"]) == (0, 0)
+
+
+def test_all_time_covers_spans_ending_before_they_start() -> None:
+    store = Store()
+    store.insert(
+        [
+            make("1", None, T0, 10, chat("m", 1, 0.1, []), trace="1" * 32),
+            # An unended span (end 0) stored with the latest start.
+            Span(
+                trace_id="2" * 32,
+                span_id="2" * 16,
+                parent_span_id=None,
+                name="chat",
+                start_ns=T0 + HOUR,
+                end_ns=0,
+                attributes=chat("m", 1, 0.1, []),
+            ),
+        ],
+        received_ns=1,
+    )
+    window = metrics.window_for_all(store, None, now_ns=T0)
+    result = metrics.metrics(store, window)
+    assert result["overview"]["model_calls"] == 2
+    # Its negative duration is clamped, not averaged in.
+    assert result["overview"]["model_p50_ms"] >= 0
+    [model] = result["by_model"]
+    assert model["max_ms"] == pytest.approx(10 / 1e6)
+
+
+def test_all_time_on_an_empty_store_and_at_the_largest_timestamp() -> None:
+    empty = metrics.window_for_all(Store(), None, now_ns=T0)
+    assert empty.end_ns == T0
+    store = Store()
+    store.insert([make("1", None, T0, 2**63 - 1 - T0, chat("m", 1, 0.1, []))], received_ns=1)
+    window = metrics.window_for_all(store, None, now_ns=T0)
+    assert window.end_ns == 2**63 - 1
+    assert metrics.metrics(store, window)["overview"]["model_calls"] == 1
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        (T0 + HOUR // 2, T0 + HOUR // 2 + 72 * HOUR),
+        (0, 2**63 - 1),
+        (5, 6),
+        (T0, T0 + 400 * 24 * HOUR),
+    ],
+)
+def test_bucket_count_never_exceeds_the_cap(start: int, end: int) -> None:
+    window = metrics.Window(start, end)
+    width = window.bucket_ns()
+    first = window.first_bucket_ns(width)
+    assert -(-(end - first) // width) <= metrics.MAX_BUCKETS
+    assert first <= start
+
+
+def test_agent_cost_includes_priced_tool_spans() -> None:
+    store = Store()
+    store.insert(
+        [
+            make("1", None, T0, 100, agent("a")),
+            make("2", "1", T0 + 1, 10, chat("m", 10, 3.0, [])),
+            make("3", "1", T0 + 20, 10, {**tool("search"), genai.COST_USD: 0.5}),
+            make("4", "1", T0 + 40, 10, {"custom": "x", genai.COST_USD: 0.25}),
+        ],
+        received_ns=1,
+    )
+    result = metrics.metrics(store, metrics.Window(T0, T0 + HOUR))
+    assert result["overview"]["cost_usd"] == pytest.approx(3.75)
+    [row] = result["by_agent"]
+    assert row["cost_usd"] == pytest.approx(3.75)
+
+
+def test_an_agent_named_like_the_unowned_group_stays_apart() -> None:
+    store = Store()
+    store.insert(
+        [
+            make("1", None, T0, 100, agent(metrics.NO_AGENT), trace="1" * 32),
+            make("2", "1", T0 + 1, 10, chat("m", 10, 1.0, []), trace="1" * 32),
+            make("3", None, T0 + 1, 10, chat("m", 10, 2.0, []), trace="2" * 32),
+        ],
+        received_ns=1,
+    )
+    rows = metrics.metrics(store, metrics.Window(T0, T0 + HOUR))["by_agent"]
+    assert sorted((r["unowned"], r["cost_usd"]) for r in rows) == [(False, 1.0), (True, 2.0)]

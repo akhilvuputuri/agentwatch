@@ -221,3 +221,18 @@ def test_unknown_enum_values_are_rejected_per_span() -> None:
     assert response.status_code == 200
     assert response.json()["partialSuccess"]["rejectedSpans"] == "2"
     assert store.span_count() == 0
+
+
+def test_cache_headers_follow_the_url_not_the_directory_name(tmp_path: Path) -> None:
+    ui = tmp_path / "assets"
+    ui.mkdir()
+    (ui / "index.html").write_text("<p>ui</p>")
+    http, _ = client(ui)
+    assert http.get("/").headers["cache-control"] == "no-cache"
+    assert http.head("/").headers["cache-control"] == "no-cache"
+
+
+def test_metrics_rejects_loose_integers() -> None:
+    http, _ = client()
+    for bad in ("+5", "1_000", " 5", "-1"):
+        assert http.get("/api/metrics", params={"from": bad, "to": "10"}).status_code == 400

@@ -27,10 +27,15 @@ export interface Tooltip {
 }
 
 function TooltipBox({ tip, x, width }: { tip: Tooltip; x: number; width: number }) {
-  // Keep the box inside the chart: flip to the left of the pointer near the right edge.
-  const left = x > width - 180 ? Math.max(0, x - 172) : x + 12;
+  // Keep the box inside the chart: past the middle, it sits to the left of the pointer.
+  const flip = x > width / 2;
   return (
-    <div className="chart-tip" style={{ left }} role="status">
+    // Hidden from screen readers: each chart's data table carries the same values.
+    <div
+      className="chart-tip"
+      style={flip ? { left: x - 12, transform: "translateX(-100%)" } : { left: x + 12 }}
+      aria-hidden="true"
+    >
       {tip.rows ? null : <strong>{tip.value}</strong>}
       {tip.rows?.map((row) => (
         <div key={row.key} className="tip-row">
@@ -108,6 +113,7 @@ export function BarChart({
 }) {
   const [ref, width] = useWidth<HTMLDivElement>();
   const [hover, setHover] = useState<number | null>(null);
+  useEffect(() => setHover(null), [data]);
   const innerWidth = width - MARGIN.left - MARGIN.right;
   const innerHeight = HEIGHT - MARGIN.top - MARGIN.bottom;
   const max = Math.max(0, ...data.map((d) => d.value ?? 0));
@@ -185,6 +191,7 @@ export function LineChart({
 }) {
   const [ref, width] = useWidth<HTMLDivElement>();
   const [hover, setHover] = useState<number | null>(null);
+  useEffect(() => setHover(null), [series]);
   const count = Math.max(1, ...series.map((s) => s.values.length));
   const innerWidth = width - MARGIN.left - MARGIN.right - 44; // room for end labels
   const innerHeight = HEIGHT - MARGIN.top - MARGIN.bottom;
