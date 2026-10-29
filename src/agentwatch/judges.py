@@ -575,11 +575,17 @@ class JudgeRunner:
         self._thread = threading.Thread(target=loop, name="agentwatch-judges", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout_s: float = TIMEOUT_S + 5) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=TIMEOUT_S + 5)
-            self._thread = None
+            self._thread.join(timeout=timeout_s)
+            if not self._thread.is_alive():
+                self._thread = None
+
+    @property
+    def running(self) -> bool:
+        """Whether the background thread is still working (after stop(): mid-call)."""
+        return self._thread is not None and self._thread.is_alive()
 
     def run_once(self) -> int:
         """One pass over every enabled judge; returns the traces recorded."""

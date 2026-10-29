@@ -75,6 +75,21 @@ Trace token totals add up model calls only. Cost adds up every span except `invo
 counted twice; when a model call reports no cost, the trace's cost is shown as a lower bound. See
 [docs/design.md](docs/design.md) for the storage model and API.
 
+### In a container
+
+Each commit to `main` publishes an image to `ghcr.io/akhilvuputuri/agentwatch` (tags `main` and
+`sha-<commit>`; pin the digest the image workflow prints). It runs as a non-root user and keeps
+its database in `/data`:
+
+```bash
+docker run -d --name agentwatch -p 127.0.0.1:4318:4318 -v agentwatch-data:/data \
+  ghcr.io/akhilvuputuri/agentwatch:main serve --host 0.0.0.0 --retain-days 90 --memory-limit 256MB
+```
+
+Other containers that send to it by name must be allowed with `--allow-host <name>`.
+`--retain-days` deletes traces that ended more than that many days ago (checked at start and
+every 6 hours); without it, nothing is deleted. `--memory-limit` caps DuckDB's memory.
+
 ## Experiments
 
 Run a dataset through your agent and score the results:

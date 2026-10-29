@@ -39,6 +39,19 @@ def main(argv: list[str] | None = None) -> int:
         help="also accept requests addressed to this host name (repeatable; '*' for any)",
     )
     serve.add_argument(
+        "--retain-days",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help="delete traces that ended more than DAYS ago (checked every 6 hours; default: keep all)",
+    )
+    serve.add_argument(
+        "--memory-limit",
+        default=None,
+        metavar="SIZE",
+        help="cap DuckDB's memory, such as 256MB (default: DuckDB's own, 80%% of RAM)",
+    )
+    serve.add_argument(
         "--demo",
         action="store_true",
         help="load the synthetic demo dataset into an in-memory database",
@@ -51,19 +64,43 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "serve":
-        return _serve(args.db, args.host, args.port, args.demo, args.allow_host)
+        if args.retain_days is not None and not 1 <= args.retain_days <= 36500:
+            parser.error("--retain-days must be from 1 to 36500")
+        return _serve(
+            args.db,
+            args.host,
+            args.port,
+            args.demo,
+            args.allow_host,
+            retain_days=args.retain_days,
+            memory_limit=args.memory_limit,
+        )
     return _demo(args.db, args.traces, args.seed)
 
 
-def _serve(db: Path, host: str, port: int, demo: bool, extra_hosts: list[str]) -> int:
+def _serve(
+    db: Path,
+    host: str,
+    port: int,
+    demo: bool,
+    extra_hosts: list[str],
+    *,
+    retain_days: int | None = None,
+    memory_limit: str | None = None,
+) -> int:
     import uvicorn
 
     from agentwatch import demo as dataset
     from agentwatch.judges import JudgeRunner
+    from agentwatch.retention import Retention
     from agentwatch.server import LOOPBACK_HOSTS, create_app
     from agentwatch.store import Store
 
-    store = Store(None if demo else db)
+    try:
+        store = Store(None if demo else db, memory_limit=memory_limit)
+    except ValueError as error:
+        print(f"agentwatch: {error}", file=sys.stderr)
+        return 2
     if demo:
         now = time.time_ns()
         store.insert(dataset.generate(end_ns=now), now)
@@ -85,6 +122,9 @@ def _serve(db: Path, host: str, port: int, demo: bool, extra_hosts: list[str]) -
     # Judges are disabled until switched on, so the runner makes no model call until then.
     runner = JudgeRunner(store)
     runner.start()
+    retention = Retention(store, retain_days) if retain_days is not None else None
+    if retention is not None:
+        retention.start()
     try:
         uvicorn.run(
             create_app(store, allowed_hosts=allowed, judge_runner=runner),
@@ -93,8 +133,14 @@ def _serve(db: Path, host: str, port: int, demo: bool, extra_hosts: list[str]) -
             log_level="warning",
         )
     finally:
-        runner.stop()
-        store.close()
+        # Within a container's stop grace period: an in-flight judge call or prune is left
+        # to the daemon threads, and the database is closed only if they have finished
+        # (DuckDB replays its log at the next start otherwise).
+        runner.stop(timeout_s=3)
+        if retention is not None:
+            retention.stop(timeout_s=3)
+        if not runner.running and (retention is None or not retention.running):
+            store.close()
     return 0
 
 
