@@ -587,6 +587,7 @@ export interface Judge {
   sample_rate: number;
   daily_limit: number;
   service: string | null;
+  sessions_only: boolean;
   enabled: boolean;
   created_ns: string;
   enabled_ns: string | null;
@@ -594,7 +595,7 @@ export interface Judge {
   problem: string | null;
 }
 
-export type NewJudge = Pick<Judge, "name" | "model" | "base_url" | "api_key_env" | "prompt" | "score_type" | "sample_rate" | "daily_limit" | "service">;
+export type NewJudge = Pick<Judge, "name" | "model" | "base_url" | "api_key_env" | "prompt" | "score_type" | "sample_rate" | "daily_limit" | "service" | "sessions_only">;
 
 export interface Judgement {
   trace_id: string;

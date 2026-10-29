@@ -19,7 +19,7 @@ from agentwatch import genai
 from agentwatch.scores import Score, ScoreConflict, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
 # database and an upgraded one end up identical.
@@ -169,6 +169,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             PRIMARY KEY (judge_id, trace_id)
         )""",
     ),
+    8: ("ALTER TABLE judges ADD COLUMN sessions_only BOOLEAN NOT NULL DEFAULT false",),
 }
 REPORTED = "reported"
 CALCULATED = "calculated"

@@ -115,6 +115,8 @@ class Judge:
     created_ns: int
     # When it was last switched on; it judges traces that start after this.
     enabled_ns: int | None
+    # Only traces in a session (a conversation): skips background work with no one to answer.
+    sessions_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +142,7 @@ class Verdict:
 
 _COLUMNS = (
     "id, name, model, base_url, api_key_env, prompt, score_type, sample_rate, daily_limit, "
-    "service, enabled, created_ns, enabled_ns"
+    "service, enabled, created_ns, enabled_ns, sessions_only"
 )
 _JUDGEMENT_COLUMNS = (
     "trace_id, outcome, value, detail, input_tokens, output_tokens, cost_usd, created_ns"
@@ -169,7 +171,7 @@ def create_judge(store: Store, body: Any, *, now_ns: int | None = None) -> Judge
         if db.execute("SELECT 1 FROM judges WHERE name = ?", [judge.name]).fetchone():
             raise Conflict(f"a judge named {judge.name!r} already exists")
         db.execute(
-            f"INSERT INTO judges ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO judges ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             _values(judge),
         )
     return judge
@@ -186,6 +188,7 @@ _EDITABLE = (
     "daily_limit",
     "service",
     "enabled",
+    "sessions_only",
 )
 
 
@@ -209,8 +212,8 @@ def update_judge(store: Store, judge_id: str, body: Any, *, now_ns: int | None =
             judge = replace(judge, enabled_ns=current.enabled_ns)
         db.execute(
             "UPDATE judges SET model = ?, base_url = ?, api_key_env = ?, prompt = ?, "
-            "sample_rate = ?, daily_limit = ?, service = ?, enabled = ?, enabled_ns = ? "
-            "WHERE id = ?",
+            "sample_rate = ?, daily_limit = ?, service = ?, enabled = ?, enabled_ns = ?, "
+            "sessions_only = ? WHERE id = ?",
             [
                 judge.model,
                 judge.base_url,
@@ -221,6 +224,7 @@ def update_judge(store: Store, judge_id: str, body: Any, *, now_ns: int | None =
                 judge.service,
                 judge.enabled,
                 judge.enabled_ns,
+                judge.sessions_only,
                 judge.id,
             ],
         )
@@ -317,10 +321,17 @@ def _validated(fields: dict[str, Any], *, judge_id: str, created_ns: int) -> Jud
         sample_rate=float(rate),
         daily_limit=limit,
         service=None if service in (None, "") else _text(service, 200, "service"),
+        sessions_only=_sessions_only(fields.get("sessions_only", False)),
         enabled=enabled,
         created_ns=created_ns,
         enabled_ns=fields.get("enabled_ns"),
     )
+
+
+def _sessions_only(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise JudgeError("sessions_only must be true or false")
+    return value
 
 
 def _base_url(value: Any) -> str:
@@ -380,6 +391,7 @@ def _values(judge: Judge) -> list[Any]:
         judge.enabled,
         judge.created_ns,
         judge.enabled_ns,
+        judge.sessions_only,
     ]
 
 
@@ -443,7 +455,7 @@ def ask(
     question = _PLACEHOLDER.sub(
         lambda m: content[0] if m.group(1) == "input" else content[1], judge.prompt
     )
-    body = {
+    body: dict[str, Any] = {
         "model": judge.model,
         "temperature": 0,
         "max_tokens": 400,
@@ -452,6 +464,9 @@ def ask(
             {"role": "user", "content": question},
         ],
     }
+    if urlsplit(judge.base_url).hostname == "openrouter.ai":
+        # OpenRouter reports each call's cost only when asked.
+        body["usage"] = {"include": True}
     headers = {"content-type": "application/json"}
     if judge.api_key_env:
         key = env.get(judge.api_key_env)
@@ -648,13 +663,15 @@ class JudgeRunner:
                     max(received_ns) AS last_received,
                     bool_or(parent_span_id IS NULL) AS has_root,
                     arg_min(service_name, (parent_span_id IS NOT NULL, start_ns, span_id))
-                        AS service
+                        AS service,
+                    bool_or(conversation_id IS NOT NULL) AS in_session
                 FROM spans
                 GROUP BY trace_id
             )
             SELECT trace_id FROM t
             WHERE has_root AND start_ns >= ? AND last_received <= ?
               AND (CAST(? AS VARCHAR) IS NULL OR service = ?)
+              AND (NOT ? OR in_session)
               AND trace_id NOT IN (SELECT trace_id FROM judgements WHERE judge_id = ?)
             ORDER BY start_ns, trace_id
             LIMIT ?
@@ -664,6 +681,7 @@ class JudgeRunner:
                 now - self.settle_ns,
                 judge.service,
                 judge.service,
+                judge.sessions_only,
                 judge.id,
                 BATCH,
             ],

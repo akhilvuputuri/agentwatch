@@ -474,3 +474,50 @@ def test_redirects_are_refused_and_the_key_is_not_forwarded() -> None:
     finally:
         httpd.shutdown()
     assert hits == ["/v1/chat/completions Bearer secret"]
+
+
+def test_sessions_only_judges_skip_traces_outside_a_conversation() -> None:
+    db = Store()
+    judge = make(db, sessions_only=True)
+    background = trace(db, 1)
+    conversation = f"{2:032x}"
+    db.insert(
+        [
+            Span(
+                trace_id=conversation,
+                span_id="1" * 16,
+                parent_span_id=None,
+                name="agent",
+                start_ns=CREATED + SECOND,
+                end_ns=CREATED + 2 * SECOND,
+                attributes={
+                    "gen_ai.conversation.id": "thread.0",
+                    "gen_ai.input.messages": "hi",
+                    "gen_ai.output.messages": "hello",
+                },
+            )
+        ],
+        received_ns=CREATED + 2 * SECOND,
+    )
+    model = FakeModel()
+    assert runner(db, model).run_once() == 1
+    assert [j.trace_id for j in judges.judgements(db, judge.id)] == [conversation]
+    assert background not in {j.trace_id for j in judges.judgements(db, judge.id)}
+    assert judges.get_judge(db, judge.id).sessions_only is True
+    with pytest.raises(judges.JudgeError, match="sessions_only"):
+        judges.update_judge(db, judge.id, {"sessions_only": "yes"})
+
+
+def test_openrouter_is_asked_to_report_cost() -> None:
+    db = Store()
+    make(db, base_url="https://openrouter.ai/api/v1")
+    trace(db, 1)
+    model = FakeModel(_reply('{"score": true}', cost=0.0012))
+    runner(db, model).run_once()
+    assert model.requests[0][2]["usage"] == {"include": True}
+    other = FakeModel()
+    db2 = Store()
+    make(db2)
+    trace(db2, 1)
+    runner(db2, other).run_once()
+    assert "usage" not in other.requests[0][2]

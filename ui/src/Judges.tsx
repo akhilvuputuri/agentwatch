@@ -144,7 +144,10 @@ function JudgeRow({
         <button type="button" className="link" onClick={onOpen}>
           {judge.name}
         </button>
-        <div className="muted small">{judge.score_type === "BOOLEAN" ? "true / false" : "0 to 1"}</div>
+        <div className="muted small">
+          {judge.score_type === "BOOLEAN" ? "true / false" : "0 to 1"}
+          {judge.sessions_only ? " · conversations only" : ""}
+        </div>
       </td>
       <td>
         <code>{judge.model}</code>
@@ -234,6 +237,7 @@ function JudgeForm({ onAdded, onError }: { onAdded: (judge: Judge) => void; onEr
   const [samplePercent, setSamplePercent] = useState("10");
   const [limit, setLimit] = useState("50");
   const [service, setService] = useState("");
+  const [sessionsOnly, setSessionsOnly] = useState(true);
   const [saving, setSaving] = useState(false);
 
   const submit = (event: FormEvent) => {
@@ -253,6 +257,7 @@ function JudgeForm({ onAdded, onError }: { onAdded: (judge: Judge) => void; onEr
       sample_rate: rate,
       daily_limit: daily,
       service: service.trim() || null,
+      sessions_only: sessionsOnly,
     }).then(
       (judge) => {
         setSaving(false);
@@ -295,6 +300,10 @@ function JudgeForm({ onAdded, onError }: { onAdded: (judge: Judge) => void; onEr
       </label>
       <label>
         Service <input value={service} onChange={(e) => setService(e.target.value)} placeholder="all" size={12} />
+      </label>
+      <label>
+        Conversations only
+        <input type="checkbox" checked={sessionsOnly} onChange={(e) => setSessionsOnly(e.target.checked)} />
       </label>
       <label className="full">
         Question ({"{input}"} and {"{output}"} are replaced by the trace's messages)

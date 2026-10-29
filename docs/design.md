@@ -305,6 +305,8 @@ as traces arrive, not over a dataset.
   and `{output}` placeholders, a score type (`BOOLEAN` or `NUMERIC` from 0 to 1), a sample rate,
   a limit of model calls per 24 hours, an optional root service filter, and whether it is on. The
   name and score type are fixed for life; everything else can change. A new judge is off.
+  `sessions_only` (schema version 8) limits it to traces in a session, that is with a
+  `gen_ai.conversation.id`, so background work that answers no one is not judged.
   Switching it off, deleting it or lowering its limit takes effect before its next model call,
   even in the middle of a pass.
 - **What it sees.** The trace's captured input and output: the root span's
@@ -327,7 +329,8 @@ as traces arrive, not over a dataset.
   Temperature 0, at most 400 output tokens, a 60-second timeout. The first `{` to the last `}` of
   the reply is parsed, so a fenced or chatty reply still works. A score of the wrong type, or
   outside 0 to 1, is a failure. The reply's `usage.prompt_tokens`, `completion_tokens` and
-  `cost` (OpenRouter reports cost) are recorded per judgement. Redirects are not followed (one is
+  `cost` are recorded per judgement; a judge whose endpoint is `openrouter.ai` asks for
+  usage accounting (`"usage": {"include": true}`), without which OpenRouter reports no cost. Redirects are not followed (one is
   a failure), so the key cannot be sent to another host or over plain HTTP.
 - **Record** (`judgements` table, one row per judge and trace): outcome (`SCORED`, `FAILED`,
   `PENDING`, `NOT_SAMPLED`, `NO_CONTENT`, `OVER_LIMIT`), value, explanation or failure reason,
