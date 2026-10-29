@@ -353,6 +353,25 @@ scores are evidence to read alongside others, not ground truth. Whether a judge 
 people has not been measured; a judge's question should be checked on a few traces with the
 trial endpoint before it is switched on.
 
+## Retention and the server image
+
+`agentwatch serve --retain-days N` deletes, at start and every 6 hours, every trace whose last
+span ended more than N days ago, with its scores and judgements (`Store.prune`). A trace with
+any recent span is kept whole. Traces of experiment runs are kept, since their runs still link
+to them. Scores and judgements older than the cutoff whose trace no longer exists, or never
+arrived, are deleted too; a recent score whose trace has not arrived yet is kept. DuckDB reuses
+the freed space rather than shrinking the file. Without the flag, nothing is deleted.
+
+`--memory-limit` sets DuckDB's `memory_limit` (it spills to disk beyond it), for a shared host.
+The value is checked against a size pattern before it is used.
+
+The image (`Dockerfile`) builds the UI in a Node stage and installs the locked dependencies with
+uv into a Python 3.13 slim image; all three base images are pinned by digest. It runs as UID
+10001, keeps the database in the `/data` volume, has a health check on `/healthz`, and starts
+`agentwatch serve --host 0.0.0.0`. The image workflow builds it on every pull request and smoke-
+tests it: health, OTLP ingest, the UI, the non-root user, and that data survives a restart. On
+`main` it publishes to GHCR as `sha-<commit>` and `main` and records the digest.
+
 ## Sessions and users
 
 A trace's session is the `gen_ai.conversation.id` (or OpenInference `session.id`) of its root span,

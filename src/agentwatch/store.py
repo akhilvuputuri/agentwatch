@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 import tempfile
 import threading
 from collections.abc import Generator, Iterable, Sequence
@@ -472,7 +473,7 @@ summaries AS (
 class Store:
     """A single-process store. All access is serialized through one lock."""
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(self, path: str | Path | None = None, *, memory_limit: str | None = None) -> None:
         target = ":memory:" if path is None else str(path)
         if path is not None:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -482,6 +483,9 @@ class Store:
         self._db = duckdb.connect(target)
         # A library must not draw progress bars on the server's stderr.
         self._db.execute("SET enable_progress_bar = false")
+        if memory_limit is not None:
+            # A shared host: cap DuckDB's buffer memory (it spills to disk beyond this).
+            self._db.execute(f"SET memory_limit = '{_memory(memory_limit)}'")
         with self._lock:
             self._migrate()
             self._rederive()
@@ -629,6 +633,31 @@ class Store:
                 with contextlib.suppress(duckdb.Error):
                     self._db.execute("ROLLBACK")
                 raise
+
+    def prune(self, before_ns: int) -> int:
+        """Deletes traces that ended before `before_ns`, with their scores and judgements.
+
+        Traces of experiment runs are kept, since their runs still show them. Scores and
+        judgements older than the cutoff whose trace is gone (or never arrived) go too.
+        Returns the number of traces deleted.
+        """
+        with self.transaction() as db:
+            db.execute(
+                """CREATE OR REPLACE TEMP TABLE pruned AS
+                SELECT trace_id FROM spans GROUP BY trace_id
+                HAVING max(end_ns) < ? AND trace_id NOT IN (SELECT trace_id FROM run_items)""",
+                [before_ns],
+            )
+            count = db.execute("SELECT count(*) FROM pruned").fetchone()
+            db.execute("DELETE FROM spans WHERE trace_id IN (SELECT trace_id FROM pruned)")
+            for table in ("scores", "judgements"):
+                db.execute(
+                    f"DELETE FROM {table} WHERE created_ns < ? "
+                    "AND trace_id NOT IN (SELECT DISTINCT trace_id FROM spans)",
+                    [before_ns],
+                )
+            db.execute("DROP TABLE pruned")
+        return count[0] if count else 0
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> Any:
         rows = self.query(sql, params)
@@ -983,6 +1012,13 @@ class Store:
                 [trace_id.lower()],
             ).fetchall()
         return [_stored(row) for row in rows]
+
+
+def _memory(value: str) -> str:
+    """A DuckDB memory size such as 256MB or 1GiB, checked so it can be inlined in SQL."""
+    if not re.fullmatch(r"\d{1,6}(?:\.\d{1,3})?\s*(?:[KMGT]i?B)", value.strip(), re.IGNORECASE):
+        raise ValueError(f"memory limit must look like 256MB or 1GiB, not {value!r}")
+    return value.strip()
 
 
 def _row(span: Span, received_ns: int) -> Sequence[Any]:
