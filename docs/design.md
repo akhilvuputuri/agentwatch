@@ -215,7 +215,8 @@ agentwatch's modules standing in for them. Every figure matched except eight Wil
 bounds, which move by at most 0.00017 (a `calls_saved_per_100` bound) and otherwise by less than
 0.00001, because agentwatch uses the exact 97.5th normal percentile (1.959964) instead of 1.96.
 No verdict, point estimate, p-value or bootstrap interval changed. Wilson bounds at 0 and n
-successes are exactly 0 and 1.
+successes are exactly 0 and 1. One more intended difference does not show in those reports:
+`call_stats` ignores a latency or cost given as a boolean, where Chief's counted `True` as 1.
 
 Chief keeps its own copies until agentwatch is published: Chief installs Python dependencies
 with `--require-hashes`, which a git-pinned package cannot satisfy. At the first PyPI release
