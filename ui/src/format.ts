@@ -11,8 +11,16 @@ export function duration(ns: number): string {
   if (ms < 1000) return `${ms.toFixed(ms < 10 ? 1 : 0)} ms`;
   const s = ms / 1000;
   if (s < 60) return `${s.toFixed(s < 10 ? 2 : 1)} s`;
-  const minutes = Math.floor(s / 60);
-  return `${minutes} m ${Math.round(s - minutes * 60)} s`;
+  if (s < 3600) {
+    const minutes = Math.floor(s / 60);
+    return `${minutes} m ${Math.round(s - minutes * 60)} s`;
+  }
+  if (s < 86400) {
+    const hours = Math.floor(s / 3600);
+    return `${hours} h ${Math.round((s - hours * 3600) / 60)} m`;
+  }
+  const days = Math.floor(s / 86400);
+  return `${days} d ${Math.round((s - days * 86400) / 3600)} h`;
 }
 
 export function count(value: number | null | undefined): string {

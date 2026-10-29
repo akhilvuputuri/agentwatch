@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { getTrace, STATUS_ERROR, type SpanRecord } from "./api";
+import { getTrace, links, STATUS_ERROR, type SpanRecord } from "./api";
 import { count, duration, timestamp, usd } from "./format";
 import { layout, type Row } from "./tree";
 
@@ -31,6 +31,8 @@ export function TraceView({ traceId }: { traceId: string }) {
   if (!spans) return <p className="muted">Loading…</p>;
 
   const root = view.rows[0]?.span;
+  const sessionId = spans.find((s) => s.genai.conversation_id)?.genai.conversation_id ?? null;
+  const userId = spans.find((s) => s.genai.user_id)?.genai.user_id ?? null;
   return (
     <section className="trace">
       <p>
@@ -40,6 +42,18 @@ export function TraceView({ traceId }: { traceId: string }) {
       <p className="muted small">
         {root && timestamp(root.start_ns)} · {duration(view.totalNs)} · {spans.length} spans ·{" "}
         <code>{traceId}</code>
+        {sessionId && (
+          <>
+            {" · "}
+            <a href={links.session(sessionId)}>session {sessionId}</a>
+          </>
+        )}
+        {userId && (
+          <>
+            {" · "}
+            <a href={links.traces({ user: userId })}>user {userId}</a>
+          </>
+        )}
       </p>
       <div className="split">
         <div className="waterfall" role="tree" aria-label="Span tree">

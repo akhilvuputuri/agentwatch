@@ -146,10 +146,52 @@ class TraceSummary:
     calls_without_cost: int
     models: tuple[str, ...]
     complete: bool
+    session_id: str | None = None
+    user_id: str | None = None
 
     @property
     def cursor(self) -> Cursor:
         return Cursor(self.start_ns, self.trace_id)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSummary:
+    session_id: str
+    traces: int
+    first_start_ns: int
+    last_start_ns: int
+    last_end_ns: int
+    error_count: int
+    model_calls: int
+    tool_calls: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float | None
+    calls_without_cost: int
+    users: tuple[str, ...]
+    services: tuple[str, ...]
+
+    @property
+    def cursor(self) -> SessionCursor:
+        return SessionCursor(self.last_start_ns, self.session_id)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCursor:
+    """A position in the session list: most recent trace start descending, then session ID."""
+
+    last_start_ns: int
+    session_id: str
+
+    def encode(self) -> str:
+        return f"{self.last_start_ns}:{self.session_id}"
+
+    @staticmethod
+    def decode(value: str) -> SessionCursor:
+        start, separator, session_id = value.partition(":")
+        if not separator or not start.isascii() or not start.isdigit() or len(start) > 19:
+            raise ValueError("cursor must be <start_ns>:<session_id>")
+        return SessionCursor(int(start), session_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +242,39 @@ roots AS (
 """
 
 
+# One row per trace: totals, root, and the trace's session and user (from its root span when
+# set there, otherwise from the earliest span that has one).
+SUMMARIES_SQL = f"""
+{ROOTS_SQL},
+totals AS (
+    SELECT
+        trace_id,
+        min(start_ns) AS start_ns,
+        max(end_ns) AS end_ns,
+        count(*) AS span_count,
+        count(*) FILTER (WHERE status_code = {STATUS_ERROR}) AS error_count,
+        count(*) FILTER (WHERE is_model_call) AS model_calls,
+        count(*) FILTER (WHERE operation = 'execute_tool') AS tool_calls,
+        coalesce(sum(input_tokens) FILTER (WHERE is_model_call), 0) AS input_tokens,
+        coalesce(sum(output_tokens) FILTER (WHERE is_model_call), 0) AS output_tokens,
+        coalesce(sum(cache_read_tokens) FILTER (WHERE is_model_call), 0) AS cache_read,
+        sum(cost_usd) FILTER (WHERE counts_toward_totals) AS cost_usd,
+        count(*) FILTER (WHERE is_model_call AND cost_usd IS NULL) AS calls_without_cost,
+        list(DISTINCT coalesce(response_model, request_model) ORDER BY coalesce(response_model, request_model))
+            FILTER (WHERE is_model_call AND coalesce(response_model, request_model) IS NOT NULL) AS models,
+        arg_min(conversation_id, (parent_span_id IS NOT NULL, start_ns, span_id))
+            FILTER (WHERE conversation_id IS NOT NULL) AS session_id,
+        arg_min(user_id, (parent_span_id IS NOT NULL, start_ns, span_id))
+            FILTER (WHERE user_id IS NOT NULL) AS user_id
+    FROM spans GROUP BY trace_id
+),
+summaries AS (
+    SELECT t.*, r.root_name, r.service_name, r.complete
+    FROM totals t JOIN roots r USING (trace_id)
+)
+"""
+
+
 class Store:
     """A single-process store. All access is serialized through one lock."""
 
@@ -207,6 +282,8 @@ class Store:
         target = ":memory:" if path is None else str(path)
         if path is not None:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+        # Scratch files (re-derivation) go next to the database, not in a small /tmp.
+        self._scratch = None if path is None else Path(path).parent
         self._lock = threading.Lock()
         self._db = duckdb.connect(target)
         # A library must not draw progress bars on the server's stderr.
@@ -266,7 +343,7 @@ class Store:
         assignments = ", ".join(f"{column} = d.{column}" for column in _DERIVED)
         # Only rows whose values change are rewritten; a rule change usually touches few.
         changed = " OR ".join(f"spans.{column} IS DISTINCT FROM d.{column}" for column in _DERIVED)
-        with tempfile.TemporaryDirectory(prefix="agentwatch-") as folder:
+        with tempfile.TemporaryDirectory(prefix="agentwatch-", dir=self._scratch) as folder:
             path = Path(folder) / "derived.ndjson"
             with path.open("w", encoding="utf-8") as out:
                 # One scan, fetched a chunk at a time from DuckDB's streaming result.
@@ -366,6 +443,8 @@ class Store:
         before: Cursor | None = None,
         service: str | None = None,
         errors_only: bool = False,
+        session: str | None = None,
+        user: str | None = None,
     ) -> list[TraceSummary]:
         """Most recent traces first. Page with the last trace's `cursor` as `before`."""
         filters: list[str] = []
@@ -373,6 +452,12 @@ class Store:
         if service is not None:
             filters.append("service_name = ?")
             params.append(service)
+        if session is not None:
+            filters.append("session_id = ?")
+            params.append(session)
+        if user is not None:
+            filters.append("user_id = ?")
+            params.append(user)
         if before is not None:
             # Traces sharing a start time are ordered by ID, so the cursor needs both.
             filters.append("(start_ns < ? OR (start_ns = ? AND trace_id > ?))")
@@ -382,33 +467,11 @@ class Store:
         where = f"WHERE {' AND '.join(filters)}" if filters else ""
         params.append(max(1, min(limit, 500)))
         query = f"""
-            WITH {ROOTS_SQL},
-            totals AS (
-                SELECT
-                    trace_id,
-                    min(start_ns) AS start_ns,
-                    max(end_ns) AS end_ns,
-                    count(*) AS span_count,
-                    count(*) FILTER (WHERE status_code = {STATUS_ERROR}) AS error_count,
-                    count(*) FILTER (WHERE is_model_call) AS model_calls,
-                    count(*) FILTER (WHERE operation = 'execute_tool') AS tool_calls,
-                    coalesce(sum(input_tokens) FILTER (WHERE is_model_call), 0) AS input_tokens,
-                    coalesce(sum(output_tokens) FILTER (WHERE is_model_call), 0) AS output_tokens,
-                    coalesce(sum(cache_read_tokens) FILTER (WHERE is_model_call), 0) AS cache_read,
-                    sum(cost_usd) FILTER (WHERE counts_toward_totals) AS cost_usd,
-                    count(*) FILTER (WHERE is_model_call AND cost_usd IS NULL) AS calls_without_cost,
-                    list(DISTINCT coalesce(response_model, request_model) ORDER BY coalesce(response_model, request_model))
-                        FILTER (WHERE is_model_call AND coalesce(response_model, request_model) IS NOT NULL) AS models
-                FROM spans GROUP BY trace_id
-            ),
-            joined AS (
-                SELECT t.*, r.root_name, r.service_name, r.complete
-                FROM totals t JOIN roots r USING (trace_id)
-            )
+            WITH {SUMMARIES_SQL}
             SELECT trace_id, root_name, service_name, start_ns, end_ns - start_ns, span_count,
                    error_count, model_calls, tool_calls, input_tokens, output_tokens, cache_read,
-                   cost_usd, calls_without_cost, coalesce(models, []), complete
-            FROM joined {where}
+                   cost_usd, calls_without_cost, coalesce(models, []), complete, session_id, user_id
+            FROM summaries {where}
             ORDER BY start_ns DESC, trace_id
             LIMIT ?
         """
@@ -432,6 +495,68 @@ class Store:
                 calls_without_cost=int(row[13]),
                 models=tuple(row[14]),
                 complete=bool(row[15]),
+                session_id=row[16],
+                user_id=row[17],
+            )
+            for row in rows
+        ]
+
+    def sessions(
+        self,
+        *,
+        limit: int = 50,
+        before: SessionCursor | None = None,
+        service: str | None = None,
+        user: str | None = None,
+        session: str | None = None,
+    ) -> list[SessionSummary]:
+        """Sessions with the most recent activity first, paged by `cursor`."""
+        filters = ["session_id IS NOT NULL"]
+        params: list[Any] = []
+        if session is not None:
+            filters.append("session_id = ?")
+            params.append(session)
+        if service is not None:
+            filters.append("service_name = ?")
+            params.append(service)
+        if user is not None:
+            filters.append("user_id = ?")
+            params.append(user)
+        having = ""
+        if before is not None:
+            having = "HAVING max(start_ns) < ? OR (max(start_ns) = ? AND session_id > ?)"
+            params.extend([before.last_start_ns, before.last_start_ns, before.session_id])
+        params.append(max(1, min(limit, 500)))
+        query = f"""
+            WITH {SUMMARIES_SQL}
+            SELECT session_id, count(*), min(start_ns), max(start_ns), max(end_ns),
+                   sum(error_count), sum(model_calls), sum(tool_calls), sum(input_tokens),
+                   sum(output_tokens), sum(cost_usd), sum(calls_without_cost),
+                   list(DISTINCT user_id ORDER BY user_id) FILTER (WHERE user_id IS NOT NULL),
+                   list(DISTINCT service_name ORDER BY service_name)
+            FROM summaries WHERE {" AND ".join(filters)}
+            GROUP BY session_id {having}
+            ORDER BY max(start_ns) DESC, session_id
+            LIMIT ?
+        """
+        with self._lock:
+            rows = self._db.execute(query, params).fetchall()
+        return [
+            SessionSummary(
+                session_id=row[0],
+                traces=int(row[1]),
+                first_start_ns=int(row[2]),
+                last_start_ns=int(row[3]),
+                last_end_ns=int(row[4]),
+                error_count=int(row[5]),
+                model_calls=int(row[6]),
+                tool_calls=int(row[7]),
+                input_tokens=int(row[8]),
+                output_tokens=int(row[9]),
+                cost_usd=None if row[10] is None else float(row[10]),
+                calls_without_cost=int(row[11]),
+                users=tuple(row[12] or ()),
+                services=tuple(row[13] or ()),
             )
             for row in rows
         ]

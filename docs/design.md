@@ -46,6 +46,9 @@ reasons, tool and agent names, session and user, error type).
 moves to the next name when a value is present but unusable (for example a token count that is not
 a number). The README lists the names.
 
+Re-derivation writes its scratch file next to the database file, not in the system temp
+directory, which can be a small in-memory file system.
+
 Two version numbers in `meta` keep stored data current:
 
 - `schema`: the table layout. A new database is created at version 1 and brought up to date
@@ -83,9 +86,22 @@ strings, because they exceed JavaScript's exact integer range. Durations are num
   ties ordered by trace ID. The response's `next` is the cursor (`<start_ns>:<trace_id>`) for the
   following page, or null.
 - `GET /api/traces/<trace_id>`: every span, with the extracted `genai` fields.
+- `GET /api/traces?session=<id>&user=<id>`: the same list, filtered to one session or user.
+- `GET /api/sessions?limit=50&before=<cursor>&service=<name>&user=<id>`: sessions with the most
+  recent trace first; `next` is `<last trace start_ns>:<session_id>`.
+- `GET /api/sessions/<session_id>`: the session's totals and its traces, oldest first (the most
+  recent 500 if longer, with `truncated`). Session IDs may contain `/`.
 - `GET /api/metrics?from=<ns>&to=<ns>&service=<name>` (or `range=all`; the default is the last 24
   hours): the dashboard's figures, below.
 - `GET /api/services` (root services, the values the list filters on), `GET /healthz`.
+
+## Sessions and users
+
+A trace's session is the `gen_ai.conversation.id` (or OpenInference `session.id`) of its root span,
+or of its earliest span that has one when the root does not; its user is found the same way from
+`user.id`. Sessions are computed at query time from the per-trace summaries, so a session's totals
+are sums over its traces and its time range runs from its first trace's start to its last trace's
+end. Traces with no session do not appear in the session list.
 
 ## Dashboard metrics
 

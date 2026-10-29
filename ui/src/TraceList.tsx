@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { listServices, listTraces, type TraceSummary } from "./api";
+import { links, listServices, listTraces, type TraceSummary } from "./api";
 import { count, duration, share, timestamp, usd } from "./format";
 
 const PAGE = 50;
 
-export function TraceList() {
+export function TraceList({ session, user }: { session?: string; user?: string }) {
   const [service, setService] = useState("");
   const [errors, setErrors] = useState(false);
   const [services, setServices] = useState<string[]>([]);
@@ -15,6 +15,7 @@ export function TraceList() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [reload, setReload] = useState(0);
+  const filters = { ...(session ? { session } : {}), ...(user ? { user } : {}) };
 
   useEffect(() => {
     const controller = new AbortController();
@@ -27,7 +28,7 @@ export function TraceList() {
     older.current?.abort();
     setNext(null);
     setLoading(true);
-    listTraces({ limit: PAGE, service, errors }, controller.signal).then(
+    listTraces({ limit: PAGE, service, errors, ...filters }, controller.signal).then(
       (page) => {
         setTraces(page.traces);
         setNext(page.next);
@@ -48,7 +49,7 @@ export function TraceList() {
     older.current?.abort();
     const controller = new AbortController();
     older.current = controller;
-    listTraces({ limit: PAGE, service, errors, before: next }, controller.signal).then(
+    listTraces({ limit: PAGE, service, errors, ...filters, before: next }, controller.signal).then(
       (page) => {
         setTraces((current) => {
           const known = new Set(current.map((t) => t.trace_id));
@@ -83,6 +84,22 @@ export function TraceList() {
         <button type="button" onClick={() => setReload((n) => n + 1)}>
           Refresh
         </button>
+        {session && (
+          <span className="chip">
+            Session <a href={links.session(session)}>{session}</a>{" "}
+            <a href={links.traces(user ? { user } : {})} aria-label="Clear session filter">
+              ✕
+            </a>
+          </span>
+        )}
+        {user && (
+          <span className="chip">
+            User {user}{" "}
+            <a href={links.traces(session ? { session } : {})} aria-label="Clear user filter">
+              ✕
+            </a>
+          </span>
+        )}
       </div>
       {error && <p className="error">Could not load traces: {error}</p>}
       {!error && !loading && traces.length === 0 && (
@@ -117,6 +134,18 @@ export function TraceList() {
                     <div className="muted small">
                       {trace.service_name}
                       {trace.models.length > 0 && ` · ${trace.models.join(", ")}`}
+                      {trace.session_id && (
+                        <>
+                          {" · "}
+                          <a href={links.session(trace.session_id)}>session {trace.session_id}</a>
+                        </>
+                      )}
+                      {trace.user_id && (
+                        <>
+                          {" · "}
+                          <a href={links.traces({ user: trace.user_id })}>{trace.user_id}</a>
+                        </>
+                      )}
                     </div>
                   </td>
                   <td className="num">{duration(trace.duration_ns)}</td>

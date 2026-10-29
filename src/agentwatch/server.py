@@ -27,13 +27,22 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from agentwatch import metrics, otlp
 from agentwatch.spans import jsonable
-from agentwatch.store import Cursor, Store, StoredSpan, TraceSummary
+from agentwatch.store import (
+    Cursor,
+    SessionCursor,
+    SessionSummary,
+    Store,
+    StoredSpan,
+    TraceSummary,
+)
 
 # Largest compressed request accepted before decoding.
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 DAY_NS = 24 * 3600 * 1_000_000_000
+# Traces returned with one session.
+SESSION_TRACES = 500
 
 
 def create_app(
@@ -90,6 +99,8 @@ def create_app(
             before=cursor,
             service=query.get("service") or None,
             errors_only=query.get("errors") in ("1", "true"),
+            session=query.get("session") or None,
+            user=query.get("user") or None,
         )
         following = summaries[-1].cursor.encode() if len(summaries) == limit else None
         return JSONResponse(
@@ -125,6 +136,41 @@ def create_app(
             window = metrics.Window(start, end, service)
         return JSONResponse(await run_in_threadpool(metrics.metrics, store, window))
 
+    async def sessions(request: Request) -> Response:
+        query = request.query_params
+        try:
+            limit = max(1, min(int(query.get("limit", "50")), 500))
+            before = query.get("before")
+            cursor = None if before in (None, "") else SessionCursor.decode(before)
+        except ValueError:
+            return PlainTextResponse(
+                "limit must be an integer and before a cursor from `next`", status_code=400
+            )
+        found = await run_in_threadpool(
+            store.sessions,
+            limit=limit,
+            before=cursor,
+            service=query.get("service") or None,
+            user=query.get("user") or None,
+        )
+        following = found[-1].cursor.encode() if len(found) == limit else None
+        return JSONResponse({"sessions": [_session_json(s) for s in found], "next": following})
+
+    async def session(request: Request) -> Response:
+        session_id = str(request.path_params["session_id"])
+        found = await run_in_threadpool(store.sessions, limit=1, session=session_id)
+        if not found:
+            return PlainTextResponse("session not found", status_code=404)
+        traces = await run_in_threadpool(store.traces, limit=SESSION_TRACES, session=session_id)
+        return JSONResponse(
+            {
+                "session": _session_json(found[0]),
+                # Oldest first, as a conversation reads; the most recent SESSION_TRACES if longer.
+                "traces": [_summary_json(t) for t in reversed(traces)],
+                "truncated": found[0].traces > len(traces),
+            }
+        )
+
     async def services(_: Request) -> Response:
         return JSONResponse({"services": await run_in_threadpool(store.services)})
 
@@ -136,6 +182,8 @@ def create_app(
         Route("/api/traces", traces),
         Route("/api/traces/{trace_id}", trace),
         Route("/api/metrics", metrics_view),
+        Route("/api/sessions", sessions),
+        Route("/api/sessions/{session_id:path}", session),
         Route("/api/services", services),
         Route("/healthz", health),
     ]
@@ -216,6 +264,13 @@ def _summary_json(summary: TraceSummary) -> dict[str, Any]:
     return data
 
 
+def _session_json(summary: SessionSummary) -> dict[str, Any]:
+    data = asdict(summary)
+    for key in ("first_start_ns", "last_start_ns", "last_end_ns"):
+        data[key] = str(data[key])
+    return data
+
+
 def _span_json(stored: StoredSpan) -> dict[str, Any]:
     span = stored.span
     fields = stored.fields
@@ -255,5 +310,7 @@ def _span_json(stored: StoredSpan) -> dict[str, Any]:
             "tool_name": fields.tool_name,
             "agent_name": fields.agent_name,
             "error_type": fields.error_type,
+            "conversation_id": fields.conversation_id,
+            "user_id": fields.user_id,
         },
     }
