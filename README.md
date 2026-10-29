@@ -122,7 +122,8 @@ the Judges page or with `POST /api/judges`: a score name, a model, any OpenAI-co
 key, a question about `{input}` and `{output}`, a sample rate and a limit of calls a day. Judges
 start switched off, see only traces that arrive after they were switched on, and skip traces whose
 messages were not captured. Judging sends those messages to the endpoint you chose; nothing
-else leaves the machine. See [the design notes](docs/design.md#llm-judges).
+else leaves the machine. On a shared machine, pin what judges may do with `serve --judge-endpoint`,
+`--judge-key-env` and `--judge-max-daily`. See [the design notes](docs/design.md#llm-judges).
 
 ## Develop
 

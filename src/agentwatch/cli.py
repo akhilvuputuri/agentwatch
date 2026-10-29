@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+from agentwatch.judges import JudgePolicy
+
 DEFAULT_DB = Path(
     os.environ.get("AGENTWATCH_DB", Path.home() / ".agentwatch" / "agentwatch.duckdb")
 )
@@ -52,6 +54,27 @@ def main(argv: list[str] | None = None) -> int:
         help="cap DuckDB's memory, such as 256MB (default: DuckDB's own, 80%% of RAM)",
     )
     serve.add_argument(
+        "--judge-endpoint",
+        action="append",
+        default=[],
+        metavar="URL",
+        help="the only base URL judges may call (repeatable; default: any https endpoint)",
+    )
+    serve.add_argument(
+        "--judge-key-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="the only API key variable judges may use (repeatable; default: any *_API_KEY)",
+    )
+    serve.add_argument(
+        "--judge-max-daily",
+        type=int,
+        default=10_000,
+        metavar="N",
+        help="the highest daily call limit a judge may have (default: %(default)s)",
+    )
+    serve.add_argument(
         "--demo",
         action="store_true",
         help="load the synthetic demo dataset into an in-memory database",
@@ -64,6 +87,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "serve":
+        if not 1 <= args.judge_max_daily <= 10_000:
+            parser.error("--judge-max-daily must be from 1 to 10000")
         if args.retain_days is not None and not 1 <= args.retain_days <= 36500:
             parser.error("--retain-days must be from 1 to 36500")
         return _serve(
@@ -74,6 +99,11 @@ def main(argv: list[str] | None = None) -> int:
             args.allow_host,
             retain_days=args.retain_days,
             memory_limit=args.memory_limit,
+            judge_policy=JudgePolicy(
+                endpoints=tuple(u.strip().rstrip("/") for u in args.judge_endpoint),
+                key_envs=tuple(args.judge_key_env),
+                max_daily=args.judge_max_daily,
+            ),
         )
     return _demo(args.db, args.traces, args.seed)
 
@@ -87,6 +117,7 @@ def _serve(
     *,
     retain_days: int | None = None,
     memory_limit: str | None = None,
+    judge_policy: JudgePolicy | None = None,
 ) -> int:
     import uvicorn
 
@@ -120,7 +151,7 @@ def _serve(
         f"agentwatch on http://{host}:{port} ({where}); OTLP endpoint http://{host}:{port}/v1/traces"
     )
     # Judges are disabled until switched on, so the runner makes no model call until then.
-    runner = JudgeRunner(store)
+    runner = JudgeRunner(store, policy=judge_policy or JudgePolicy())
     runner.start()
     retention = Retention(store, retain_days) if retain_days is not None else None
     if retention is not None:
