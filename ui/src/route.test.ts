@@ -8,6 +8,8 @@ describe("route", () => {
     expect(route("#/dashboard")).toEqual({ page: "dashboard" });
     expect(route("#/sessions")).toEqual({ page: "sessions" });
     expect(route("#/prices")).toEqual({ page: "prices" });
+    expect(route("#/datasets")).toEqual({ page: "datasets" });
+    expect(route(links.dataset("a b/c"))).toEqual({ page: "dataset", datasetId: "a b/c" });
     expect(route(`#/trace/${"A".repeat(32)}`)).toEqual({ page: "trace", traceId: "a".repeat(32) });
   });
   it("round-trips session and user IDs of any shape", () => {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getTrace, links, STATUS_ERROR, type Score, type TraceDetail } from "./api";
 import { count, duration, timestamp, usd } from "./format";
+import { AddToDataset } from "./AddToDataset";
 import { ScorePanel } from "./ScorePanel";
 import { layout, type Row } from "./tree";
 
@@ -63,6 +64,7 @@ export function TraceView({ traceId }: { traceId: string }) {
           </>
         )}
       </p>
+      <AddToDataset traceId={traceId} spanId={chosen?.span.span_id ?? null} spanName={chosen?.span.name ?? null} />
       <ScorePanel
         traceId={traceId}
         spanId={chosen?.span.span_id ?? null}

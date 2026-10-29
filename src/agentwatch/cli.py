@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import sys
@@ -65,6 +66,7 @@ def _serve(db: Path, host: str, port: int, demo: bool, extra_hosts: list[str]) -
     if demo:
         now = time.time_ns()
         store.insert(dataset.generate(end_ns=now), now)
+        dataset.seed_datasets(store)
     allowed = [*LOOPBACK_HOSTS, *extra_hosts]
     if host not in ("0.0.0.0", "::"):
         allowed.append(host)
@@ -89,12 +91,15 @@ def _serve(db: Path, host: str, port: int, demo: bool, extra_hosts: list[str]) -
 
 
 def _demo(db: Path, traces: int, seed: int) -> int:
+    from agentwatch import datasets
     from agentwatch import demo as dataset
     from agentwatch.store import Store
 
     store = Store(db)
     now = time.time_ns()
     count = store.insert(dataset.generate(traces=traces, seed=seed, end_ns=now), now)
+    with contextlib.suppress(datasets.Conflict):  # already seeded
+        dataset.seed_datasets(store)
     store.close()
     print(f"wrote {count} synthetic spans in {traces} traces to {db}")
     return 0

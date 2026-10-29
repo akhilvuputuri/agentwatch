@@ -7,7 +7,7 @@ import json
 import logging
 import tempfile
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Generator, Iterable, Sequence
 from dataclasses import astuple, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -18,7 +18,7 @@ from agentwatch import genai
 from agentwatch.scores import Score, ScoreConflict, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
 # database and an upgraded one end up identical.
@@ -95,6 +95,27 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             start_ns BIGINT,
             created_ns BIGINT NOT NULL
         )""",
+    ),
+    5: (
+        """CREATE TABLE datasets (
+            id VARCHAR PRIMARY KEY,
+            name VARCHAR NOT NULL UNIQUE,
+            description VARCHAR,
+            metadata JSON NOT NULL,
+            created_ns BIGINT NOT NULL
+        )""",
+        """CREATE TABLE dataset_items (
+            id VARCHAR PRIMARY KEY,
+            dataset_id VARCHAR NOT NULL,
+            input JSON,
+            expected_output JSON,
+            metadata JSON NOT NULL,
+            source_trace_id VARCHAR,
+            source_span_id VARCHAR,
+            status VARCHAR NOT NULL,
+            created_ns BIGINT NOT NULL
+        )""",
+        "CREATE INDEX dataset_items_dataset ON dataset_items (dataset_id)",
     ),
 }
 REPORTED = "reported"
@@ -544,6 +565,19 @@ class Store:
         if with_names:
             return [dict(zip(names, row, strict=True)) for row in rows]
         return rows
+
+    @contextlib.contextmanager
+    def transaction(self) -> Generator[duckdb.DuckDBPyConnection]:
+        """The connection, under the store's lock, in a transaction committed on success."""
+        with self._lock:
+            self._db.execute("BEGIN")
+            try:
+                yield self._db
+                self._db.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(duckdb.Error):
+                    self._db.execute("ROLLBACK")
+                raise
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> Any:
         rows = self.query(sql, params)

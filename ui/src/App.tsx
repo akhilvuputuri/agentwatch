@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Dashboard } from "./Dashboard";
+import { DatasetList, DatasetView } from "./Datasets";
 import { Prices } from "./Prices";
 import { SessionList, SessionView } from "./Sessions";
 import { TraceList } from "./TraceList";
@@ -9,6 +10,8 @@ export type Route =
   | { page: "traces"; session?: string; user?: string }
   | { page: "dashboard" }
   | { page: "prices" }
+  | { page: "datasets" }
+  | { page: "dataset"; datasetId: string }
   | { page: "sessions" }
   | { page: "session"; sessionId: string }
   | { page: "trace"; traceId: string };
@@ -17,6 +20,15 @@ export function route(hash: string): Route {
   if (hash === "#/dashboard") return { page: "dashboard" };
   if (hash === "#/sessions") return { page: "sessions" };
   if (hash === "#/prices") return { page: "prices" };
+  if (hash === "#/datasets") return { page: "datasets" };
+  const dataset = /^#\/dataset\/(.+)$/.exec(hash);
+  if (dataset) {
+    try {
+      return { page: "dataset", datasetId: decodeURIComponent(dataset[1]!) };
+    } catch {
+      return { page: "datasets" };
+    }
+  }
   const session = /^#\/session\/(.+)$/.exec(hash);
   if (session) {
     try {
@@ -52,7 +64,9 @@ export function App() {
       ? current.page
       : current.page === "sessions" || current.page === "session"
         ? "sessions"
-        : "traces";
+        : current.page === "datasets" || current.page === "dataset"
+          ? "datasets"
+          : "traces";
   return (
     <div className="app">
       <header className="top">
@@ -65,6 +79,9 @@ export function App() {
           </a>
           <a href="#/sessions" aria-current={section === "sessions" ? "page" : undefined}>
             Sessions
+          </a>
+          <a href="#/datasets" aria-current={section === "datasets" ? "page" : undefined}>
+            Datasets
           </a>
           <a href="#/dashboard" aria-current={section === "dashboard" ? "page" : undefined}>
             Dashboard
@@ -79,6 +96,10 @@ export function App() {
           <Dashboard />
         ) : current.page === "prices" ? (
           <Prices />
+        ) : current.page === "datasets" ? (
+          <DatasetList />
+        ) : current.page === "dataset" ? (
+          <DatasetView datasetId={current.datasetId} />
         ) : current.page === "sessions" ? (
           <SessionList />
         ) : current.page === "session" ? (

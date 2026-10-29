@@ -98,6 +98,30 @@ strings, because they exceed JavaScript's exact integer range. Durations are num
   hours): the dashboard's figures, below.
 - `GET /api/services` (root services, the values the list filters on), `GET /healthz`.
 
+## Datasets
+
+A dataset (schema version 5) is a named collection of items, as in Langfuse: each item has an
+`input` and optional `expected_output` (any JSON), metadata, a status (`ACTIVE` or `ARCHIVED`) and,
+when it was made from a trace, the trace and span it came from. Items are archived rather than
+deleted so that experiments that used them stay readable; deleting a whole dataset removes its
+items.
+
+- `GET`/`POST /api/datasets` (names are unique; 409 on a duplicate), `GET`/`DELETE
+  /api/datasets/<id>`.
+- `GET /api/datasets/<id>/items[?archived=1]`; `POST` one item or `{"items": [...]}` (up to
+  1,000, all or none). An item with a caller-chosen `id` (URL-safe, as for scores) replaces the
+  same item in place, keeping its creation time and status; an `id` owned by another dataset is a
+  409. Each item is limited to 512 KiB of JSON.
+- `POST /api/datasets/<id>/items/from-trace` with `trace_id` and optional `span_id` (default: the
+  root span) makes an item from the span's captured messages: input from `gen_ai.input.messages`
+  (the GenAI conventions' opt-in capture) or OpenInference `input.value`, expected output from
+  `gen_ai.output.messages` or `output.value`, parsed when they hold JSON text. Spans without
+  captured content give an item with a null input, still linked to the trace.
+- `PATCH /api/dataset-items/<id>` with `{"status": "ARCHIVED" | "ACTIVE"}`.
+
+All JSON writes (datasets, scores, prices) must be `application/json`, which forces a preflight
+on any cross-origin browser request.
+
 ## Model prices
 
 When a model call reports tokens but no cost, its cost is calculated from a model price, as with
