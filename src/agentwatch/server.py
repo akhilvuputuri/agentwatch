@@ -27,7 +27,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from agentwatch import datasets, experiments, metrics, otlp, prices, scores
+from agentwatch import comparisons, datasets, experiments, metrics, otlp, prices, scores
 from agentwatch.scores import Score
 from agentwatch.spans import jsonable
 from agentwatch.store import (
@@ -276,6 +276,29 @@ def create_app(
             status=201,
         )
 
+    async def compare(request: Request) -> Response:
+        query = request.query_params
+        baseline, candidate = query.get("baseline", ""), query.get("candidate", "")
+        if not baseline or not candidate:
+            return PlainTextResponse("baseline and candidate run IDs are required", status_code=400)
+        margins: dict[str, float] = {}
+        for key in ("margin", "relative_margin"):
+            try:
+                margins[key] = float(query.get(key, "0.05"))
+            except ValueError:
+                margins[key] = -1.0
+            if not 0 < margins[key] <= 1:
+                return PlainTextResponse(f"{key} must be a number above 0 and at most 1", 400)
+        return await _dataset_call(
+            lambda: comparisons.compare_runs(
+                store,
+                baseline,
+                candidate,
+                margin=margins["margin"],
+                relative_margin=margins["relative_margin"],
+            )
+        )
+
     async def list_prices(_: Request) -> Response:
         found = await run_in_threadpool(store.prices)
         return JSONResponse({"prices": [_price_json(price) for price in found]})
@@ -429,6 +452,7 @@ def create_app(
         ),
         Route("/api/dataset-items/{item_id}", dataset_item, methods=["PATCH"]),
         Route("/api/datasets/{dataset_id}/runs", dataset_runs, methods=["GET", "POST"]),
+        Route("/api/compare", compare, methods=["GET"]),
         Route("/api/runs/{run_id}", run_detail, methods=["GET", "DELETE"]),
         Route("/api/runs/{run_id}/items", run_items_post, methods=["POST"]),
         Route("/api/prices", list_prices, methods=["GET"]),

@@ -163,7 +163,52 @@ neither stops the run, and the score means count only accepted scores. An unreac
 non-JSON reply raises `AgentwatchError` with the URL.
 
 Deleting a dataset also removes its runs and run items; their traces and scores stay as trace
-data.
+data. Removing a replaced item's synthetic trace removes every score on it, including any human
+annotation added in the UI. A caller that re-records an item with the same `trace_id` it traced
+itself keeps that trace's earlier scores, so it should replace (same score `id`) rather than re-add
+them.
+
+## Comparing runs
+
+`GET /api/compare?baseline=<run>&candidate=<run>[&margin=0.05][&relative_margin=0.05]` compares
+two runs of the same dataset item by item. Only items both runs recorded are paired. The
+statistics (`stats.py`) are dependency-free and deterministic, and every comparison ends in a
+verdict rather than a bare difference. Two margins say what size of change matters: `margin`, in
+pass rate (absolute, 0.05 = 5 points), for boolean scores and task success; `relative_margin`, as a
+share of the baseline mean, for numeric scores and latency, never below 0.01 (1 ms for latency).
+
+- **better / worse**: unlikely to be noise. Boolean scores use an exact McNemar test on the items
+  that flipped (5% level). Numeric scores and latency use a 95% paired *t* interval of the mean
+  difference, which must exclude zero, and need at least 10 pairs: the percentile bootstrap used
+  first gave 9–13% false positives at 5–10 pairs. A significant change smaller than its margin is
+  still better or worse, flagged `below_margin` ("real but smaller than the change that matters").
+- **no detectable difference**: not significant, at least 10 pairs, and the minimum detectable
+  effect (the smallest true change detected 80% of the time at the 5% level) is within the margin.
+  For numbers it is (1.96 + 0.84) × the standard deviation of the paired differences / √n. For
+  pass/fail it uses the upper Wilson bound of the share of items that flipped instead of the
+  observed spread, so ten items that agree completely cannot claim "no difference" (they could
+  not have detected a 5-point change); about 300 agreeing items can.
+- **underpowered**: anything else: too few pairs to rule out a change that matters.
+
+Each comparison also reports both sides' rates (with Wilson intervals) or means, the difference
+and its interval, how many items improved or regressed, and the minimum detectable effect. Task
+success (no error) and latency (lower is better) are always compared. An item whose task failed
+counts as failing every boolean score the other run's item has, so a crash never hides behind a
+missing score; numeric scores cannot be filled in that way, so those pairs are left out and
+counted in `dropped_failures` on the card. Several numeric scores of one name on an item are
+averaged; several boolean ones pass only if all pass; a name used with both types is compared as
+numeric. Label-only scores are not compared.
+
+The item list shows both runs' outputs and scores side by side, with each item's changes: a
+boolean that flipped, or a numeric score that moved by more than the margin. The UI's compare page
+shows a card per comparison with its verdict (icon and label) and, by default, only the items that
+changed. Runs are chosen as baseline and candidate on the dataset page.
+
+Wilson and McNemar come from Chief's evaluation code. Seeded simulations in `tests/test_stats.py`
+check that Wilson intervals cover the true rate about 95% of the time; that McNemar, and the
+numeric test at 10, 20 and 40 pairs, call a difference at most about 5–7% of the time when there
+is none; that a clear 25-point improvement is detected; and that a real 10-point regression on 10
+or 20 items is almost never reported as "no detectable difference".
 
 ## Model prices
 

@@ -94,7 +94,9 @@ result = run_experiment(dataset="Demo requests", name="prompt v2", task=answer, 
 print(result.scores)  # {"exact": 0.83}
 ```
 
-Each run appears on its dataset's page with per-item outputs, scores and traces.
+Each run appears on its dataset's page with per-item outputs, scores and traces. Choose two runs
+to compare them: each score gets a verdict (better, worse, no detectable difference, or
+underpowered) from paired statistics, with the items that changed listed side by side.
 
 ## Develop
 

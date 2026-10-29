@@ -329,6 +329,8 @@ export const links = {
   session: (id: string) => `#/session/${encodeURIComponent(id)}`,
   dataset: (id: string) => `#/dataset/${encodeURIComponent(id)}`,
   run: (id: string) => `#/run/${encodeURIComponent(id)}`,
+  compare: (baseline: string, candidate: string) =>
+    `#/compare/${encodeURIComponent(baseline)}/${encodeURIComponent(candidate)}`,
   traces: (filter: { session?: string; user?: string }) => {
     const params = new URLSearchParams();
     if (filter.session) params.set("session", filter.session);
@@ -488,4 +490,81 @@ export async function getRun(runId: string, signal?: AbortSignal): Promise<{ run
 
 export async function deleteRun(runId: string): Promise<void> {
   await send("DELETE", `api/runs/${encodeURIComponent(runId)}`);
+}
+
+export type Verdict = "better" | "worse" | "no detectable difference" | "underpowered";
+
+export interface BinaryComparison {
+  name: string;
+  kind: "binary";
+  pairs: number;
+  both: number;
+  only_baseline: number;
+  only_candidate: number;
+  neither: number;
+  baseline_rate: number | null;
+  candidate_rate: number | null;
+  baseline_interval: [number, number] | null;
+  candidate_interval: [number, number] | null;
+  difference: number | null;
+  difference_interval: [number, number] | null;
+  p_value: number;
+  minimum_detectable: number | null;
+  margin: number;
+  below_margin: boolean;
+  dropped_failures: number;
+  verdict: Verdict;
+}
+
+export interface NumericComparison {
+  name: string;
+  kind: "numeric";
+  pairs: number;
+  baseline_mean: number | null;
+  candidate_mean: number | null;
+  difference: number | null;
+  difference_interval: [number, number] | null;
+  improved: number;
+  regressed: number;
+  unchanged: number;
+  minimum_detectable: number | null;
+  margin: number;
+  below_margin: boolean;
+  dropped_failures: number;
+  verdict: Verdict;
+  unit?: string;
+  lower_is_better?: boolean;
+}
+
+export interface ComparedSide {
+  output: unknown;
+  error: string | null;
+  trace_id: string;
+  latency_ms: number;
+  scores: RunItemResult["scores"];
+}
+
+export interface Comparison {
+  baseline: Run;
+  candidate: Run;
+  pairs: number;
+  only_baseline: number;
+  only_candidate: number;
+  margin: number;
+  relative_margin: number;
+  comparisons: (BinaryComparison | NumericComparison)[];
+  latency: NumericComparison;
+  items: {
+    item_id: string;
+    input: unknown;
+    expected_output: unknown;
+    baseline: ComparedSide;
+    candidate: ComparedSide;
+    flips: Record<string, "improved" | "regressed">;
+  }[];
+}
+
+export async function compareRuns(baseline: string, candidate: string, signal?: AbortSignal): Promise<Comparison> {
+  const params = new URLSearchParams({ baseline, candidate });
+  return getJson<Comparison>(`api/compare?${params}`, signal);
 }

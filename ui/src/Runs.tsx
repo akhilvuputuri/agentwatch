@@ -7,6 +7,8 @@ import { duration, scoreText, timestamp, usd } from "./format";
 export function RunList({ datasetId }: { datasetId: string }) {
   const [runs, setRuns] = useState<RunSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [baseline, setBaseline] = useState<string | null>(null);
+  const [candidate, setCandidate] = useState<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -31,6 +33,8 @@ export function RunList({ datasetId }: { datasetId: string }) {
           <table className="traces" data-testid="run-table">
             <thead>
               <tr>
+                <th>Baseline</th>
+                <th>Candidate</th>
                 <th>Run</th>
                 <th className="num">Items</th>
                 <th className="num">Errors</th>
@@ -46,6 +50,24 @@ export function RunList({ datasetId }: { datasetId: string }) {
             <tbody>
               {runs.map((r) => (
                 <tr key={r.run.id}>
+                  <td>
+                    <input
+                      type="radio"
+                      name="baseline"
+                      aria-label={`Baseline ${r.run.name}`}
+                      checked={baseline === r.run.id}
+                      onChange={() => setBaseline(r.run.id)}
+                    />
+                  </td>
+                  <td>
+                    <input
+                      type="radio"
+                      name="candidate"
+                      aria-label={`Candidate ${r.run.name}`}
+                      checked={candidate === r.run.id}
+                      onChange={() => setCandidate(r.run.id)}
+                    />
+                  </td>
                   <td>
                     <a href={links.run(r.run.id)}>{r.run.name}</a>
                     <div className="muted small">{timestamp(r.run.created_ns)}</div>
@@ -67,6 +89,17 @@ export function RunList({ datasetId }: { datasetId: string }) {
             </tbody>
           </table>
         </div>
+      )}
+      {runs.length > 1 && (
+        <p>
+          {baseline && candidate && baseline !== candidate ? (
+            <a className="button-link" href={links.compare(baseline, candidate)}>
+              Compare runs
+            </a>
+          ) : (
+            <span className="muted small">Choose a baseline and a different candidate to compare them.</span>
+          )}
+        </p>
       )}
     </>
   );

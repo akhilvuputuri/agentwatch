@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { CompareView } from "./Compare";
 import { Dashboard } from "./Dashboard";
 import { DatasetList, DatasetView } from "./Datasets";
 import { Prices } from "./Prices";
@@ -14,6 +15,7 @@ export type Route =
   | { page: "datasets" }
   | { page: "dataset"; datasetId: string }
   | { page: "run"; runId: string }
+  | { page: "compare"; baseline: string; candidate: string }
   | { page: "sessions" }
   | { page: "session"; sessionId: string }
   | { page: "trace"; traceId: string };
@@ -23,6 +25,18 @@ export function route(hash: string): Route {
   if (hash === "#/sessions") return { page: "sessions" };
   if (hash === "#/prices") return { page: "prices" };
   if (hash === "#/datasets") return { page: "datasets" };
+  const compare = /^#\/compare\/([^/]+)\/([^/]+)$/.exec(hash);
+  if (compare) {
+    try {
+      return {
+        page: "compare",
+        baseline: decodeURIComponent(compare[1]!),
+        candidate: decodeURIComponent(compare[2]!),
+      };
+    } catch {
+      return { page: "datasets" };
+    }
+  }
   const run = /^#\/run\/(.+)$/.exec(hash);
   if (run) {
     try {
@@ -74,7 +88,10 @@ export function App() {
       ? current.page
       : current.page === "sessions" || current.page === "session"
         ? "sessions"
-        : current.page === "datasets" || current.page === "dataset" || current.page === "run"
+        : current.page === "datasets" ||
+            current.page === "dataset" ||
+            current.page === "run" ||
+            current.page === "compare"
           ? "datasets"
           : "traces";
   return (
@@ -112,6 +129,8 @@ export function App() {
           <DatasetView datasetId={current.datasetId} />
         ) : current.page === "run" ? (
           <RunView runId={current.runId} />
+        ) : current.page === "compare" ? (
+          <CompareView baseline={current.baseline} candidate={current.candidate} />
         ) : current.page === "sessions" ? (
           <SessionList />
         ) : current.page === "session" ? (

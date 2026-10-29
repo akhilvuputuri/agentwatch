@@ -665,3 +665,34 @@ tr.archived td {
   gap: 10px;
   align-items: center;
 }
+
+.badge.neutral {
+  background: var(--hover);
+  color: var(--muted);
+}
+.compare-tiles {
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+}
+.compare-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+}
+.compare-values {
+  font-size: 16px;
+  margin: 6px 0 2px;
+  font-variant-numeric: tabular-nums;
+}
+a.button-link {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 12px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.warn-text {
+  color: var(--warn-fg);
+}
