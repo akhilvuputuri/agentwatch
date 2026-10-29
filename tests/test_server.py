@@ -133,8 +133,15 @@ def test_read_api_errors() -> None:
 
 def test_serves_built_ui(tmp_path: Path) -> None:
     (tmp_path / "index.html").write_text("<p>ui</p>")
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "index-abc123.js").write_text("1")
     http, _ = client(tmp_path)
-    assert http.get("/").text == "<p>ui</p>"
+    page = http.get("/")
+    assert page.text == "<p>ui</p>"
+    # The page is revalidated so an upgrade picks up new asset names; assets are immutable.
+    assert page.headers["cache-control"] == "no-cache"
+    asset = http.get("/assets/index-abc123.js")
+    assert "immutable" in asset.headers["cache-control"]
 
 
 def test_without_ui_root_explains() -> None:

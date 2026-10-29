@@ -25,7 +25,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from agentwatch import otlp
+from agentwatch import metrics, otlp
 from agentwatch.spans import jsonable
 from agentwatch.store import Cursor, Store, StoredSpan, TraceSummary
 
@@ -33,6 +33,7 @@ from agentwatch.store import Cursor, Store, StoredSpan, TraceSummary
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+DAY_NS = 24 * 3600 * 1_000_000_000
 
 
 def create_app(
@@ -104,6 +105,24 @@ def create_app(
             return PlainTextResponse("trace not found", status_code=404)
         return JSONResponse({"trace_id": trace_id, "spans": [_span_json(s) for s in spans]})
 
+    async def metrics_view(request: Request) -> Response:
+        query = request.query_params
+        service = query.get("service") or None
+        try:
+            if query.get("range") == "all":
+                bounds = await run_in_threadpool(metrics.data_range, store, service)
+                end = bounds[1] + 1 if bounds else time.time_ns()
+                start = bounds[0] if bounds else end - DAY_NS
+            else:
+                end = int(query["to"]) if query.get("to") else time.time_ns()
+                start = int(query["from"]) if query.get("from") else end - DAY_NS
+        except ValueError:
+            return PlainTextResponse("from and to must be Unix nanoseconds", status_code=400)
+        if not 0 <= start < end <= otlp.MAX_TIME_NS:
+            return PlainTextResponse("need 0 <= from < to", status_code=400)
+        window = metrics.Window(start, end, service)
+        return JSONResponse(await run_in_threadpool(metrics.metrics, store, window))
+
     async def services(_: Request) -> Response:
         return JSONResponse({"services": await run_in_threadpool(store.services)})
 
@@ -114,16 +133,32 @@ def create_app(
         Route("/v1/traces", ingest, methods=["POST"]),
         Route("/api/traces", traces),
         Route("/api/traces/{trace_id}", trace),
+        Route("/api/metrics", metrics_view),
         Route("/api/services", services),
         Route("/healthz", health),
     ]
     static = ui_dir if ui_dir is not None else _bundled_ui()
     if static is not None and (static / "index.html").is_file():
-        routes.append(Mount("/", StaticFiles(directory=static, html=True), name="ui"))
+        routes.append(Mount("/", UiFiles(directory=static, html=True), name="ui"))
     else:
         routes.append(Route("/", _no_ui))
     middleware = [Middleware(HostGuard, allowed=tuple(allowed_hosts))]
     return Starlette(routes=routes, middleware=middleware)
+
+
+class UiFiles(StaticFiles):
+    """The built UI. Asset names carry a content hash, so they can be cached for good;
+    the page itself must be revalidated, or an upgraded install keeps loading old assets."""
+
+    def file_response(
+        self, full_path: Any, stat_result: Any, scope: Scope, status_code: int = 200
+    ) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        if str(full_path).replace("\\", "/").rsplit("/", 2)[-2:-1] == ["assets"]:
+            response.headers["cache-control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["cache-control"] = "no-cache"
+        return response
 
 
 class HostGuard:

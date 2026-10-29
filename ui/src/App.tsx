@@ -1,10 +1,15 @@
 import { useEffect, useState } from "react";
+import { Dashboard } from "./Dashboard";
 import { TraceList } from "./TraceList";
 import { TraceView } from "./TraceView";
 
-function route(): { traceId: string | null } {
-  const match = /^#\/trace\/([0-9a-fA-F]{32})$/.exec(window.location.hash);
-  return { traceId: match ? match[1]!.toLowerCase() : null };
+type Route = { page: "traces" } | { page: "dashboard" } | { page: "trace"; traceId: string };
+
+function route(): Route {
+  const hash = window.location.hash;
+  if (hash === "#/dashboard") return { page: "dashboard" };
+  const match = /^#\/trace\/([0-9a-fA-F]{32})$/.exec(hash);
+  return match ? { page: "trace", traceId: match[1]!.toLowerCase() } : { page: "traces" };
 }
 
 export function App() {
@@ -20,9 +25,24 @@ export function App() {
         <a className="brand" href="#/">
           agentwatch
         </a>
-        <span className="subtitle">traces</span>
+        <nav className="nav">
+          <a href="#/" aria-current={current.page !== "dashboard" ? "page" : undefined}>
+            Traces
+          </a>
+          <a href="#/dashboard" aria-current={current.page === "dashboard" ? "page" : undefined}>
+            Dashboard
+          </a>
+        </nav>
       </header>
-      <main>{current.traceId ? <TraceView traceId={current.traceId} /> : <TraceList />}</main>
+      <main>
+        {current.page === "dashboard" ? (
+          <Dashboard />
+        ) : current.page === "trace" ? (
+          <TraceView traceId={current.traceId} />
+        ) : (
+          <TraceList />
+        )}
+      </main>
     </div>
   );
 }

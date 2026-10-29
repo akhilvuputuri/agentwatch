@@ -63,7 +63,36 @@ strings, because they exceed JavaScript's exact integer range. Durations are num
   ties ordered by trace ID. The response's `next` is the cursor (`<start_ns>:<trace_id>`) for the
   following page, or null.
 - `GET /api/traces/<trace_id>`: every span, with the extracted `genai` fields.
+- `GET /api/metrics?from=<ns>&to=<ns>&service=<name>` (or `range=all`; the default is the last 24
+  hours): the dashboard's figures, below.
 - `GET /api/services` (root services, the values the list filters on), `GET /healthz`.
+
+## Dashboard metrics
+
+`metrics.py` computes everything for the spans that *started* in the window (optionally of one
+service). The figures are descriptive: counts, sums and percentiles (`quantile_cont`, so
+interpolated), with no intervals or comparisons; those belong to the statistics engine.
+
+- **Overview:** traces, model and tool calls and failures, token sums (model calls only), cost (as
+  for trace totals) and model calls without cost, model-call latency p50/p95, and per-trace
+  duration and cost p50/p95 and mean.
+- **By model** (`response_model`, else `request_model`): calls, failures, tokens, cost, latency
+  p50/p95/max, error types and finish reasons. Finish reasons come from a separate query, so a
+  call reporting two reasons is counted once in `calls` and once under each reason.
+- **By tool:** calls, failures, latency p50/p95/max, error types.
+- **By agent:** `invoke_agent` runs, failures and duration p50/p95, plus the model and tool calls
+  each agent made itself. A call belongs to its nearest `invoke_agent` ancestor (a recursive walk
+  up the parents, at most 64 levels), so a parent's figures exclude its child agents'. Calls with
+  no agent ancestor are grouped as `(no agent)`.
+- **Series:** buckets of 1, 5 or 15 minutes, 1, 3, 6 or 12 hours, a day or a week; the smallest
+  width giving at most 72 buckets. Buckets start on whole multiples of their width (UTC), and
+  empty buckets are returned with zero counts and null cost and latency. A trace counts in the
+  bucket where its root span started.
+
+The UI shows these as stat tiles, a cost and a model-call bar chart and a p50/p95 latency line
+chart (each with a data table), and the three breakdown tables. The page itself is served with
+`Cache-Control: no-cache` and the hashed assets as immutable, so an upgraded install never keeps
+loading an old bundle.
 
 ## UI
 

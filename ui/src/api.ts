@@ -101,3 +101,107 @@ export async function listServices(signal?: AbortSignal): Promise<string[]> {
   const body = await getJson<{ services: string[] }>("api/services", signal);
   return body.services;
 }
+
+export interface MetricsOverview {
+  traces: number;
+  model_calls: number;
+  model_errors: number;
+  tool_calls: number;
+  tool_errors: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  reasoning_tokens: number;
+  cost_usd: number | null;
+  calls_without_cost: number;
+  model_p50_ms: number | null;
+  model_p95_ms: number | null;
+  trace_p50_ms: number | null;
+  trace_p95_ms: number | null;
+  trace_cost_p50: number | null;
+  trace_cost_p95: number | null;
+  trace_cost_mean: number | null;
+}
+
+export interface ModelRow {
+  model: string;
+  provider: string | null;
+  calls: number;
+  errors: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  reasoning_tokens: number;
+  cost_usd: number | null;
+  calls_without_cost: number;
+  p50_ms: number | null;
+  p95_ms: number | null;
+  max_ms: number | null;
+  finish_reasons: Record<string, number>;
+  error_types: Record<string, number>;
+}
+
+export interface ToolRow {
+  tool: string;
+  calls: number;
+  errors: number;
+  p50_ms: number | null;
+  p95_ms: number | null;
+  max_ms: number | null;
+  error_types: Record<string, number> | null;
+}
+
+export interface AgentRow {
+  agent: string;
+  runs: number;
+  errors: number;
+  p50_ms: number | null;
+  p95_ms: number | null;
+  model_calls: number;
+  tool_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number | null;
+}
+
+export interface SeriesPoint {
+  start_ns: string;
+  model_calls: number;
+  model_errors: number;
+  tool_calls: number;
+  traces: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number | null;
+  model_p50_ms: number | null;
+  model_p95_ms: number | null;
+}
+
+export interface Metrics {
+  window: { start_ns: string; end_ns: string; bucket_ns: number; service: string | null };
+  overview: MetricsOverview;
+  by_model: ModelRow[];
+  by_tool: ToolRow[];
+  by_agent: AgentRow[];
+  series: SeriesPoint[];
+}
+
+export type MetricsRange = { kind: "last"; hours: number } | { kind: "all" };
+
+export async function getMetrics(
+  range: MetricsRange,
+  service: string,
+  signal?: AbortSignal,
+): Promise<Metrics> {
+  const params = new URLSearchParams();
+  if (range.kind === "all") {
+    params.set("range", "all");
+  } else {
+    const to = BigInt(Date.now()) * 1_000_000n;
+    params.set("to", String(to));
+    params.set("from", String(to - BigInt(range.hours) * 3_600_000_000_000n));
+  }
+  if (service) params.set("service", service);
+  return getJson<Metrics>(`api/metrics?${params}`, signal);
+}

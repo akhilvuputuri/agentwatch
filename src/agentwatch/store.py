@@ -192,6 +192,20 @@ class Store:
                 raise
         return len(rows)
 
+    def query(self, sql: str, params: Sequence[Any] = (), *, with_names: bool = False) -> list[Any]:
+        """Run a read query. With `with_names`, rows are dicts keyed by column name."""
+        with self._lock:
+            cursor = self._db.execute(sql, list(params))
+            rows = cursor.fetchall()
+            names = [column[0] for column in cursor.description or []]
+        if with_names:
+            return [dict(zip(names, row, strict=True)) for row in rows]
+        return rows
+
+    def query_one(self, sql: str, params: Sequence[Any] = ()) -> Any:
+        rows = self.query(sql, params)
+        return rows[0] if rows else None
+
     def span_count(self) -> int:
         with self._lock:
             row = self._db.execute("SELECT count(*) FROM spans").fetchone()
