@@ -113,7 +113,10 @@ def create_app(
             window = await run_in_threadpool(metrics.window_for_all, store, service, now)
         else:
             raw_to, raw_from = query.get("to", ""), query.get("from", "")
-            if not all(v.isascii() and v.isdigit() for v in (raw_to, raw_from) if v):
+            # At most 19 digits: anything longer is out of range (and too long for int()).
+            if not all(
+                v.isascii() and v.isdigit() and len(v) <= 19 for v in (raw_to, raw_from) if v
+            ):
                 return PlainTextResponse("from and to must be Unix nanoseconds", status_code=400)
             end = int(raw_to) if raw_to else now
             start = int(raw_from) if raw_from else end - DAY_NS

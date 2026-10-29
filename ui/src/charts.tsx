@@ -118,7 +118,7 @@ export function BarChart({
   const innerHeight = HEIGHT - MARGIN.top - MARGIN.bottom;
   const max = Math.max(0, ...data.map((d) => d.value ?? 0));
   const ticks = niceTicks(max);
-  const top = ticks[ticks.length - 1] ?? 1;
+  const top = ticks[ticks.length - 1] || 1;
   const scale = (v: number) => MARGIN.top + innerHeight - (v / top) * innerHeight;
   const band = innerWidth / Math.max(1, data.length);
   const barWidth = Math.max(1, Math.min(24, band - 2));
@@ -197,7 +197,7 @@ export function LineChart({
   const innerHeight = HEIGHT - MARGIN.top - MARGIN.bottom;
   const max = Math.max(0, ...series.flatMap((s) => s.values.map((v) => v ?? 0)));
   const ticks = niceTicks(max);
-  const top = ticks[ticks.length - 1] ?? 1;
+  const top = ticks[ticks.length - 1] || 1;
   const y = (v: number) => MARGIN.top + innerHeight - (v / top) * innerHeight;
   const step = count > 1 ? innerWidth / (count - 1) : 0;
   const x = (i: number) => MARGIN.left + (count > 1 ? step * i : innerWidth / 2);

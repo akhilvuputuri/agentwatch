@@ -89,7 +89,7 @@ function Figures({ data }: { data: Metrics }) {
   const bucketLabel = (index: number) => `${when(index)} · per ${period(bucketNs)}`;
   const costLowerBound = o.calls_without_cost > 0 && o.cost_usd !== null ? "≥ " : "";
 
-  if (o.traces === 0)
+  if (o.traces === 0 && o.model_calls === 0 && o.tool_calls === 0)
     return <p className="empty">No spans in this range. Pick a longer range, or send traces to /v1/traces.</p>;
 
   return (

@@ -234,5 +234,5 @@ def test_cache_headers_follow_the_url_not_the_directory_name(tmp_path: Path) -> 
 
 def test_metrics_rejects_loose_integers() -> None:
     http, _ = client()
-    for bad in ("+5", "1_000", " 5", "-1"):
+    for bad in ("+5", "1_000", " 5", "-1", "9" * 5000):
         assert http.get("/api/metrics", params={"from": bad, "to": "10"}).status_code == 400
