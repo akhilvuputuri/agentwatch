@@ -580,3 +580,64 @@ h2.section {
   border-radius: 50%;
   background: var(--accent);
 }
+
+.scores {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-top: 12px;
+}
+.scores-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.scores-head h2 {
+  margin: 0;
+}
+.score-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  align-items: end;
+  margin: 6px 0 12px;
+  font-size: 13px;
+}
+.score-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.score-form label.wide {
+  flex: 1 1 220px;
+}
+.score-form input:not([type="checkbox"]),
+.score-form select {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+button.link {
+  border: none;
+  background: none;
+  color: var(--accent);
+  padding: 0;
+  font-size: 12px;
+}
+.score-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.score-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}

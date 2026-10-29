@@ -6,16 +6,19 @@ import base64
 import gzip
 import json
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
 from google.protobuf import json_format
 from google.protobuf.message import DecodeError
+from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceRequest,
 )
 from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
 
+from agentwatch.scores import EVALUATION_EVENT, Score, from_evaluation
 from agentwatch.spans import Attributes, Span, SpanEvent, SpanLink, Value
 
 PROTOBUF = "application/x-protobuf"
@@ -96,14 +99,30 @@ def _bounded(decoder: Any, body: bytes) -> bytes:
 
 
 def parse_request(body: bytes, content_type: str) -> ExportTraceServiceRequest:
-    media = content_type.split(";", 1)[0].strip().lower()
     request = ExportTraceServiceRequest()
+    _parse(body, content_type, request, _hex_ids_to_base64)
+    return request
+
+
+def parse_logs_request(body: bytes, content_type: str) -> ExportLogsServiceRequest:
+    request = ExportLogsServiceRequest()
+    _parse(body, content_type, request, _log_hex_ids_to_base64)
+    return request
+
+
+def _parse(
+    body: bytes,
+    content_type: str,
+    request: Any,
+    hex_to_base64: Callable[[dict[str, Any]], dict[str, Any]],
+) -> None:
+    media = content_type.split(";", 1)[0].strip().lower()
     if media == PROTOBUF:
         try:
             request.ParseFromString(body)
         except DecodeError as error:
             raise OtlpError(f"invalid protobuf body: {error}") from error
-        return request
+        return
     if media == JSON:
         try:
             document = json.loads(body)
@@ -113,29 +132,39 @@ def parse_request(body: bytes, content_type: str) -> ExportTraceServiceRequest:
             raise OtlpError("JSON body must be an object")
         try:
             json_format.ParseDict(
-                _hex_ids_to_base64(cast(dict[str, Any], document)),
+                hex_to_base64(cast(dict[str, Any], document)),
                 request,
                 ignore_unknown_fields=True,
             )
         except json_format.ParseError as error:
             raise OtlpError(f"invalid OTLP JSON: {error}") from error
-        return request
+        return
     raise UnsupportedMediaType(f"unsupported content type: {content_type or '(none)'}")
 
 
-def _hex_ids_to_base64(document: dict[str, Any]) -> dict[str, Any]:
+def _convert_hex(holder: dict[str, Any], key: str) -> None:
     """OTLP/JSON writes trace and span IDs as hex; protobuf's JSON mapping expects base64."""
+    value = holder.get(key)
+    if not isinstance(value, str) or value == "":
+        return
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as error:
+        raise OtlpError(f"{key} is not hex: {value[:40]!r}") from error
+    holder[key] = base64.b64encode(raw).decode("ascii")
 
-    def convert(holder: dict[str, Any], key: str) -> None:
-        value = holder.get(key)
-        if not isinstance(value, str) or value == "":
-            return
-        try:
-            raw = bytes.fromhex(value)
-        except ValueError as error:
-            raise OtlpError(f"{key} is not hex: {value[:40]!r}") from error
-        holder[key] = base64.b64encode(raw).decode("ascii")
 
+def _log_hex_ids_to_base64(document: dict[str, Any]) -> dict[str, Any]:
+    for resource_logs in _objects(document.get("resourceLogs")):
+        for scope_logs in _objects(resource_logs.get("scopeLogs")):
+            for record in _objects(scope_logs.get("logRecords")):
+                for key in ("traceId", "spanId"):
+                    _convert_hex(record, key)
+    return document
+
+
+def _hex_ids_to_base64(document: dict[str, Any]) -> dict[str, Any]:
+    convert = _convert_hex
     for resource_spans in _objects(document.get("resourceSpans")):
         for scope_spans in _objects(resource_spans.get("scopeSpans")):
             for span in _objects(scope_spans.get("spans")):
@@ -227,6 +256,59 @@ def _problem(span: Any, trace_id: str, span_id: str) -> str:
     if any(event.time_unix_nano > MAX_TIME_NS for event in span.events):
         return "event timestamp out of range"
     return ""
+
+
+@dataclass(frozen=True, slots=True)
+class DecodedLogs:
+    """Scores from evaluation events; other log records are ignored, not rejected."""
+
+    scores: list[Score]
+    ignored: int = 0
+    rejected: int = 0
+    error: str = ""
+
+
+def decode_logs(body: bytes, content_type: str, content_encoding: str | None = None) -> DecodedLogs:
+    request = parse_logs_request(decompress(body, content_encoding), content_type)
+    found: list[Score] = []
+    ignored = rejected = 0
+    first_error = ""
+    for resource_logs in request.resource_logs:
+        for scope_logs in resource_logs.scope_logs:
+            for record in scope_logs.log_records:
+                record_attributes = attributes(record.attributes)
+                event_name = record.event_name or record_attributes.get("event.name")
+                if event_name != EVALUATION_EVENT:
+                    ignored += 1
+                    continue
+                trace_id = record.trace_id.hex()
+                span_id = record.span_id.hex() or None
+                problem = ""
+                if len(trace_id) != 32 or trace_id == "0" * 32:
+                    # Correlating by gen_ai.response.id instead is not supported.
+                    problem = "evaluation event without a trace ID"
+                elif span_id is not None and (len(span_id) != 16 or span_id == "0" * 16):
+                    problem = "evaluation event with an invalid span ID"
+                time_ns = record.time_unix_nano or record.observed_time_unix_nano
+                if not problem and time_ns > MAX_TIME_NS:
+                    problem = "evaluation event timestamp out of range"
+                score = (
+                    None
+                    if problem
+                    else from_evaluation(trace_id, span_id, time_ns, record_attributes)
+                )
+                if score is None:
+                    rejected += 1
+                    first_error = (
+                        first_error or problem or "evaluation event without a name or result"
+                    )
+                    continue
+                found.append(score)
+    if rejected:
+        return DecodedLogs(
+            found, ignored, rejected, f"{rejected} record(s) rejected; first: {first_error}"
+        )
+    return DecodedLogs(found, ignored)
 
 
 def decode(body: bytes, content_type: str, content_encoding: str | None = None) -> Decoded:

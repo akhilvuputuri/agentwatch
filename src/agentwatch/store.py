@@ -8,16 +8,17 @@ import logging
 import tempfile
 import threading
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import astuple, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import duckdb
 
 from agentwatch import genai
+from agentwatch.scores import Score, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
 # database and an upgraded one end up identical.
@@ -66,7 +67,23 @@ CREATE INDEX IF NOT EXISTS spans_start ON spans (start_ns);
 # Statements that take the schema from version N-1 to N.
 MIGRATIONS: dict[int, tuple[str, ...]] = {
     2: ("ALTER TABLE spans ADD COLUMN user_id VARCHAR",),
+    3: (
+        """CREATE TABLE scores (
+            id VARCHAR PRIMARY KEY,
+            trace_id VARCHAR NOT NULL,
+            span_id VARCHAR,
+            name VARCHAR NOT NULL,
+            data_type VARCHAR NOT NULL,
+            value DOUBLE,
+            label VARCHAR,
+            source VARCHAR NOT NULL,
+            comment VARCHAR,
+            created_ns BIGINT NOT NULL
+        )""",
+        "CREATE INDEX scores_trace ON scores (trace_id)",
+    ),
 }
+_SCORE_COLUMNS = "id, trace_id, span_id, name, data_type, value, label, source, comment, created_ns"
 
 # Columns computed from a span's attributes by genai.read. They are re-read for every stored
 # span when genai.DERIVATION_VERSION changes, so rule changes apply to old data too.
@@ -148,10 +165,22 @@ class TraceSummary:
     complete: bool
     session_id: str | None = None
     user_id: str | None = None
+    scores: tuple[ScoreAggregate, ...] = ()
 
     @property
     def cursor(self) -> Cursor:
         return Cursor(self.start_ns, self.trace_id)
+
+
+@dataclass(frozen=True, slots=True)
+class ScoreAggregate:
+    """One score name on a trace: how many, their mean (numeric and boolean), commonest label."""
+
+    name: str
+    data_type: str
+    count: int
+    mean: float | None
+    label: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,9 +297,20 @@ totals AS (
             FILTER (WHERE user_id IS NOT NULL) AS user_id
     FROM spans GROUP BY trace_id
 ),
+score_names AS (
+    SELECT trace_id, name, any_value(data_type) AS data_type, count(*) AS n,
+           avg(value) AS mean, mode(label) AS label
+    FROM scores GROUP BY trace_id, name
+),
+trace_scores AS (
+    SELECT trace_id,
+           list(struct_pack(name := name, data_type := data_type, count := n, mean := mean, label := label)
+                ORDER BY name) AS scores
+    FROM score_names GROUP BY trace_id
+),
 summaries AS (
-    SELECT t.*, r.root_name, r.service_name, r.complete
-    FROM totals t JOIN roots r USING (trace_id)
+    SELECT t.*, r.root_name, r.service_name, r.complete, coalesce(ts.scores, []) AS scores
+    FROM totals t JOIN roots r USING (trace_id) LEFT JOIN trace_scores ts USING (trace_id)
 )
 """
 
@@ -391,6 +431,7 @@ class Store:
         rows = [_row(span, received_ns) for span in latest.values()]
         if not rows:
             return 0
+        event_scores = [score for span in latest.values() for score in from_span_events(span)]
         with self._lock:
             self._db.execute("BEGIN")
             try:
@@ -402,6 +443,7 @@ class Store:
                         f"INSERT OR REPLACE INTO spans ({_COLUMNS}) VALUES {values}",
                         [value for row in chunk for value in row],
                     )
+                self._write_scores(event_scores)
                 self._db.execute("COMMIT")
             except BaseException:
                 with contextlib.suppress(duckdb.Error):
@@ -445,10 +487,14 @@ class Store:
         errors_only: bool = False,
         session: str | None = None,
         user: str | None = None,
+        trace: str | None = None,
     ) -> list[TraceSummary]:
         """Most recent traces first. Page with the last trace's `cursor` as `before`."""
         filters: list[str] = []
         params: list[Any] = []
+        if trace is not None:
+            filters.append("trace_id = ?")
+            params.append(trace)
         if service is not None:
             filters.append("service_name = ?")
             params.append(service)
@@ -470,7 +516,8 @@ class Store:
             WITH {SUMMARIES_SQL}
             SELECT trace_id, root_name, service_name, start_ns, end_ns - start_ns, span_count,
                    error_count, model_calls, tool_calls, input_tokens, output_tokens, cache_read,
-                   cost_usd, calls_without_cost, coalesce(models, []), complete, session_id, user_id
+                   cost_usd, calls_without_cost, coalesce(models, []), complete, session_id, user_id,
+                   scores
             FROM summaries {where}
             ORDER BY start_ns DESC, trace_id
             LIMIT ?
@@ -497,6 +544,16 @@ class Store:
                 complete=bool(row[15]),
                 session_id=row[16],
                 user_id=row[17],
+                scores=tuple(
+                    ScoreAggregate(
+                        name=item["name"],
+                        data_type=item["data_type"],
+                        count=int(item["count"]),
+                        mean=None if item["mean"] is None else float(item["mean"]),
+                        label=item["label"],
+                    )
+                    for item in row[18]
+                ),
             )
             for row in rows
         ]
@@ -560,6 +617,47 @@ class Store:
             )
             for row in rows
         ]
+
+    def upsert_scores(self, found: Sequence[Score]) -> int:
+        """Store scores; one with an existing ID replaces it."""
+        if not found:
+            return 0
+        with self._lock:
+            self._db.execute("BEGIN")
+            try:
+                self._write_scores(found)
+                self._db.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(duckdb.Error):
+                    self._db.execute("ROLLBACK")
+                raise
+        return len(found)
+
+    def _write_scores(self, found: Sequence[Score]) -> None:
+        latest = {score.id: score for score in found}
+        rows = [astuple(score) for score in latest.values()]
+        for start in range(0, len(rows), _INSERT_CHUNK):
+            chunk = rows[start : start + _INSERT_CHUNK]
+            marks = ", ".join("(" + ", ".join("?" * 10) + ")" for _ in chunk)
+            self._db.execute(
+                f"INSERT OR REPLACE INTO scores ({_SCORE_COLUMNS}) VALUES {marks}",
+                [value for row in chunk for value in row],
+            )
+
+    def delete_score(self, score_id: str) -> bool:
+        with self._lock:
+            row = self._db.execute(
+                "DELETE FROM scores WHERE id = ? RETURNING id", [score_id]
+            ).fetchone()
+        return row is not None
+
+    def scores(self, trace_id: str) -> list[Score]:
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT {_SCORE_COLUMNS} FROM scores WHERE trace_id = ? ORDER BY created_ns, id",
+                [trace_id.lower()],
+            ).fetchall()
+        return [Score(*row) for row in rows]
 
     def trace(self, trace_id: str) -> list[StoredSpan]:
         with self._lock:

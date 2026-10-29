@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { getMetrics, listServices, type Metrics, type MetricsRange } from "./api";
 import { BarChart, ChartTable, LineChart } from "./charts";
-import { count, duration, msTick, nsToMs, period, share, usd, usdTick } from "./format";
+import { count, duration, msTick, nsToMs, period, scoreText, share, usd, usdTick } from "./format";
 
 const RANGES: { label: string; range: MetricsRange }[] = [
   { label: "24 hours", range: { kind: "last", hours: 24 } },
@@ -169,6 +169,20 @@ function Figures({ data }: { data: Metrics }) {
         </figure>
       </div>
 
+      <h2 className="section">Scores</h2>
+      <Table
+        columns={["Score", "Type", "Count", "Mean", "Min", "Max", "Labels", "Sources"]}
+        rows={data.scores.map((s) => [
+          s.name,
+          s.data_type.toLowerCase(),
+          s.count,
+          s.data_type === "CATEGORICAL" ? "–" : scoreText(s.data_type, s.mean, null, s.count),
+          s.min === null ? "–" : String(Math.round(s.min * 100) / 100),
+          s.max === null ? "–" : String(Math.round(s.max * 100) / 100),
+          mix(s.labels),
+          mix(s.sources),
+        ])}
+      />
       <h2 className="section">By model</h2>
       <Table
         columns={["Model", "Calls", "Failed", "Input", "Cached", "Output", "Cost", "p50", "p95", "Finish reasons"]}
@@ -250,7 +264,7 @@ function Table({ columns, rows }: { columns: string[]; rows: React.ReactNode[][]
   );
 }
 
-const TEXT_COLUMNS = new Set(["Finish reasons", "Errors"]);
+const TEXT_COLUMNS = new Set(["Finish reasons", "Errors", "Type", "Labels", "Sources"]);
 const isText = (columns: string[], index: number) =>
   index === 0 || TEXT_COLUMNS.has(columns[index] ?? "");
 

@@ -85,7 +85,8 @@ strings, because they exceed JavaScript's exact integer range. Durations are num
 - `GET /api/traces?limit=50&before=<cursor>&service=<root service>&errors=1`: most recent first,
   ties ordered by trace ID. The response's `next` is the cursor (`<start_ns>:<trace_id>`) for the
   following page, or null.
-- `GET /api/traces/<trace_id>`: every span, with the extracted `genai` fields.
+- `GET /api/traces/<trace_id>`: every span, with the extracted `genai` fields, plus the trace's
+  session, user and scores.
 - `GET /api/traces?session=<id>&user=<id>`: the same list, filtered to one session or user.
 - `GET /api/sessions?limit=50&before=<cursor>&service=<name>&user=<id>`: sessions with the most
   recent trace first; `next` is `<last trace start_ns>:<session_id>`.
@@ -95,13 +96,42 @@ strings, because they exceed JavaScript's exact integer range. Durations are num
   hours): the dashboard's figures, below.
 - `GET /api/services` (root services, the values the list filters on), `GET /healthz`.
 
+## Scores
+
+A score is a named judgement on a trace, optionally on one of its spans: numeric (any finite
+number), boolean (stored as 1 or 0) or categorical (a label), with a source: `API`, `ANNOTATION`
+(added in the UI) or `EVAL` (from an evaluator). Scores live in their own table (schema version 3)
+and may arrive before the trace they refer to.
+
+They come in three ways:
+
+- `POST /api/scores` with one score object or `{"scores": [...]}` (up to 1,000, all validated before
+  any is stored). Fields: `trace_id`, optional `span_id`, `name`, `value` (number or boolean) and/or
+  `label`, optional `comment`, `data_type` and `id`. A score with an existing `id` replaces it. The
+  UI posts with `?source=annotation`. `DELETE /api/scores/<id>` removes one.
+- `gen_ai.evaluation.result` events, the GenAI conventions' way of reporting an evaluation, sent
+  as OTLP log records to `POST /v1/logs`. The event name is read from the record's `event_name`
+  field or an `event.name` attribute; `gen_ai.evaluation.name`, `.score.value`, `.score.label` and
+  `.explanation` become the name, value, label and comment, and the record's trace and span IDs
+  attach it. Other log records are ignored, and evaluation records without a trace ID (the
+  conventions allow correlating by `gen_ai.response.id` instead, which agentwatch does not
+  support) are rejected through OTLP partial success.
+- The same events attached to a span as span events, read when the span is stored.
+
+An event's score ID is a hash of its trace, span, name, time and result, so a re-sent event or
+span keeps one copy. The trace list shows each trace's scores per name (count, mean, commonest
+label); the trace view lists them with a form to add and delete annotations; the dashboard
+summarises scores recorded in the window by name (count, mean, minimum, maximum, labels, sources).
+
 ## Sessions and users
 
 A trace's session is the `gen_ai.conversation.id` (or OpenInference `session.id`) of its root span,
 or of its earliest span that has one when the root does not; its user is found the same way from
 `user.id`. Sessions are computed at query time from the per-trace summaries, so a session's totals
 are sums over its traces and its time range runs from its first trace's start to its last trace's
-end. Traces with no session do not appear in the session list.
+end. Traces with no session do not appear in the session list. With a `service` or `user` filter,
+the list sums only the matching traces of each session, while the session page always shows all
+of them.
 
 ## Dashboard metrics
 

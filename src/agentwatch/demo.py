@@ -8,7 +8,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 
-from agentwatch import genai
+from agentwatch import genai, scores
 from agentwatch.spans import (
     KIND_CLIENT,
     KIND_INTERNAL,
@@ -113,9 +113,53 @@ def _turn(rng: random.Random, ids: _Ids, trace_id: str, start: int) -> list[Span
             },
             resource=_resource(),
             scope_name="agentwatch.demo",
+            events=_evaluations(rng, end, failed),
         ),
     )
     return spans
+
+
+def _evaluations(rng: random.Random, at: int, failed: bool) -> tuple[SpanEvent, ...]:
+    """Synthetic evaluator results, as gen_ai.evaluation.result span events."""
+    events: list[SpanEvent] = []
+    if not failed and rng.random() < 0.6:
+        score = round(min(1.0, max(0.0, rng.gauss(0.78, 0.15))), 2)
+        events.append(
+            SpanEvent(
+                name=scores.EVALUATION_EVENT,
+                time_ns=at,
+                attributes={
+                    scores.EVALUATION_NAME: "helpfulness",
+                    scores.EVALUATION_VALUE: score,
+                    scores.EVALUATION_EXPLANATION: "Synthetic judge score.",
+                },
+            )
+        )
+    if rng.random() < 0.25:
+        events.append(
+            SpanEvent(
+                name=scores.EVALUATION_EVENT,
+                time_ns=at + 1,
+                attributes={
+                    scores.EVALUATION_NAME: "user_feedback",
+                    scores.EVALUATION_VALUE: (not failed) and rng.random() < 0.8,
+                },
+            )
+        )
+    if rng.random() < 0.4:
+        events.append(
+            SpanEvent(
+                name=scores.EVALUATION_EVENT,
+                time_ns=at + 2,
+                attributes={
+                    scores.EVALUATION_NAME: "topic",
+                    scores.EVALUATION_LABEL: rng.choice(
+                        ("calendar", "research", "notes", "travel")
+                    ),
+                },
+            )
+        )
+    return tuple(events)
 
 
 def _model_call(

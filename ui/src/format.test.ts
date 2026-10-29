@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { count, duration, msTick, nsToMs, period, share, usd, usdTick } from "./format";
+import { count, duration, msTick, nsToMs, period, scoreText, share, usd, usdTick } from "./format";
 
 describe("format", () => {
   it("durations", () => {
@@ -9,7 +9,9 @@ describe("format", () => {
     expect(duration(3_210_000_000)).toBe("3.21 s");
     expect(duration(125_000_000_000)).toBe("2 m 5 s");
     expect(duration(2 * 3600e9 + 30 * 60e9)).toBe("2 h 30 m");
-    expect(duration(46 * 3600e9 + 40 * 60e9)).toBe("1 d 23 h");
+    expect(duration(46 * 3600e9 + 40 * 60e9)).toBe("1 d 22 h");
+    expect(duration(7199.9e9)).toBe("1 h 59 m");
+    expect(duration(119.9e9)).toBe("1 m 59 s");
     expect(duration(-1)).toBe("–");
   });
   it("counts and money", () => {
@@ -39,6 +41,13 @@ describe("format", () => {
     expect(msTick(0)).toBe("0");
     expect(msTick(500)).toBe("500 ms");
     expect(msTick(12500)).toBe("12.5 s");
+  });
+  it("formats scores", () => {
+    expect(scoreText("NUMERIC", 0.8123, null)).toBe("0.81");
+    expect(scoreText("NUMERIC", 4, "four")).toBe("4 (four)");
+    expect(scoreText("BOOLEAN", 1, null)).toBe("yes");
+    expect(scoreText("BOOLEAN", 0.75, null, 4)).toBe("75% yes");
+    expect(scoreText("CATEGORICAL", null, "travel")).toBe("travel");
   });
   it("converts nanoseconds without losing milliseconds", () => {
     expect(nsToMs(1_761_000_000_123_456_789n)).toBe(1_761_000_000_123.456);
