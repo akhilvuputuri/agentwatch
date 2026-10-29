@@ -163,7 +163,43 @@ neither stops the run, and the score means count only accepted scores. An unreac
 non-JSON reply raises `AgentwatchError` with the URL.
 
 Deleting a dataset also removes its runs and run items; their traces and scores stay as trace
-data.
+data. Removing a replaced item's synthetic trace removes every score on it, including any human
+annotation added in the UI. A caller that re-records an item with the same `trace_id` it traced
+itself keeps that trace's earlier scores, so it should replace (same score `id`) rather than re-add
+them.
+
+## Comparing runs
+
+`GET /api/compare?baseline=<run>&candidate=<run>[&margin=0.05]` compares two runs of the same
+dataset item by item. Only items both runs recorded are paired. The statistics (`stats.py`) are
+dependency-free and seeded, so a comparison is reproducible, and every comparison ends in a
+verdict rather than a bare difference:
+
+- **better / worse**: unlikely to be noise. Pass/fail scores (boolean) use an exact McNemar test
+  on the items that flipped (5% level); numeric scores and latency use a 95% paired bootstrap
+  interval (4,000 resamples) of the mean difference, which must exclude zero.
+- **no detectable difference**: not significant, at least 10 pairs, and the minimum detectable
+  effect ((1.96 + 0.84) × standard deviation of the paired differences / √n, the smallest true
+  difference detected 80% of the time) is within the margin that matters: 5 points of pass rate
+  by default, or 5% of the baseline mean for numbers.
+- **underpowered**: not significant, but too few pairs to rule out a difference that matters.
+
+Each comparison also reports both sides' rates (with Wilson intervals) or means, the difference
+and its interval, how many items improved or regressed, and the minimum detectable effect. Task
+success (no error) and latency (lower is better) are always compared. An item whose task failed
+counts as failing every boolean score the other run's item has, so a crash never hides behind a
+missing score; other missing scores leave the pair out. Several scores of one name on an item are
+averaged; label-only scores are not compared.
+
+The item list shows both runs' outputs and scores side by side, with each item's changes: a
+boolean that flipped, or a numeric score that moved by more than the margin. The UI's compare page
+shows a card per comparison with its verdict (icon and label) and, by default, only the items that
+changed. Runs are chosen as baseline and candidate on the dataset page.
+
+The verdict layer and its tests come from Chief's evaluation code: simulations in
+`tests/test_stats.py` check that Wilson intervals cover the true rate about 95% of the time, that
+McNemar rejects at most about 5% of the time when the runs do not differ, and that it detects a
+clear improvement.
 
 ## Model prices
 
