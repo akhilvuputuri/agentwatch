@@ -328,6 +328,7 @@ export async function getSession(
 export const links = {
   session: (id: string) => `#/session/${encodeURIComponent(id)}`,
   dataset: (id: string) => `#/dataset/${encodeURIComponent(id)}`,
+  run: (id: string) => `#/run/${encodeURIComponent(id)}`,
   traces: (filter: { session?: string; user?: string }) => {
     const params = new URLSearchParams();
     if (filter.session) params.set("session", filter.session);
@@ -444,4 +445,47 @@ export async function addItemFromTrace(datasetId: string, traceId: string, spanI
 
 export async function setItemStatus(itemId: string, status: "ACTIVE" | "ARCHIVED"): Promise<void> {
   await send("PATCH", `api/dataset-items/${encodeURIComponent(itemId)}`, { status });
+}
+
+export interface Run {
+  id: string;
+  dataset_id: string;
+  name: string;
+  description: string | null;
+  metadata: Record<string, unknown>;
+  created_ns: string;
+}
+
+export interface RunSummary {
+  run: Run;
+  items: number;
+  errors: number;
+  mean_latency_ms: number | null;
+  cost_usd: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  scores: { name: string; count: number; mean: number | null }[];
+}
+
+export interface RunItemResult {
+  item_id: string;
+  trace_id: string;
+  output: unknown;
+  error: string | null;
+  latency_ms: number;
+  input: unknown;
+  expected_output: unknown;
+  scores: { id: string; name: string; data_type: ScoreType; value: number | null; label: string | null; comment: string | null }[];
+}
+
+export async function listRuns(datasetId: string, signal?: AbortSignal): Promise<RunSummary[]> {
+  return (await getJson<{ runs: RunSummary[] }>(`api/datasets/${encodeURIComponent(datasetId)}/runs`, signal)).runs;
+}
+
+export async function getRun(runId: string, signal?: AbortSignal): Promise<{ run: Run; items: RunItemResult[] }> {
+  return getJson(`api/runs/${encodeURIComponent(runId)}`, signal);
+}
+
+export async function deleteRun(runId: string): Promise<void> {
+  await send("DELETE", `api/runs/${encodeURIComponent(runId)}`);
 }

@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from dataclasses import dataclass
+from typing import Any
 
-from agentwatch import datasets, genai, scores
+from agentwatch import datasets, experiments, genai, scores
 from agentwatch.spans import (
     KIND_CLIENT,
     KIND_INTERNAL,
@@ -344,7 +346,7 @@ def seed_datasets(store: Store) -> None:
         store,
         {"name": "Demo requests", "description": "Synthetic requests and expected answers."},
     )
-    datasets.add_items(
+    items = datasets.add_items(
         store,
         dataset.id,
         [
@@ -355,6 +357,34 @@ def seed_datasets(store: Store) -> None:
             for question, answer in _REQUESTS
         ],
     )
+    # Two synthetic runs to compare: the second answers more items correctly.
+    rng = random.Random(11)
+    start = time.time_ns() - 3600 * 10**9
+    for run_name, accuracy in (("baseline", 0.5), ("prompt v2", 0.83)):
+        run = experiments.create_run(store, dataset.id, {"name": run_name})
+        results: list[dict[str, Any]] = []
+        for index, item in enumerate(items):
+            correct = rng.random() < accuracy
+            latency = int(rng.uniform(0.8, 3.0) * 1e9)
+            item_start = start + index * 5 * 10**9
+            results.append(
+                {
+                    "item_id": item.id,
+                    "output": item.expected_output if correct else "I could not find that.",
+                    "start_ns": item_start,
+                    "end_ns": item_start + latency,
+                    "scores": [
+                        {"name": "exact", "value": correct},
+                        {
+                            "name": "helpfulness",
+                            "value": round(
+                                rng.uniform(0.7, 1.0) if correct else rng.uniform(0.1, 0.5), 2
+                            ),
+                        },
+                    ],
+                }
+            )
+        experiments.add_run_items(store, run.id, results)
 
 
 def _resource() -> Attributes:

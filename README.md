@@ -5,7 +5,8 @@ Local tracing for LLM agents. agentwatch receives OpenTelemetry traces over OTLP
 span, stores everything in a local DuckDB file and shows it in a web UI: a trace list with tokens,
 cache share and cost per trace, a span waterfall for each trace, sessions (traces grouped by
 conversation) and users, scores (from an API, OTel `gen_ai.evaluation.result` events, or added by
-hand), datasets (items written by hand, through the API, or made from any trace), and a dashboard of cost, tokens, cache share and latency over time and
+hand), datasets (items written by hand, through the API, or made from any trace), experiment runs
+over datasets, and a dashboard of cost, tokens, cache share and latency over time and
 by model, tool and agent.
 
 It runs on one machine for one person. There is no authentication, so it binds to `127.0.0.1` by
@@ -72,6 +73,25 @@ Trace token totals add up model calls only. Cost adds up every span except `invo
 `create_agent` and `invoke_workflow`, so an agent span that repeats its children's cost is not
 counted twice; when a model call reports no cost, the trace's cost is shown as a lower bound. See
 [docs/design.md](docs/design.md) for the storage model and API.
+
+## Experiments
+
+Run a dataset through your agent and score the results:
+
+```python
+from agentwatch.client import run_experiment
+
+def answer(question):                       # the task under test
+    return my_agent(question)
+
+def exact(question, output, expected):      # a score named "exact"
+    return output == expected
+
+result = run_experiment(dataset="Demo requests", name="prompt v2", task=answer, evaluators=[exact])
+print(result.scores)                        # {"exact": 0.83}
+```
+
+Each run appears on its dataset's page with per-item outputs, scores and traces.
 
 ## Develop
 

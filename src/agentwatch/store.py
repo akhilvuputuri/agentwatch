@@ -18,7 +18,7 @@ from agentwatch import genai
 from agentwatch.scores import Score, ScoreConflict, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
 # database and an upgraded one end up identical.
@@ -116,6 +116,28 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             created_ns BIGINT NOT NULL
         )""",
         "CREATE INDEX dataset_items_dataset ON dataset_items (dataset_id)",
+    ),
+    6: (
+        """CREATE TABLE runs (
+            id VARCHAR PRIMARY KEY,
+            dataset_id VARCHAR NOT NULL,
+            name VARCHAR NOT NULL,
+            description VARCHAR,
+            metadata JSON NOT NULL,
+            created_ns BIGINT NOT NULL,
+            UNIQUE (dataset_id, name)
+        )""",
+        """CREATE TABLE run_items (
+            run_id VARCHAR NOT NULL,
+            item_id VARCHAR NOT NULL,
+            trace_id VARCHAR NOT NULL,
+            output JSON,
+            error VARCHAR,
+            start_ns BIGINT NOT NULL,
+            end_ns BIGINT NOT NULL,
+            created_ns BIGINT NOT NULL,
+            PRIMARY KEY (run_id, item_id)
+        )""",
     ),
 }
 REPORTED = "reported"

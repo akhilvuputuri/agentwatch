@@ -9,6 +9,7 @@ describe("route", () => {
     expect(route("#/sessions")).toEqual({ page: "sessions" });
     expect(route("#/prices")).toEqual({ page: "prices" });
     expect(route("#/datasets")).toEqual({ page: "datasets" });
+    expect(route(links.run("r 1"))).toEqual({ page: "run", runId: "r 1" });
     expect(route(links.dataset("a b/c"))).toEqual({ page: "dataset", datasetId: "a b/c" });
     expect(route(`#/trace/${"A".repeat(32)}`)).toEqual({ page: "trace", traceId: "a".repeat(32) });
   });

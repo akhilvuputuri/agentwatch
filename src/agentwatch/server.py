@@ -27,7 +27,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from agentwatch import datasets, metrics, otlp, prices, scores
+from agentwatch import datasets, experiments, metrics, otlp, prices, scores
 from agentwatch.scores import Score
 from agentwatch.spans import jsonable
 from agentwatch.store import (
@@ -218,6 +218,64 @@ def create_app(
             lambda: datasets.set_item_status(store, item_id, body), status=204
         )
 
+    async def dataset_runs(request: Request) -> Response:
+        dataset_id = str(request.path_params["dataset_id"])
+        if request.method == "POST":
+            body = await _json_body(request)
+            if isinstance(body, Response):
+                return body
+            return await _dataset_call(
+                lambda: {"run": _run_json(experiments.create_run(store, dataset_id, body))},
+                status=201,
+            )
+        return await _dataset_call(
+            lambda: {
+                "runs": [
+                    summary | {"run": _run_json(summary["run"])}
+                    for summary in experiments.list_runs(store, dataset_id)
+                ]
+            }
+        )
+
+    async def run_detail(request: Request) -> Response:
+        run_id = str(request.path_params["run_id"])
+        if request.method == "DELETE":
+            return await _dataset_call(lambda: experiments.delete_run(store, run_id), status=204)
+        return await _dataset_call(
+            lambda: {
+                "run": _run_json(experiments.get_run(store, run_id)),
+                "items": experiments.run_items(store, run_id),
+            }
+        )
+
+    async def run_items_post(request: Request) -> Response:
+        run_id = str(request.path_params["run_id"])
+        body = await _json_body(request)
+        if isinstance(body, Response):
+            return body
+        items: Any
+        if isinstance(body, dict) and "items" in body:
+            items = cast(dict[str, Any], body)["items"]
+        else:
+            items = [cast(Any, body)]
+        if (
+            not isinstance(items, list)
+            or not 1 <= len(cast(list[Any], items)) <= MAX_ITEMS_PER_REQUEST
+        ):
+            return PlainTextResponse(
+                f'send one run item or 1 to {MAX_ITEMS_PER_REQUEST} under "items"', status_code=400
+            )
+        added = cast(list[Any], items)
+        return await _dataset_call(
+            lambda: {
+                "items": [
+                    {"item_id": i.item_id, "trace_id": i.trace_id}
+                    for i in experiments.add_run_items(store, run_id, added)
+                ]
+            },
+            status=201,
+        )
+
     async def list_prices(_: Request) -> Response:
         found = await run_in_threadpool(store.prices)
         return JSONResponse({"prices": [_price_json(price) for price in found]})
@@ -370,6 +428,9 @@ def create_app(
             "/api/datasets/{dataset_id}/items/from-trace", dataset_item_from_trace, methods=["POST"]
         ),
         Route("/api/dataset-items/{item_id}", dataset_item, methods=["PATCH"]),
+        Route("/api/datasets/{dataset_id}/runs", dataset_runs, methods=["GET", "POST"]),
+        Route("/api/runs/{run_id}", run_detail, methods=["GET", "DELETE"]),
+        Route("/api/runs/{run_id}/items", run_items_post, methods=["POST"]),
         Route("/api/prices", list_prices, methods=["GET"]),
         Route("/api/prices", post_price, methods=["POST"]),
         Route("/api/prices/{price_id}", delete_price, methods=["DELETE"]),
@@ -530,6 +591,10 @@ async def _dataset_call(work: Callable[[], Any], *, status: int = 200) -> Respon
 
 def _dataset_json(dataset: datasets.Dataset) -> dict[str, Any]:
     return asdict(dataset) | {"created_ns": str(dataset.created_ns)}
+
+
+def _run_json(run: experiments.Run) -> dict[str, Any]:
+    return asdict(run) | {"created_ns": str(run.created_ns)}
 
 
 def _item_json(item: datasets.Item) -> dict[str, Any]:

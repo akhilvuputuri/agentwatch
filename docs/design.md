@@ -127,6 +127,35 @@ on any cross-origin browser request, and standard JSON: the `NaN` and `Infinity`
 would accept are refused with 400, since a stored value that cannot be returned would break every
 listing that includes it. Absurdly deep nesting is a 400 as well.
 
+## Experiment runs
+
+A run (schema version 6) runs a dataset through a task, as Langfuse dataset runs and Braintrust
+experiments do. It belongs to one dataset, has a unique name there, and optional description and
+metadata (model, prompt version, commit). A run item records, for one dataset item, the task's
+output (any standard JSON, up to 512 KiB) or error, its start and end, and the trace that holds it.
+
+- `POST /api/datasets/<id>/runs` creates a run (409 on a repeated name); `GET` lists the dataset's
+  runs with, per run: items, errors, mean latency, cost and tokens over the items' traces, and
+  the mean and count of each score name on those traces.
+- `POST /api/runs/<id>/items` records one run item or `{"items": [...]}` (all or none). Each needs
+  `item_id` (an item of the run's dataset), and may carry `output`, `error`, `start_ns`, `end_ns`,
+  `trace_id` and `scores` (as for `/api/scores`, without `trace_id`; stored with source `EVAL`).
+  Recording an item again replaces its earlier result.
+- When `trace_id` is given, the caller traced the task itself and its spans arrive by OTLP.
+  Otherwise the server records a one-span trace for the item (service `agentwatch.experiment`,
+  with the item's input and output as `input.value` and `output.value`), so every result has a
+  trace for its scores and for the trace list.
+- `GET /api/runs/<id>` returns the run and its items with their dataset input and expected
+  output and their scores; `DELETE` removes the run and its run items, keeping their traces and
+  scores as trace data.
+
+`agentwatch.client.run_experiment` is a runner that uses only the standard library: it creates a
+run, calls the task on each active item (in a thread pool), applies evaluators to successful
+outputs, and posts each result. An evaluator receives `(input, output, expected_output)` and
+returns a number, boolean, label, score dict or list of those; its function name names the score.
+A task's exception is the item's error; an evaluator's exception is reported in the result and
+does not stop the run.
+
 ## Model prices
 
 When a model call reports tokens but no cost, its cost is calculated from a model price, as with

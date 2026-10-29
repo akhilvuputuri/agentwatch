@@ -234,12 +234,17 @@ def _captured(attributes: Attributes, names: tuple[str, ...]) -> Any:
         if value is None or value == "":
             continue
         if isinstance(value, str):
+            # Standard JSON only; anything else (including NaN) is kept as the text it was.
             try:
-                return json.loads(value)
-            except json.JSONDecodeError:
+                return json.loads(value, parse_constant=_reject_constant)
+            except (ValueError, RecursionError):
                 return value
         return value
     return None
+
+
+def _reject_constant(token: str) -> Any:
+    raise ValueError(f"{token} is not standard JSON")
 
 
 def _item(dataset_id: str, body: Any, now: int) -> Item:

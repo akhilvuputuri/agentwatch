@@ -12,6 +12,7 @@ import {
   type DatasetItem,
 } from "./api";
 import { timestamp } from "./format";
+import { RunList } from "./Runs";
 
 /** A one-line preview of a JSON value; message lists show their text parts. */
 export function preview(value: unknown, limit = 140): string {
@@ -171,6 +172,8 @@ export function DatasetView({ datasetId }: { datasetId: string }) {
           Delete dataset
         </button>
       </div>
+      <RunList datasetId={dataset.id} />
+      <h2 className="section">Items</h2>
       <ItemForm
         datasetId={dataset.id}
         onAdded={(item) => setItems((current) => [...(current ?? []), item])}
