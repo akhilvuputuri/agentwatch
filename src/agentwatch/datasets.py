@@ -178,14 +178,14 @@ def item_from_trace(store: Store, dataset_id: str, body: Any) -> Item:
         # messages on the model-call spans, so when the root has none, the earliest span that
         # captured an input stands in for the trace.
         ordered = sorted(spans, key=lambda s: (s.span.parent_span_id is not None, s.span.start_ns))
-        captured = [
+        with_input = [
             s
             for s in sorted(spans, key=lambda s: (s.span.start_ns, s.span.span_id))
-            if _captured(s.span.attributes, INPUT_ATTRIBUTES) is not None
+            if captured(s.span.attributes, INPUT_ATTRIBUTES) is not None
         ]
         root = ordered[0]
-        has_input = _captured(root.span.attributes, INPUT_ATTRIBUTES) is not None
-        chosen = root if has_input or not captured else captured[0]
+        has_input = captured(root.span.attributes, INPUT_ATTRIBUTES) is not None
+        chosen = root if has_input or not with_input else with_input[0]
     else:
         matches = [s for s in spans if s.span.span_id == span_id]
         if not matches:
@@ -195,8 +195,8 @@ def item_from_trace(store: Store, dataset_id: str, body: Any) -> Item:
     item = Item(
         id=uuid.uuid4().hex,
         dataset_id=dataset_id,
-        input=_captured(attributes, INPUT_ATTRIBUTES),
-        expected_output=_captured(attributes, OUTPUT_ATTRIBUTES),
+        input=captured(attributes, INPUT_ATTRIBUTES),
+        expected_output=captured(attributes, OUTPUT_ATTRIBUTES),
         metadata=_metadata(data.get("metadata")),
         source_trace_id=trace_id,
         source_span_id=chosen.span.span_id,
@@ -233,7 +233,7 @@ def set_item_status(store: Store, item_id: str, body: Any) -> None:
             raise NotFound("item not found")
 
 
-def _captured(attributes: Attributes, names: tuple[str, ...]) -> Any:
+def captured(attributes: Attributes, names: tuple[str, ...]) -> Any:
     """The first captured value, parsed when it holds JSON text (as both conventions use)."""
     for name in names:
         value = attributes.get(name)

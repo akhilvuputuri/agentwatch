@@ -18,7 +18,7 @@ from agentwatch import genai
 from agentwatch.scores import Score, ScoreConflict, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
 # database and an upgraded one end up identical.
@@ -137,6 +137,35 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             end_ns BIGINT NOT NULL,
             created_ns BIGINT NOT NULL,
             PRIMARY KEY (run_id, item_id)
+        )""",
+    ),
+    7: (
+        """CREATE TABLE judges (
+            id VARCHAR PRIMARY KEY,
+            name VARCHAR NOT NULL UNIQUE,
+            model VARCHAR NOT NULL,
+            base_url VARCHAR NOT NULL,
+            api_key_env VARCHAR,
+            prompt VARCHAR NOT NULL,
+            score_type VARCHAR NOT NULL,
+            sample_rate DOUBLE NOT NULL,
+            daily_limit INTEGER NOT NULL,
+            service VARCHAR,
+            enabled BOOLEAN NOT NULL,
+            created_ns BIGINT NOT NULL,
+            enabled_ns BIGINT
+        )""",
+        """CREATE TABLE judgements (
+            judge_id VARCHAR NOT NULL,
+            trace_id VARCHAR NOT NULL,
+            outcome VARCHAR NOT NULL,
+            value DOUBLE,
+            detail VARCHAR,
+            input_tokens BIGINT,
+            output_tokens BIGINT,
+            cost_usd DOUBLE,
+            created_ns BIGINT NOT NULL,
+            PRIMARY KEY (judge_id, trace_id)
         )""",
     ),
 }

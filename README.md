@@ -6,17 +6,18 @@ span, stores everything in a local DuckDB file and shows it in a web UI: a trace
 cache share and cost per trace, a span waterfall for each trace, sessions (traces grouped by
 conversation) and users, scores (from an API, OTel `gen_ai.evaluation.result` events, or added by
 hand), datasets (items written by hand, through the API, or made from any trace), experiment runs
-over datasets, and a dashboard of cost, tokens, cache share and latency over time and
-by model, tool and agent.
+over datasets, LLM judges that score a sample of new traces, and a dashboard of cost, tokens,
+cache share and latency over time and by model, tool and agent.
 
 It runs on one machine for one person. There is no authentication, so it binds to `127.0.0.1` by
 default and refuses requests addressed to any other host name, which blocks DNS-rebinding and
 cross-origin browser requests. To reach it from another machine, bind with `--host` and name the
 address clients will use with `--allow-host`.
 
-> Status: early development (phases 1–2 of the plan in
-> [chief-agent#323](https://github.com/akhilvuputuri/chief-agent/issues/323): tracing in, cost and
-> latency dashboards). The statistics engine and eval comparison come next.
+> Status: early development, following the plan in
+> [chief-agent#323](https://github.com/akhilvuputuri/chief-agent/issues/323). Tracing, dashboards,
+> scores, datasets, experiments with paired statistics, and LLM judges work; monitors and alerts
+> come next. Not yet published to PyPI.
 
 ## Run it
 
@@ -98,6 +99,16 @@ Each run appears on its dataset's page with per-item outputs, scores and traces.
 to compare them: each score gets a verdict (better, worse, no detectable difference, or
 underpowered) from paired statistics, with the items that changed listed side by side.
 
+## Judges
+
+A judge asks a model about each sampled new trace and stores the answer as a score. Add one on
+the Judges page or with `POST /api/judges`: a score name, a model, any OpenAI-compatible endpoint
+(OpenRouter, OpenAI, or a local server such as Ollama), the environment variable that holds the
+key, a question about `{input}` and `{output}`, a sample rate and a limit of calls a day. Judges
+start switched off, see only traces that arrive after they were switched on, and skip traces whose
+messages were not captured. Judging sends those messages to the endpoint you chose; nothing
+else leaves the machine. See [the design notes](docs/design.md#llm-judges).
+
 ## Develop
 
 Python 3.13 with [uv](https://docs.astral.sh/uv/), Node 22.
@@ -114,7 +125,8 @@ cd ui && npm ci && npm run build && npm test && npm run e2e
 ## Data and privacy
 
 The demo dataset is generated (`src/agentwatch/demo.py`) and contains no real conversations. Real
-traces stay in the local DuckDB file. agentwatch only reads what exporters send; whether prompts
+traces stay in the local DuckDB file, except the captured messages of traces a judge you
+switched on sends to its model endpoint. agentwatch only reads what exporters send; whether prompts
 or tool arguments are included is the exporter's choice.
 
 ## Licence

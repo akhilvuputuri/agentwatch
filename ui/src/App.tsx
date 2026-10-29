@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { CompareView } from "./Compare";
 import { Dashboard } from "./Dashboard";
 import { DatasetList, DatasetView } from "./Datasets";
+import { Judges } from "./Judges";
 import { Prices } from "./Prices";
 import { RunView } from "./Runs";
 import { SessionList, SessionView } from "./Sessions";
@@ -12,6 +13,7 @@ export type Route =
   | { page: "traces"; session?: string; user?: string }
   | { page: "dashboard" }
   | { page: "prices" }
+  | { page: "judges" }
   | { page: "datasets" }
   | { page: "dataset"; datasetId: string }
   | { page: "run"; runId: string }
@@ -24,6 +26,7 @@ export function route(hash: string): Route {
   if (hash === "#/dashboard") return { page: "dashboard" };
   if (hash === "#/sessions") return { page: "sessions" };
   if (hash === "#/prices") return { page: "prices" };
+  if (hash === "#/judges") return { page: "judges" };
   if (hash === "#/datasets") return { page: "datasets" };
   const compare = /^#\/compare\/([^/]+)\/([^/]+)$/.exec(hash);
   if (compare) {
@@ -84,7 +87,7 @@ export function App() {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
   const section =
-    current.page === "dashboard" || current.page === "prices"
+    current.page === "dashboard" || current.page === "prices" || current.page === "judges"
       ? current.page
       : current.page === "sessions" || current.page === "session"
         ? "sessions"
@@ -113,6 +116,9 @@ export function App() {
           <a href="#/dashboard" aria-current={section === "dashboard" ? "page" : undefined}>
             Dashboard
           </a>
+          <a href="#/judges" aria-current={section === "judges" ? "page" : undefined}>
+            Judges
+          </a>
           <a href="#/prices" aria-current={section === "prices" ? "page" : undefined}>
             Prices
           </a>
@@ -123,6 +129,8 @@ export function App() {
           <Dashboard />
         ) : current.page === "prices" ? (
           <Prices />
+        ) : current.page === "judges" ? (
+          <Judges />
         ) : current.page === "datasets" ? (
           <DatasetList />
         ) : current.page === "dataset" ? (

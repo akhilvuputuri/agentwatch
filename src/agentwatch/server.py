@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
@@ -27,7 +28,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from agentwatch import comparisons, datasets, experiments, metrics, otlp, prices, scores
+from agentwatch import comparisons, datasets, experiments, judges, metrics, otlp, prices, scores
 from agentwatch.scores import Score
 from agentwatch.spans import jsonable
 from agentwatch.store import (
@@ -58,8 +59,13 @@ def create_app(
     *,
     ui_dir: Path | None = None,
     allowed_hosts: Sequence[str] = LOOPBACK_HOSTS,
+    judge_runner: judges.JudgeRunner | None = None,
 ) -> Starlette:
-    """`allowed_hosts` are the Host header names served; "*" allows any (no rebinding guard)."""
+    """`allowed_hosts` are the Host header names served; "*" allows any (no rebinding guard).
+
+    `judge_runner`, when given, is the background runner whose problems the judges API reports
+    and whose model client a judge's trial uses.
+    """
 
     async def ingest(request: Request) -> Response:
         content_type = request.headers.get("content-type", "")
@@ -319,6 +325,84 @@ def create_app(
         await run_in_threadpool(store.upsert_price, price)
         return JSONResponse({"price": _price_json(price)}, status_code=201)
 
+    def judge_json(judge: judges.Judge) -> dict[str, Any]:
+        return asdict(judge) | {
+            "created_ns": str(judge.created_ns),
+            "enabled_ns": None if judge.enabled_ns is None else str(judge.enabled_ns),
+            "activity": judges.activity(store, judge.id),
+            "problem": judge_runner.problems.get(judge.id) if judge_runner else None,
+        }
+
+    async def judges_index(request: Request) -> Response:
+        if request.method == "GET":
+            return await _judge_call(
+                lambda: {"judges": [judge_json(j) for j in judges.list_judges(store)]}
+            )
+        body = await _json_body(request, MAX_SCORE_REQUEST_BYTES)
+        if isinstance(body, Response):
+            return body
+        return await _judge_call(
+            lambda: {"judge": judge_json(judges.create_judge(store, body))}, status=201
+        )
+
+    async def judge_detail(request: Request) -> Response:
+        judge_id = str(request.path_params["judge_id"])
+        if request.method == "GET":
+            return await _judge_call(
+                lambda: {"judge": judge_json(judges.get_judge(store, judge_id))}
+            )
+        if request.method == "DELETE":
+            return await _judge_call(lambda: judges.delete_judge(store, judge_id), status=204)
+        body = await _json_body(request, MAX_SCORE_REQUEST_BYTES)
+        if isinstance(body, Response):
+            return body
+        return await _judge_call(
+            lambda: {"judge": judge_json(judges.update_judge(store, judge_id, body))}
+        )
+
+    async def judge_judgements(request: Request) -> Response:
+        judge_id = str(request.path_params["judge_id"])
+        try:
+            limit = max(1, min(int(request.query_params.get("limit", "50")), 500))
+        except ValueError:
+            return PlainTextResponse("limit must be an integer", status_code=400)
+        return await _judge_call(
+            lambda: {
+                "judgements": [
+                    asdict(j) | {"created_ns": str(j.created_ns)}
+                    for j in judges.judgements(store, judge_id, limit=limit)
+                ]
+            }
+        )
+
+    async def judge_try(request: Request) -> Response:
+        """Judges one trace now and returns the verdict without storing it: one model call."""
+        judge_id = str(request.path_params["judge_id"])
+        body = await _json_body(request, MAX_SCORE_REQUEST_BYTES)
+        if isinstance(body, Response):
+            return body
+        trace_id = body.get("trace_id") if isinstance(body, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        if not isinstance(trace_id, str) or len(trace_id) != 32:
+            return PlainTextResponse("trace_id must be 32 hex characters", status_code=400)
+        post = judge_runner.post if judge_runner else judges.urllib_post
+        env = judge_runner.env if judge_runner else os.environ
+
+        def work() -> dict[str, Any]:
+            judge = judges.get_judge(store, judge_id)
+            spans = store.trace(trace_id)
+            if not spans:
+                raise datasets.NotFound("trace not found")
+            content = judges.trace_content(spans)
+            if content is None:
+                raise judges.JudgeError("this trace captured no output to judge")
+            try:
+                verdict = judges.ask(judge, content, post=post, env=env)
+            except judges.JudgeError as error:
+                raise ModelFailure(str(error)) from error
+            return {"verdict": asdict(verdict)}
+
+        return await _judge_call(work)
+
     async def delete_price(request: Request) -> Response:
         removed = await run_in_threadpool(store.delete_price, str(request.path_params["price_id"]))
         return (
@@ -455,6 +539,10 @@ def create_app(
         Route("/api/compare", compare, methods=["GET"]),
         Route("/api/runs/{run_id}", run_detail, methods=["GET", "DELETE"]),
         Route("/api/runs/{run_id}/items", run_items_post, methods=["POST"]),
+        Route("/api/judges", judges_index, methods=["GET", "POST"]),
+        Route("/api/judges/{judge_id}", judge_detail, methods=["GET", "PATCH", "DELETE"]),
+        Route("/api/judges/{judge_id}/judgements", judge_judgements, methods=["GET"]),
+        Route("/api/judges/{judge_id}/try", judge_try, methods=["POST"]),
         Route("/api/prices", list_prices, methods=["GET"]),
         Route("/api/prices", post_price, methods=["POST"]),
         Route("/api/prices/{price_id}", delete_price, methods=["DELETE"]),
@@ -608,6 +696,27 @@ async def _dataset_call(work: Callable[[], Any], *, status: int = 200) -> Respon
         return PlainTextResponse(str(error), status_code=409)
     except datasets.DatasetError as error:
         return PlainTextResponse(str(error), status_code=400)
+    if status == 204:
+        return Response(status_code=204)
+    return JSONResponse(result, status_code=status)
+
+
+class ModelFailure(Exception):
+    """The judge's model endpoint failed or answered something unusable."""
+
+
+async def _judge_call(work: Callable[[], Any], *, status: int = 200) -> Response:
+    """Run a judges operation in the threadpool and map its errors to HTTP statuses."""
+    try:
+        result = await run_in_threadpool(work)
+    except (judges.NotFound, datasets.NotFound) as error:
+        return PlainTextResponse(str(error), status_code=404)
+    except judges.Conflict as error:
+        return PlainTextResponse(str(error), status_code=409)
+    except judges.JudgeError as error:
+        return PlainTextResponse(str(error), status_code=400)
+    except ModelFailure as error:
+        return PlainTextResponse(str(error), status_code=502)
     if status == 204:
         return Response(status_code=204)
     return JSONResponse(result, status_code=status)

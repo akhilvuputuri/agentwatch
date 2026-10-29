@@ -59,6 +59,7 @@ def _serve(db: Path, host: str, port: int, demo: bool, extra_hosts: list[str]) -
     import uvicorn
 
     from agentwatch import demo as dataset
+    from agentwatch.judges import JudgeRunner
     from agentwatch.server import LOOPBACK_HOSTS, create_app
     from agentwatch.store import Store
 
@@ -81,11 +82,18 @@ def _serve(db: Path, host: str, port: int, demo: bool, extra_hosts: list[str]) -
     print(
         f"agentwatch on http://{host}:{port} ({where}); OTLP endpoint http://{host}:{port}/v1/traces"
     )
+    # Judges are disabled until switched on, so the runner makes no model call until then.
+    runner = JudgeRunner(store)
+    runner.start()
     try:
         uvicorn.run(
-            create_app(store, allowed_hosts=allowed), host=host, port=port, log_level="warning"
+            create_app(store, allowed_hosts=allowed, judge_runner=runner),
+            host=host,
+            port=port,
+            log_level="warning",
         )
     finally:
+        runner.stop()
         store.close()
     return 0
 
