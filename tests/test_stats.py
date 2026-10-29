@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Sequence
 
 import pytest
 
@@ -153,3 +154,55 @@ def test_a_real_regression_is_rarely_called_no_difference(n: int) -> None:
         pairs = [(rng.random() < 0.8, rng.random() < 0.7) for _ in range(n)]
         reassured += stats.compare_binary(pairs).verdict == stats.NO_DIFFERENCE
     assert reassured / trials <= 0.02, (n, reassured / trials)
+
+
+# Ported from Chief's evals/decisions/test_decisions.py.
+
+
+def test_wilson_is_exact_at_the_ends() -> None:
+    for n in (1, 7, 41, 1000):
+        assert (stats.wilson(0, n) or (1.0, 1.0))[0] == 0.0
+        assert (stats.wilson(n, n) or (0.0, 0.0))[1] == 1.0
+
+
+def test_chief_wilson_bounds() -> None:
+    low, high = stats.wilson(48, 48) or (0.0, 0.0)
+    assert high == pytest.approx(1.0)
+    assert low > 0.9
+    assert (stats.wilson(0, 20) or (1.0, 1.0))[0] == 0.0
+    low, high = stats.wilson(30, 60) or (1.0, 0.0)
+    assert low < 0.5 < high
+
+
+def test_chief_mcnemar_and_bootstrap() -> None:
+    assert stats.mcnemar_exact(10, 0) == pytest.approx(2 / 1024)
+    values = [0.0, 0.0, 100.0, 200.0, 0.0, 50.0, 0.0, 300.0]
+    assert stats.bootstrap(values, stats.mean) == stats.bootstrap(values, stats.mean)
+    low, high = stats.bootstrap(values, stats.mean) or (0.0, 0.0)
+    assert low <= stats.mean(values) <= high
+
+
+def test_percentile_nearest_rank() -> None:
+    assert stats.percentile([5, 1, 3, 2, 4], 0.5) == 3
+    assert stats.percentile([5, 1, 3, 2, 4], 0.95) == 5
+    assert stats.percentile([], 0.5) is None
+
+
+def test_cluster_bootstrap_resamples_whole_groups() -> None:
+    items = [{"g": 0, "v": 1.0}, {"g": 0, "v": 1.0}, {"g": 1, "v": 0.0}]
+    interval = stats.cluster_bootstrap(
+        items, lambda x: x["g"], lambda s: stats.mean([x["v"] for x in s])
+    )
+    # Only three group mixes are possible: all of group 0, all of group 1, or both.
+    assert interval == (0.0, 1.0)
+    assert stats.cluster_bootstrap([], lambda x: x, stats.mean) is None
+
+
+def test_cluster_interval_falls_back_to_wilson_when_degenerate() -> None:
+    items = [{"g": g, "v": 1.0} for g in range(20)]
+
+    def rate(sample: Sequence[dict[str, float]]) -> float:
+        return stats.mean([x["v"] for x in sample])
+
+    assert stats.cluster_interval(items, lambda x: x["g"], rate) == stats.wilson(20, 20)
+    assert stats.cluster_interval(items, lambda x: x["g"], rate, proportion=False) == (1.0, 1.0)

@@ -204,6 +204,24 @@ boolean that flipped, or a numeric score that moved by more than the margin. The
 shows a card per comparison with its verdict (icon and label) and, by default, only the items that
 changed. Runs are chosen as baseline and candidate on the dataset page.
 
+## Statistics shared with Chief
+
+`stats.py` and `scoring.py` replace Chief's `evals/decisions/stats.py` and `scoring.py` (Wilson,
+exact McNemar, percentile and cluster bootstraps with a Wilson fallback, nearest-rank percentiles,
+and per-call scoring helpers). Parity was checked on 29 October 2026 by re-scoring Chief's two
+stored decision reports (`continuity` and `routing`, Chief `0c3039c`) offline, with no model
+calls: once with Chief's own modules, which reproduced both reports exactly, and once with
+agentwatch's modules standing in for them. Every figure matched except eight Wilson interval
+bounds, which move by at most 0.00017 (a `calls_saved_per_100` bound) and otherwise by less than
+0.00001, because agentwatch uses the exact 97.5th normal percentile (1.959964) instead of 1.96.
+No verdict, point estimate, p-value or bootstrap interval changed. Wilson bounds at 0 and n
+successes are exactly 0 and 1. One more intended difference does not show in those reports:
+`call_stats` ignores a latency or cost given as a boolean, where Chief's counted `True` as 1.
+
+Chief keeps its own copies until agentwatch is published: Chief installs Python dependencies
+with `--require-hashes`, which a git-pinned package cannot satisfy. At the first PyPI release
+(issue #3), Chief pins the hashed package and deletes its copies.
+
 Wilson and McNemar come from Chief's evaluation code. Seeded simulations in `tests/test_stats.py`
 check that Wilson intervals cover the true rate about 95% of the time; that McNemar, and the
 numeric test at 10, 20 and 40 pairs, call a difference at most about 5–7% of the time when there

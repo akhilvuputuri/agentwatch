@@ -1,7 +1,8 @@
 """Paired statistics for comparing two experiment runs on the same dataset items.
 
 Dependency-free and deterministic given a seed, so a comparison can be reproduced exactly.
-Ported from Chief's evals/decisions/stats.py, which this replaces there.
+Ported from Chief's evals/decisions/stats.py, which this replaces there. One deliberate change:
+Wilson intervals use the exact 97.5th normal percentile (1.959964) rather than 1.96.
 
 A comparison ends in a verdict, never a bare difference:
 
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 import math
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass
 
 BETTER = "better"
@@ -59,7 +60,10 @@ def wilson(successes: int, total: int, z: float = Z_95) -> tuple[float, float] |
     denominator = 1 + z * z / total
     centre = (p + z * z / (2 * total)) / denominator
     half = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / denominator
-    return (max(0.0, centre - half), min(1.0, centre + half))
+    # At 0 or total successes the bound is exactly 0 or 1; computed, it can be off by 1e-17.
+    low = 0.0 if successes == 0 else max(0.0, centre - half)
+    high = 1.0 if successes == total else min(1.0, centre + half)
+    return (low, high)
 
 
 def mcnemar_exact(b: int, c: int) -> float:
@@ -92,6 +96,68 @@ def bootstrap(
         statistic([values[rng.randrange(n)] for _ in range(n)]) for _ in range(resamples)
     )
     return (draws[int(0.025 * resamples)], draws[int(0.975 * resamples) - 1])
+
+
+def percentile(values: Sequence[float], share: float) -> float | None:
+    """Nearest-rank percentile; None for no values."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(1, math.ceil(len(ordered) * share)) - 1]
+
+
+def cluster_bootstrap[T](
+    items: Sequence[T],
+    cluster: Callable[[T], Hashable],
+    statistic: Callable[[Sequence[T]], float | None],
+    *,
+    resamples: int = 4000,
+    seed: int = 7,
+) -> tuple[float, float] | None:
+    """95% percentile bootstrap that resamples whole clusters.
+
+    Calls of the same case, and cases of the same conversation, are not independent, so
+    resampling clusters (not single items) keeps the interval honest. A resample whose
+    statistic is undefined (for example, no positives) is skipped.
+    """
+    groups: dict[Hashable, list[T]] = {}
+    for item in items:
+        groups.setdefault(cluster(item), []).append(item)
+    keys = list(groups)
+    if not keys:
+        return None
+    rng = random.Random(seed)
+    draws: list[float] = []
+    for _ in range(resamples):
+        sample = [x for _ in keys for x in groups[keys[rng.randrange(len(keys))]]]
+        value = statistic(sample)
+        if value is not None:
+            draws.append(value)
+    if not draws:
+        return None
+    draws.sort()
+    return (draws[int(0.025 * len(draws))], draws[max(0, int(0.975 * len(draws)) - 1)])
+
+
+def cluster_interval[T](
+    items: Sequence[T],
+    cluster: Callable[[T], Hashable],
+    statistic: Callable[[Sequence[T]], float | None],
+    *,
+    proportion: bool = True,
+) -> tuple[float, float] | None:
+    """Cluster bootstrap interval, or a Wilson interval over clusters when it is degenerate.
+
+    With no failures (or no successes) every resample gives the same value, so the bootstrap
+    would claim certainty. A Wilson interval with n = number of clusters is used instead,
+    treating each cluster as one independent observation. Only for proportions.
+    """
+    interval = cluster_bootstrap(items, cluster, statistic)
+    value = statistic(list(items))
+    if not proportion or interval is None or value is None or interval[0] != interval[1]:
+        return interval
+    n = len({cluster(x) for x in items})
+    return wilson(round(value * n), n)
 
 
 def mean(values: Sequence[float]) -> float:
