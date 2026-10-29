@@ -224,3 +224,21 @@ def test_input_that_excludes_cached_tokens_is_charged_as_fresh() -> None:
     db.insert([call("1", "m", input=100, cache_read=10_000, output=0)], 1)
     db.upsert_price(price("m", 3.0, 0.0, cache_read_per_million=0.3))
     assert costs(db)["1"][0] == pytest.approx((100 * 3.0 + 10_000 * 0.3) / 1e6)
+
+
+def test_a_dated_generic_price_does_not_override_a_specific_pattern() -> None:
+    db = Store()
+    db.insert(
+        [
+            call("1", "gpt-x-mini", start=500, input=1_000_000),
+            call("2", "gpt-x", start=500, input=1_000_000),
+        ],
+        1,
+    )
+    db.upsert_price(price("gpt-x-mini.*", 0.15, 0.0, id="mini"))
+    db.upsert_price(price("gpt-x.*", 2.5, 0.0, id="generic"))
+    db.upsert_price(price("gpt-x.*", 2.0, 0.0, id="generic-change", start_ns=100))
+    found = costs(db)
+    assert found["1"][0] == pytest.approx(0.15)
+    # The generic pattern's own dated change applies to the calls it alone matches.
+    assert found["2"][0] == pytest.approx(2.0)

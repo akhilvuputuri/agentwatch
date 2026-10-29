@@ -829,8 +829,9 @@ class Store:
         """Set the cost of model calls that reported none from the best matching price.
 
         A price matches when its pattern matches the whole model name (case-insensitively) and
-        it took effect by the span's start. Of the matches, the latest to take effect wins,
-        then the longest (most specific) pattern, then the most recently added. Calls with no
+        it took effect by the span's start. Of the matches, the longest (most specific) pattern
+        wins; among that pattern's prices, the latest to take effect, then the most recently
+        added. Calls with no
         match have no cost. Reported costs are never touched. `traces` limits the work to
         those traces; None recalculates everything.
         """
@@ -865,7 +866,7 @@ class Store:
             ),
             costs AS (
                 SELECT s.trace_id, s.span_id,
-                       arg_max({_COST}, (coalesce(p.start_ns, -1), length(p.match_pattern),
+                       arg_max({_COST}, (length(p.match_pattern), coalesce(p.start_ns, -1),
                                          p.created_ns, p.id)) AS cost
                 FROM targets s JOIN matched p USING (model)
                 WHERE p.start_ns IS NULL OR p.start_ns <= s.start_ns

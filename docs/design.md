@@ -105,9 +105,10 @@ Langfuse's model definitions. A price (schema version 4) has a regular expressio
 the whole model name (response model, else request model) case-insensitively, prices in US dollars
 per million tokens for input, output, cache reads and cache writes (cache prices default to the
 input price), and an optional time it takes effect. Of the prices in effect at the call's start
-whose pattern matches, the one that took effect latest applies; among equals, the longest (most
-specific) pattern, then the most recently added. So `gpt-4o-mini.*` keeps applying to mini calls
-after a generic `gpt-4o.*` is added:
+whose pattern matches, the longest (most specific) pattern wins; among that pattern's prices, the
+one that took effect latest, then the most recently added. So `gpt-4o-mini.*` keeps applying to
+mini calls when a generic `gpt-4o.*` is added, dated or not. To record a price change over time,
+add a dated price with the same pattern:
 
 cost = (input − cache read − cache write) × input price + cache read × cache-read price
 + cache write × cache-write price + output × output price, per million.
