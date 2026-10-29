@@ -568,3 +568,60 @@ export async function compareRuns(baseline: string, candidate: string, signal?: 
   const params = new URLSearchParams({ baseline, candidate });
   return getJson<Comparison>(`api/compare?${params}`, signal);
 }
+
+export interface JudgeActivity {
+  counts: Record<"SCORED" | "FAILED" | "NOT_SAMPLED" | "NO_CONTENT" | "OVER_LIMIT", number>;
+  calls: number;
+  cost_usd: number;
+  calls_without_cost: number;
+}
+
+export interface Judge {
+  id: string;
+  name: string;
+  model: string;
+  base_url: string;
+  api_key_env: string | null;
+  prompt: string;
+  score_type: "BOOLEAN" | "NUMERIC";
+  sample_rate: number;
+  daily_limit: number;
+  service: string | null;
+  enabled: boolean;
+  created_ns: string;
+  activity: JudgeActivity;
+  problem: string | null;
+}
+
+export type NewJudge = Pick<Judge, "name" | "model" | "base_url" | "api_key_env" | "prompt" | "score_type" | "sample_rate" | "daily_limit" | "service">;
+
+export interface Judgement {
+  trace_id: string;
+  outcome: keyof JudgeActivity["counts"];
+  value: number | null;
+  detail: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cost_usd: number | null;
+  created_ns: string;
+}
+
+export async function listJudges(signal?: AbortSignal): Promise<Judge[]> {
+  return (await getJson<{ judges: Judge[] }>("api/judges", signal)).judges;
+}
+
+export async function createJudge(judge: NewJudge): Promise<Judge> {
+  return (await send<{ judge: Judge }>("POST", "api/judges", judge)).judge;
+}
+
+export async function updateJudge(id: string, fields: Partial<NewJudge & { enabled: boolean }>): Promise<Judge> {
+  return (await send<{ judge: Judge }>("PATCH", `api/judges/${encodeURIComponent(id)}`, fields)).judge;
+}
+
+export async function deleteJudge(id: string): Promise<void> {
+  await send<void>("DELETE", `api/judges/${encodeURIComponent(id)}`);
+}
+
+export async function listJudgements(id: string, signal?: AbortSignal): Promise<Judgement[]> {
+  return (await getJson<{ judgements: Judgement[] }>(`api/judges/${encodeURIComponent(id)}/judgements`, signal)).judgements;
+}

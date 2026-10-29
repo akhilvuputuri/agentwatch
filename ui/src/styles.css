@@ -613,6 +613,9 @@ h2.section {
 .score-form label.wide {
   flex: 1 1 220px;
 }
+.score-form label.full {
+  flex: 1 1 100%;
+}
 .score-form input:not([type="checkbox"]),
 .score-form select {
   font: inherit;
