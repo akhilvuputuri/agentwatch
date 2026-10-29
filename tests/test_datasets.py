@@ -200,3 +200,69 @@ def test_module_errors_are_typed() -> None:
         datasets.get_dataset(db, "missing")
     with pytest.raises(datasets.DatasetError):
         datasets.create_dataset(db, [])
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b'{"input": NaN}', b'{"input": 1, "metadata": {"x": Infinity}}', b'{"input": -Infinity}'],
+)
+def test_non_standard_json_is_refused(raw: bytes) -> None:
+    db = Store()
+    http = client(db)
+    dataset_id = make(http)
+    response = http.post(
+        f"/api/datasets/{dataset_id}/items",
+        content=raw,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert http.get(f"/api/datasets/{dataset_id}/items").status_code == 200
+    # Called directly, the module refuses them too.
+    with pytest.raises(datasets.DatasetError, match="standard JSON"):
+        datasets.add_items(db, dataset_id, [{"input": float("nan")}])
+
+
+def test_deeply_nested_json_is_a_400() -> None:
+    http = client(Store())
+    body = b"[" * 100_000 + b"]" * 100_000
+    for path in ("/api/datasets", "/api/scores", "/api/prices"):
+        assert http.post(
+            path, content=body, headers={"content-type": "application/json"}
+        ).status_code in (400, 413)
+
+
+def test_a_trace_without_root_messages_uses_the_first_captured_span() -> None:
+    db = Store()
+    messages = json.dumps(
+        [{"role": "user", "parts": [{"type": "text", "content": "from the chat span"}]}]
+    )
+    db.insert(
+        [
+            Span(
+                trace_id=T,
+                span_id="1" * 16,
+                parent_span_id=None,
+                name="agent",
+                start_ns=1,
+                end_ns=9,
+                attributes={genai.OPERATION: "invoke_agent"},
+            ),
+            Span(
+                trace_id=T,
+                span_id="2" * 16,
+                parent_span_id="1" * 16,
+                name="chat",
+                start_ns=2,
+                end_ns=3,
+                attributes={genai.OPERATION: "chat", "gen_ai.input.messages": messages},
+            ),
+        ],
+        received_ns=1,
+    )
+    http = client(db)
+    dataset_id = make(http)
+    item = http.post(f"/api/datasets/{dataset_id}/items/from-trace", json={"trace_id": T}).json()[
+        "item"
+    ]
+    assert item["input"][0]["parts"][0]["content"] == "from the chat span"
+    assert item["source_span_id"] == "2" * 16

@@ -64,7 +64,7 @@ export function TraceView({ traceId }: { traceId: string }) {
           </>
         )}
       </p>
-      <AddToDataset traceId={traceId} spanId={chosen?.span.span_id ?? null} spanName={chosen?.span.name ?? null} />
+      <AddToDataset key={traceId} traceId={traceId} spanId={chosen?.span.span_id ?? null} spanName={chosen?.span.name ?? null} />
       <ScorePanel
         traceId={traceId}
         spanId={chosen?.span.span_id ?? null}

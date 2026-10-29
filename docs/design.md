@@ -112,15 +112,20 @@ items.
   1,000, all or none). An item with a caller-chosen `id` (URL-safe, as for scores) replaces the
   same item in place, keeping its creation time and status; an `id` owned by another dataset is a
   409. Each item is limited to 512 KiB of JSON.
-- `POST /api/datasets/<id>/items/from-trace` with `trace_id` and optional `span_id` (default: the
-  root span) makes an item from the span's captured messages: input from `gen_ai.input.messages`
+- `POST /api/datasets/<id>/items/from-trace` with `trace_id` and optional `span_id` makes an item
+  from a span's captured messages. Without `span_id` it uses the root span, or, when the root
+  captured no input (agent frameworks usually capture messages on the model-call spans), the
+  earliest span that did. The input comes from `gen_ai.input.messages`
   (the GenAI conventions' opt-in capture) or OpenInference `input.value`, expected output from
   `gen_ai.output.messages` or `output.value`, parsed when they hold JSON text. Spans without
   captured content give an item with a null input, still linked to the trace.
-- `PATCH /api/dataset-items/<id>` with `{"status": "ARCHIVED" | "ACTIVE"}`.
+- `PATCH /api/dataset-items/<id>` with `{"status": "ARCHIVED" | "ACTIVE"}`; item IDs are unique
+  across datasets, so the route needs no dataset.
 
 All JSON writes (datasets, scores, prices) must be `application/json`, which forces a preflight
-on any cross-origin browser request.
+on any cross-origin browser request, and standard JSON: the `NaN` and `Infinity` tokens Python
+would accept are refused with 400, since a stored value that cannot be returned would break every
+listing that includes it. Absurdly deep nesting is a 400 as well.
 
 ## Model prices
 

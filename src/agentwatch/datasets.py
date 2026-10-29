@@ -168,8 +168,18 @@ def item_from_trace(store: Store, dataset_id: str, body: Any) -> Item:
     if not spans:
         raise NotFound("trace not found")
     if span_id is None:
-        # The root: the span with no parent, else the earliest.
-        chosen = min(spans, key=lambda s: (s.span.parent_span_id is not None, s.span.start_ns))
+        # The root (no parent, else the earliest); but agent frameworks usually capture
+        # messages on the model-call spans, so when the root has none, the earliest span that
+        # captured an input stands in for the trace.
+        ordered = sorted(spans, key=lambda s: (s.span.parent_span_id is not None, s.span.start_ns))
+        captured = [
+            s
+            for s in sorted(spans, key=lambda s: (s.span.start_ns, s.span.span_id))
+            if _captured(s.span.attributes, INPUT_ATTRIBUTES) is not None
+        ]
+        root = ordered[0]
+        has_input = _captured(root.span.attributes, INPUT_ATTRIBUTES) is not None
+        chosen = root if has_input or not captured else captured[0]
     else:
         matches = [s for s in spans if s.span.span_id == span_id]
         if not matches:
@@ -260,8 +270,16 @@ def _item(dataset_id: str, body: Any, now: int) -> Item:
     return item
 
 
+def _dumps(value: Any) -> str:
+    """Standard JSON only: NaN and Infinity could be stored but never returned."""
+    try:
+        return json.dumps(value, allow_nan=False)
+    except (ValueError, RecursionError) as error:
+        raise DatasetError("values must be standard JSON (no NaN or Infinity)") from error
+
+
 def _check_size(item: Item) -> None:
-    size = len(json.dumps([item.input, item.expected_output, item.metadata]))
+    size = len(_dumps([item.input, item.expected_output, item.metadata]))
     if size > MAX_ITEM_BYTES:
         raise DatasetError(f"an item is limited to {MAX_ITEM_BYTES // 1024} KiB of JSON")
 
@@ -272,9 +290,9 @@ def _write_item(db: duckdb.DuckDBPyConnection, item: Item) -> None:
         [
             item.id,
             item.dataset_id,
-            json.dumps(item.input),
-            json.dumps(item.expected_output),
-            json.dumps(item.metadata),
+            _dumps(item.input),
+            _dumps(item.expected_output),
+            _dumps(item.metadata),
             item.source_trace_id,
             item.source_span_id,
             item.status,

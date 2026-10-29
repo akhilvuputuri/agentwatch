@@ -17,7 +17,11 @@ import { timestamp } from "./format";
 export function preview(value: unknown, limit = 140): string {
   if (value === null || value === undefined) return "–";
   let text: string;
-  if (Array.isArray(value) && value.every((m) => m && typeof m === "object" && "parts" in m)) {
+  if (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((m) => m && typeof m === "object" && Array.isArray((m as { parts?: unknown }).parts))
+  ) {
     text = (value as { role?: string; parts: { content?: unknown }[] }[])
       .map((m) => `${m.role ?? ""}: ${m.parts.map((p) => (typeof p.content === "string" ? p.content : "")).join(" ")}`)
       .join(" / ");

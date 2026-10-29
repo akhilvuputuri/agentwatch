@@ -8,6 +8,8 @@ export function AddToDataset({ traceId, spanId, spanName }: { traceId: string; s
   const [chosen, setChosen] = useState("");
   const [useSpan, setUseSpan] = useState(false);
   const [message, setMessage] = useState<{ text: string; datasetId?: string } | null>(null);
+  // A confirmation belongs to the span it was for.
+  useEffect(() => setMessage(null), [spanId, useSpan, chosen]);
 
   useEffect(() => {
     if (!open || datasets) return;

@@ -113,18 +113,9 @@ def create_app(
 
     async def post_scores(request: Request) -> Response:
         """One score object, or {"scores": [...]}; all are validated before any is stored."""
-        # Requiring JSON makes any cross-origin browser request preflight, which this server
-        # never answers, so a page elsewhere cannot submit a form here.
-        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if media != otlp.JSON:
-            return PlainTextResponse("send application/json", status_code=415)
-        body = await _read_body(request, MAX_SCORE_REQUEST_BYTES)
-        if body is None:
-            return PlainTextResponse("request too large", status_code=413)
-        try:
-            document = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return PlainTextResponse("body must be JSON", status_code=400)
+        document = await _json_body(request, MAX_SCORE_REQUEST_BYTES)
+        if isinstance(document, Response):
+            return document
         items: Any
         if isinstance(document, dict) and "scores" in document:
             items = cast(dict[str, Any], document)["scores"]
@@ -232,16 +223,11 @@ def create_app(
         return JSONResponse({"prices": [_price_json(price) for price in found]})
 
     async def post_price(request: Request) -> Response:
-        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if media != otlp.JSON:
-            return PlainTextResponse("send application/json", status_code=415)
-        body = await _read_body(request, MAX_SCORE_REQUEST_BYTES)
-        if body is None:
-            return PlainTextResponse("request too large", status_code=413)
+        document = await _json_body(request, MAX_SCORE_REQUEST_BYTES)
+        if isinstance(document, Response):
+            return document
         try:
-            price = prices.from_api(json.loads(body))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return PlainTextResponse("body must be JSON", status_code=400)
+            price = prices.from_api(document)
         except prices.PriceError as error:
             return PlainTextResponse(str(error), status_code=400)
         problem = await run_in_threadpool(store.check_pattern, price.match_pattern)
@@ -499,7 +485,16 @@ def _summary_json(summary: TraceSummary) -> dict[str, Any]:
     return data
 
 
-async def _json_body(request: Request) -> Any:
+def _reject_constant(token: str) -> Any:
+    raise ValueError(f"{token} is not valid JSON")
+
+
+def _parse_json(body: bytes) -> Any:
+    """Strict JSON: no NaN or Infinity (which Python accepts but nothing can return)."""
+    return json.loads(body, parse_constant=_reject_constant)
+
+
+async def _json_body(request: Request, limit: int | None = None) -> Any:
     """The parsed JSON body of a write, or the error Response to return instead.
 
     Writes must be application/json, which forces a preflight on any cross-origin browser
@@ -508,13 +503,14 @@ async def _json_body(request: Request) -> Any:
     media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if media != otlp.JSON:
         return PlainTextResponse("send application/json", status_code=415)
-    body = await _read_body(request, MAX_JSON_WRITE_BYTES)
+    body = await _read_body(request, MAX_JSON_WRITE_BYTES if limit is None else limit)
     if body is None:
         return PlainTextResponse("request too large", status_code=413)
     try:
-        return json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return PlainTextResponse("body must be JSON", status_code=400)
+        return _parse_json(body)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        # ValueError covers JSONDecodeError and NaN/Infinity; RecursionError, absurd nesting.
+        return PlainTextResponse("body must be standard JSON", status_code=400)
 
 
 async def _dataset_call(work: Callable[[], Any], *, status: int = 200) -> Response:
