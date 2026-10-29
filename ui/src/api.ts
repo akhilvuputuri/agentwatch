@@ -327,6 +327,7 @@ export async function getSession(
 /** Hash links to the views, with IDs encoded so any session or user string is safe. */
 export const links = {
   session: (id: string) => `#/session/${encodeURIComponent(id)}`,
+  dataset: (id: string) => `#/dataset/${encodeURIComponent(id)}`,
   traces: (filter: { session?: string; user?: string }) => {
     const params = new URLSearchParams();
     if (filter.session) params.set("session", filter.session);
@@ -369,4 +370,78 @@ export async function deletePrice(id: string): Promise<void> {
   if (!response.ok && response.status !== 404) {
     throw new Error(`${response.status} ${(await response.text()).trim()}`);
   }
+}
+
+export interface Dataset {
+  id: string;
+  name: string;
+  description: string | null;
+  metadata: Record<string, unknown>;
+  created_ns: string;
+  items: number;
+  archived_items: number;
+}
+
+export interface DatasetItem {
+  id: string;
+  dataset_id: string;
+  input: unknown;
+  expected_output: unknown;
+  metadata: Record<string, unknown>;
+  source_trace_id: string | null;
+  source_span_id: string | null;
+  status: "ACTIVE" | "ARCHIVED";
+  created_ns: string;
+}
+
+async function send<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method,
+    ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+  });
+  if (!response.ok) throw new Error(`${response.status} ${(await response.text()).trim()}`);
+  return (response.status === 204 ? undefined : await response.json()) as T;
+}
+
+export async function listDatasets(signal?: AbortSignal): Promise<Dataset[]> {
+  return (await getJson<{ datasets: Dataset[] }>("api/datasets", signal)).datasets;
+}
+
+export async function getDataset(id: string, signal?: AbortSignal): Promise<Dataset> {
+  return (await getJson<{ dataset: Dataset }>(`api/datasets/${encodeURIComponent(id)}`, signal)).dataset;
+}
+
+export async function createDataset(name: string, description: string): Promise<Dataset> {
+  return (await send<{ dataset: Dataset }>("POST", "api/datasets", { name, description: description || null }))
+    .dataset;
+}
+
+export async function deleteDataset(id: string): Promise<void> {
+  await send("DELETE", `api/datasets/${encodeURIComponent(id)}`);
+}
+
+export async function listItems(datasetId: string, archived: boolean, signal?: AbortSignal): Promise<DatasetItem[]> {
+  const query = archived ? "?archived=1" : "";
+  return (await getJson<{ items: DatasetItem[] }>(`api/datasets/${encodeURIComponent(datasetId)}/items${query}`, signal))
+    .items;
+}
+
+export async function addItem(
+  datasetId: string,
+  item: { input: unknown; expected_output?: unknown },
+): Promise<DatasetItem> {
+  const body = await send<{ items: DatasetItem[] }>("POST", `api/datasets/${encodeURIComponent(datasetId)}/items`, item);
+  return body.items[0]!;
+}
+
+export async function addItemFromTrace(datasetId: string, traceId: string, spanId: string | null): Promise<DatasetItem> {
+  const body = await send<{ item: DatasetItem }>("POST", `api/datasets/${encodeURIComponent(datasetId)}/items/from-trace`, {
+    trace_id: traceId,
+    ...(spanId ? { span_id: spanId } : {}),
+  });
+  return body.item;
+}
+
+export async function setItemStatus(itemId: string, status: "ACTIVE" | "ARCHIVED"): Promise<void> {
+  await send("PATCH", `api/dataset-items/${encodeURIComponent(itemId)}`, { status });
 }

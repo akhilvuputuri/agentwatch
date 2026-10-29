@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from importlib import resources
 from pathlib import Path
@@ -27,7 +27,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from agentwatch import metrics, otlp, prices, scores
+from agentwatch import datasets, metrics, otlp, prices, scores
 from agentwatch.scores import Score
 from agentwatch.spans import jsonable
 from agentwatch.store import (
@@ -47,6 +47,8 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 DAY_NS = 24 * 3600 * 1_000_000_000
 MAX_SCORE_REQUEST_BYTES = 1024 * 1024
 MAX_SCORES_PER_REQUEST = 1000
+MAX_JSON_WRITE_BYTES = 16 * 1024 * 1024
+MAX_ITEMS_PER_REQUEST = 1000
 # Traces returned with one session.
 SESSION_TRACES = 500
 
@@ -111,18 +113,9 @@ def create_app(
 
     async def post_scores(request: Request) -> Response:
         """One score object, or {"scores": [...]}; all are validated before any is stored."""
-        # Requiring JSON makes any cross-origin browser request preflight, which this server
-        # never answers, so a page elsewhere cannot submit a form here.
-        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if media != otlp.JSON:
-            return PlainTextResponse("send application/json", status_code=415)
-        body = await _read_body(request, MAX_SCORE_REQUEST_BYTES)
-        if body is None:
-            return PlainTextResponse("request too large", status_code=413)
-        try:
-            document = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return PlainTextResponse("body must be JSON", status_code=400)
+        document = await _json_body(request, MAX_SCORE_REQUEST_BYTES)
+        if isinstance(document, Response):
+            return document
         items: Any
         if isinstance(document, dict) and "scores" in document:
             items = cast(dict[str, Any], document)["scores"]
@@ -151,21 +144,90 @@ def create_app(
             status_code=201,
         )
 
+    async def datasets_index(request: Request) -> Response:
+        if request.method == "POST":
+            body = await _json_body(request)
+            if isinstance(body, Response):
+                return body
+            return await _dataset_call(
+                lambda: {"dataset": _dataset_json(datasets.create_dataset(store, body))}, status=201
+            )
+        found = await run_in_threadpool(datasets.list_datasets, store)
+        return JSONResponse({"datasets": [_dataset_json(d) for d in found]})
+
+    async def dataset_detail(request: Request) -> Response:
+        dataset_id = str(request.path_params["dataset_id"])
+        if request.method == "DELETE":
+            return await _dataset_call(
+                lambda: datasets.delete_dataset(store, dataset_id), status=204
+            )
+        return await _dataset_call(
+            lambda: {"dataset": _dataset_json(datasets.get_dataset(store, dataset_id))}
+        )
+
+    async def dataset_items(request: Request) -> Response:
+        dataset_id = str(request.path_params["dataset_id"])
+        if request.method == "POST":
+            body = await _json_body(request)
+            if isinstance(body, Response):
+                return body
+            items: Any
+            if isinstance(body, dict) and "items" in body:
+                items = cast(dict[str, Any], body)["items"]
+            else:
+                items = [cast(Any, body)]
+            if (
+                not isinstance(items, list)
+                or not 1 <= len(cast(list[Any], items)) <= MAX_ITEMS_PER_REQUEST
+            ):
+                return PlainTextResponse(
+                    f'send one item or 1 to {MAX_ITEMS_PER_REQUEST} under "items"', status_code=400
+                )
+            added = cast(list[Any], items)
+            return await _dataset_call(
+                lambda: {
+                    "items": [_item_json(i) for i in datasets.add_items(store, dataset_id, added)]
+                },
+                status=201,
+            )
+        archived = request.query_params.get("archived") in ("1", "true")
+        return await _dataset_call(
+            lambda: {
+                "items": [
+                    _item_json(i) for i in datasets.list_items(store, dataset_id, archived=archived)
+                ]
+            }
+        )
+
+    async def dataset_item_from_trace(request: Request) -> Response:
+        dataset_id = str(request.path_params["dataset_id"])
+        body = await _json_body(request)
+        if isinstance(body, Response):
+            return body
+        return await _dataset_call(
+            lambda: {"item": _item_json(datasets.item_from_trace(store, dataset_id, body))},
+            status=201,
+        )
+
+    async def dataset_item(request: Request) -> Response:
+        item_id = str(request.path_params["item_id"])
+        body = await _json_body(request)
+        if isinstance(body, Response):
+            return body
+        return await _dataset_call(
+            lambda: datasets.set_item_status(store, item_id, body), status=204
+        )
+
     async def list_prices(_: Request) -> Response:
         found = await run_in_threadpool(store.prices)
         return JSONResponse({"prices": [_price_json(price) for price in found]})
 
     async def post_price(request: Request) -> Response:
-        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if media != otlp.JSON:
-            return PlainTextResponse("send application/json", status_code=415)
-        body = await _read_body(request, MAX_SCORE_REQUEST_BYTES)
-        if body is None:
-            return PlainTextResponse("request too large", status_code=413)
+        document = await _json_body(request, MAX_SCORE_REQUEST_BYTES)
+        if isinstance(document, Response):
+            return document
         try:
-            price = prices.from_api(json.loads(body))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return PlainTextResponse("body must be JSON", status_code=400)
+            price = prices.from_api(document)
         except prices.PriceError as error:
             return PlainTextResponse(str(error), status_code=400)
         problem = await run_in_threadpool(store.check_pattern, price.match_pattern)
@@ -301,6 +363,13 @@ def create_app(
         Route("/v1/logs", ingest_logs, methods=["POST"]),
         Route("/api/scores", post_scores, methods=["POST"]),
         Route("/api/scores/{score_id}", delete_score, methods=["DELETE"]),
+        Route("/api/datasets", datasets_index, methods=["GET", "POST"]),
+        Route("/api/datasets/{dataset_id}", dataset_detail, methods=["GET", "DELETE"]),
+        Route("/api/datasets/{dataset_id}/items", dataset_items, methods=["GET", "POST"]),
+        Route(
+            "/api/datasets/{dataset_id}/items/from-trace", dataset_item_from_trace, methods=["POST"]
+        ),
+        Route("/api/dataset-items/{item_id}", dataset_item, methods=["PATCH"]),
         Route("/api/prices", list_prices, methods=["GET"]),
         Route("/api/prices", post_price, methods=["POST"]),
         Route("/api/prices/{price_id}", delete_price, methods=["DELETE"]),
@@ -414,6 +483,57 @@ def _summary_json(summary: TraceSummary) -> dict[str, Any]:
     data = asdict(summary)
     data["start_ns"] = str(summary.start_ns)
     return data
+
+
+def _reject_constant(token: str) -> Any:
+    raise ValueError(f"{token} is not valid JSON")
+
+
+def _parse_json(body: bytes) -> Any:
+    """Strict JSON: no NaN or Infinity (which Python accepts but nothing can return)."""
+    return json.loads(body, parse_constant=_reject_constant)
+
+
+async def _json_body(request: Request, limit: int | None = None) -> Any:
+    """The parsed JSON body of a write, or the error Response to return instead.
+
+    Writes must be application/json, which forces a preflight on any cross-origin browser
+    request; this server never answers one.
+    """
+    media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if media != otlp.JSON:
+        return PlainTextResponse("send application/json", status_code=415)
+    body = await _read_body(request, MAX_JSON_WRITE_BYTES if limit is None else limit)
+    if body is None:
+        return PlainTextResponse("request too large", status_code=413)
+    try:
+        return _parse_json(body)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        # ValueError covers JSONDecodeError and NaN/Infinity; RecursionError, absurd nesting.
+        return PlainTextResponse("body must be standard JSON", status_code=400)
+
+
+async def _dataset_call(work: Callable[[], Any], *, status: int = 200) -> Response:
+    """Run a datasets operation in the threadpool and map its errors to HTTP statuses."""
+    try:
+        result = await run_in_threadpool(work)
+    except datasets.NotFound as error:
+        return PlainTextResponse(str(error), status_code=404)
+    except datasets.Conflict as error:
+        return PlainTextResponse(str(error), status_code=409)
+    except datasets.DatasetError as error:
+        return PlainTextResponse(str(error), status_code=400)
+    if status == 204:
+        return Response(status_code=204)
+    return JSONResponse(result, status_code=status)
+
+
+def _dataset_json(dataset: datasets.Dataset) -> dict[str, Any]:
+    return asdict(dataset) | {"created_ns": str(dataset.created_ns)}
+
+
+def _item_json(item: datasets.Item) -> dict[str, Any]:
+    return asdict(item) | {"created_ns": str(item.created_ns)}
 
 
 async def _read_body(request: Request, limit: int | None = None) -> bytes | None:

@@ -5,10 +5,11 @@ Everything here is generated. It contains no real conversations, people or accou
 
 from __future__ import annotations
 
+import json
 import random
 from dataclasses import dataclass
 
-from agentwatch import genai, scores
+from agentwatch import datasets, genai, scores
 from agentwatch.spans import (
     KIND_CLIENT,
     KIND_INTERNAL,
@@ -18,6 +19,7 @@ from agentwatch.spans import (
     Span,
     SpanEvent,
 )
+from agentwatch.store import Store
 
 SERVICE = "demo-assistant"
 
@@ -110,6 +112,7 @@ def _turn(rng: random.Random, ids: _Ids, trace_id: str, start: int) -> list[Span
                 genai.AGENT_NAME: "assistant",
                 genai.CONVERSATION_ID: f"demo-{conversation}",
                 genai.USER_ID: f"user-{conversation % 3 + 1}",
+                **_messages(rng, failed),
             },
             resource=_resource(),
             scope_name="agentwatch.demo",
@@ -305,6 +308,53 @@ def _helper_agent(
         scope_name="agentwatch.demo",
     )
     return [span, *children], clock + rng.randrange(1, 5) * 1_000_000
+
+
+_REQUESTS = (
+    ("What is on my calendar tomorrow?", "You have two meetings tomorrow: 10:00 and 15:30."),
+    ("Find notes about the garden project.", "I found three notes; the latest is from last week."),
+    ("Remind me to call the bank on Friday.", "Done: a reminder for Friday at 09:00."),
+    (
+        "Summarise this article about solar panels.",
+        "The article compares panel types and payback periods.",
+    ),
+    ("Plan a two-day trip to the coast.", "Here is a two-day plan with a stop at the lighthouse."),
+    ("Which tasks are overdue?", "Two tasks are overdue: the tax form and the library book."),
+)
+
+
+def _messages(rng: random.Random, failed: bool) -> Attributes:
+    """Synthetic captured messages, in the GenAI conventions' opt-in message format."""
+    question, answer = rng.choice(_REQUESTS)
+    captured: Attributes = {
+        "gen_ai.input.messages": json.dumps(
+            [{"role": "user", "parts": [{"type": "text", "content": question}]}]
+        )
+    }
+    if not failed:
+        captured["gen_ai.output.messages"] = json.dumps(
+            [{"role": "assistant", "parts": [{"type": "text", "content": answer}]}]
+        )
+    return captured
+
+
+def seed_datasets(store: Store) -> None:
+    """A demo dataset: the synthetic requests with their expected answers."""
+    dataset = datasets.create_dataset(
+        store,
+        {"name": "Demo requests", "description": "Synthetic requests and expected answers."},
+    )
+    datasets.add_items(
+        store,
+        dataset.id,
+        [
+            {
+                "input": [{"role": "user", "parts": [{"type": "text", "content": question}]}],
+                "expected_output": answer,
+            }
+            for question, answer in _REQUESTS
+        ],
+    )
 
 
 def _resource() -> Attributes:

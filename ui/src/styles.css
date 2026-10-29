@@ -641,3 +641,27 @@ button.link {
   border: 1px solid var(--line);
   white-space: nowrap;
 }
+
+.score-form textarea {
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 8px;
+  resize: vertical;
+}
+table.items td {
+  white-space: normal;
+  max-width: 420px;
+}
+tr.archived td {
+  opacity: 0.55;
+}
+
+.add-to-dataset {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
