@@ -38,10 +38,22 @@ and span ID) replaces the earlier copy, so exporter retries are harmless.
 
 ## Storage
 
-`spans` keeps every span field, its attributes, resource, events and links as JSON, and the GenAI
-fields extracted by `genai.read` as typed columns (operation, provider, models, token counts, cost,
-finish reasons, tool and agent names, error type). `meta.schema` records the schema version; an
-unknown version refuses to open rather than guessing.
+`spans` keeps every span field, its attributes, resource, events and links as JSON, and the fields
+extracted by `genai.read` as typed columns (operation, provider, models, token counts, cost, finish
+reasons, tool and agent names, session and user, error type).
+
+`genai.read` takes each field from the GenAI conventions, then OpenInference, then OpenLLMetry, and
+moves to the next name when a value is present but unusable (for example a token count that is not
+a number). The README lists the names.
+
+Two version numbers in `meta` keep stored data current:
+
+- `schema`: the table layout. A new database is created at version 1 and brought up to date
+  by the same `MIGRATIONS` an old one runs, each step in its own transaction, so both end up
+  identical. A database from a newer agentwatch refuses to open.
+- `derivation`: the extraction rules (`genai.DERIVATION_VERSION`). When it changes, every stored
+  span's attributes are read again and the extracted columns rewritten, in one transaction, so
+  new rules (such as accepting OpenInference) apply to data received before them.
 
 Trace summaries are computed at query time:
 
