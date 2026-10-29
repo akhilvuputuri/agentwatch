@@ -328,6 +328,7 @@ def create_app(
     def judge_json(judge: judges.Judge) -> dict[str, Any]:
         return asdict(judge) | {
             "created_ns": str(judge.created_ns),
+            "enabled_ns": None if judge.enabled_ns is None else str(judge.enabled_ns),
             "activity": judges.activity(store, judge.id),
             "problem": judge_runner.problems.get(judge.id) if judge_runner else None,
         }

@@ -570,7 +570,7 @@ export async function compareRuns(baseline: string, candidate: string, signal?: 
 }
 
 export interface JudgeActivity {
-  counts: Record<"SCORED" | "FAILED" | "NOT_SAMPLED" | "NO_CONTENT" | "OVER_LIMIT", number>;
+  counts: Record<"SCORED" | "FAILED" | "PENDING" | "NOT_SAMPLED" | "NO_CONTENT" | "OVER_LIMIT", number>;
   calls: number;
   cost_usd: number;
   calls_without_cost: number;
@@ -589,6 +589,7 @@ export interface Judge {
   service: string | null;
   enabled: boolean;
   created_ns: string;
+  enabled_ns: string | null;
   activity: JudgeActivity;
   problem: string | null;
 }

@@ -152,7 +152,8 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             daily_limit INTEGER NOT NULL,
             service VARCHAR,
             enabled BOOLEAN NOT NULL,
-            created_ns BIGINT NOT NULL
+            created_ns BIGINT NOT NULL,
+            enabled_ns BIGINT
         )""",
         """CREATE TABLE judgements (
             judge_id VARCHAR NOT NULL,

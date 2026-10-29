@@ -105,7 +105,7 @@ A judge asks a model about each sampled new trace and stores the answer as a sco
 the Judges page or with `POST /api/judges`: a score name, a model, any OpenAI-compatible endpoint
 (OpenRouter, OpenAI, or a local server such as Ollama), the environment variable that holds the
 key, a question about `{input}` and `{output}`, a sample rate and a limit of calls a day. Judges
-start switched off, see only traces that arrive after they were created, and skip traces whose
+start switched off, see only traces that arrive after they were switched on, and skip traces whose
 messages were not captured. Judging sends those messages to the endpoint you chose; nothing
 else leaves the machine. See [the design notes](docs/design.md#llm-judges).
 

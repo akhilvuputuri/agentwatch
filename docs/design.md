@@ -305,28 +305,34 @@ as traces arrive, not over a dataset.
   and `{output}` placeholders, a score type (`BOOLEAN` or `NUMERIC` from 0 to 1), a sample rate,
   a limit of model calls per 24 hours, an optional root service filter, and whether it is on. The
   name and score type are fixed for life; everything else can change. A new judge is off.
+  Switching it off, deleting it or lowering its limit takes effect before its next model call,
+  even in the middle of a pass.
 - **What it sees.** The trace's captured input and output: the root span's
   `gen_ai.input.messages` / `gen_ai.output.messages` (or OpenInference `input.value` /
   `output.value`), else the earliest captured input and the latest captured output. Each is cut
   to 20,000 characters. A trace with no captured output is recorded as `NO_CONTENT` and never
   sent, since judging it would be blind.
-- **Which traces.** Those whose root starts after the judge was created (creating a judge never
-  re-judges history), that have a span without a parent, and that have received no span for 30
+- **Which traces.** Those whose root starts after the judge was last switched on (switching a
+  judge on never judges the traces from before, including those that arrived while it was off), that have a span without a parent, and that have received no span for 30
   seconds. The background runner looks at up to 20 per judge every 30 seconds, oldest first.
 - **Sampling.** A stable draw per judge and trace (a SHA-256 of both IDs), so a restart samples
   the same traces. Unsampled traces are recorded as `NOT_SAMPLED`.
-- **Limit.** At most `daily_limit` model calls in any 24 hours, counting failures. Sampled traces
-  beyond it are recorded as `OVER_LIMIT` and not judged later, so a busy day never turns into a
-  backlog of paid calls.
+- **Limit.** At most `daily_limit` model calls in any 24 hours, counting failures. Each call is
+  recorded as `PENDING` before it is made, so a call whose result is lost (a crash, a reply that
+  breaks the HTTP client) still counts and its trace is not called again. Sampled traces beyond
+  the limit are recorded as `OVER_LIMIT` and not judged later, so a busy day never turns into a
+  backlog of paid calls. Trial calls (below) are made on request and do not count.
 - **The call.** System message: grade the work from the transcript and reply with only
   `{"score": …, "explanation": "…"}`. User message: the question with the placeholders filled in.
   Temperature 0, at most 400 output tokens, a 60-second timeout. The first `{` to the last `}` of
   the reply is parsed, so a fenced or chatty reply still works. A score of the wrong type, or
   outside 0 to 1, is a failure. The reply's `usage.prompt_tokens`, `completion_tokens` and
-  `cost` (OpenRouter reports cost) are recorded per judgement.
+  `cost` (OpenRouter reports cost) are recorded per judgement. Redirects are not followed (one is
+  a failure), so the key cannot be sent to another host or over plain HTTP.
 - **Record** (`judgements` table, one row per judge and trace): outcome (`SCORED`, `FAILED`,
-  `NOT_SAMPLED`, `NO_CONTENT`, `OVER_LIMIT`), value, explanation or failure reason, tokens, cost.
-  The judgement and its score are written in one transaction. Deleting a judge deletes its
+  `PENDING`, `NOT_SAMPLED`, `NO_CONTENT`, `OVER_LIMIT`), value, explanation or failure reason,
+  tokens, cost. A `SCORED` judgement and its score are written in one transaction; if the score's
+  ID is already used on another trace, the judgement fails instead. Deleting a judge deletes its
   judgements and keeps its scores.
 - **Keys.** The key is read from the named variable when a call is made, and is never stored or
   returned. Only variables named `…_API_KEY` are accepted, so a judge cannot be pointed at an
@@ -337,7 +343,8 @@ as traces arrive, not over a dataset.
 API: `GET/POST /api/judges`, `GET/PATCH/DELETE /api/judges/<id>` (each judge with its last 24
 hours of outcome counts, calls, cost and any problem), `GET /api/judges/<id>/judgements?limit=`,
 and `POST /api/judges/<id>/try` with `{"trace_id"}`, which judges one trace now and returns the
-verdict without storing it (one model call; 502 when the model endpoint fails). The UI's Judges
+verdict without storing it (one model call, not counted toward the limit, allowed while the judge
+is off; 502 when the model endpoint fails). The UI's Judges
 page creates judges switched off, asks before switching one on, and lists recent judgements.
 
 Judging is the one feature that sends trace content off the machine, to the endpoint the owner

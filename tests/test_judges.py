@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import http.client
 import json
+import threading
 import urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import pytest
@@ -306,3 +309,168 @@ def test_the_api_manages_judges_and_tries_one_trace() -> None:
     assert [j["name"] for j in http.get("/api/judges").json()["judges"]] == ["helpful"]
     assert http.delete(path).status_code == 204
     assert http.get(path).status_code == 404
+
+
+def test_a_call_whose_result_is_lost_still_counts_and_is_not_repeated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Store()
+    judge = make(db, daily_limit=5)
+    trace(db, 1)
+    model = FakeModel(http.client.IncompleteRead(b"{"))  # the client fails mid-reply
+    run = runner(db, model)
+    assert run.run_once() == 1
+    [seen] = judges.judgements(db, judge.id)
+    assert seen.outcome == judges.FAILED
+    assert seen.detail == "could not reach the model endpoint: IncompleteRead"
+
+    # A crash between the call and its record leaves the call counted and the trace seen.
+    trace(db, 2)
+
+    def crash(*_: Any, **__: Any) -> None:
+        raise RuntimeError("lost")
+
+    monkeypatch.setattr(run, "_finish", crash)
+    with pytest.raises(RuntimeError):
+        run.run_once()
+    monkeypatch.undo()
+    assert runner(db, model).run_once() == 0
+    assert len(model.requests) == 2
+    activity = judges.activity(db, judge.id, now_ns=CREATED + 60 * SECOND)
+    assert activity["counts"][judges.PENDING] == 1
+    assert activity["calls"] == 2
+
+
+def test_a_score_id_conflict_fails_the_judgement_once() -> None:
+    db = Store()
+    judge = make(db)
+    first = trace(db, 1)
+    other = trace(db, 2, start=CREATED - SECOND)  # not a candidate
+    db.upsert_scores(
+        [
+            judges.Score(
+                id=f"judge.{judge.id}.{first}",
+                trace_id=other,
+                span_id=None,
+                name="x",
+                data_type=BOOLEAN,
+                value=1.0,
+                label=None,
+                source="API",
+                comment=None,
+                created_ns=1,
+            )
+        ]
+    )
+    model = FakeModel()
+    assert runner(db, model).run_once() == 1
+    assert runner(db, model).run_once() == 0
+    [seen] = judges.judgements(db, judge.id)
+    assert seen.outcome == judges.FAILED
+    assert seen.detail == "the score ID is already used on another trace"
+    assert len(model.requests) == 1
+
+
+def test_switching_off_or_lowering_the_limit_takes_effect_before_the_next_call() -> None:
+    db = Store()
+    judge = make(db, daily_limit=10)
+    for n in range(1, 6):
+        trace(db, n)
+
+    class SwitchOff(FakeModel):
+        def __call__(self, url: str, headers: dict[str, str], body: bytes, timeout: float) -> Any:
+            judges.update_judge(db, judge.id, {"enabled": False})
+            return super().__call__(url, headers, body, timeout)
+
+    model = SwitchOff()
+    runner(db, model).run_once()
+    assert len(model.requests) == 1
+
+    judges.update_judge(db, judge.id, {"enabled": True}, now_ns=CREATED)
+
+    class Lower(FakeModel):
+        def __call__(self, url: str, headers: dict[str, str], body: bytes, timeout: float) -> Any:
+            judges.update_judge(db, judge.id, {"daily_limit": 2})
+            return super().__call__(url, headers, body, timeout)
+
+    lower = Lower()
+    runner(db, lower).run_once()
+    assert len(lower.requests) == 1  # one before, one now: the new limit of 2 is reached
+
+
+def test_switching_on_later_judges_only_traces_from_then() -> None:
+    db = Store()
+    judge = make(db, enabled=False)
+    trace(db, 1)  # while it was off
+    on = CREATED + 3600 * SECOND
+    judges.update_judge(db, judge.id, {"enabled": True}, now_ns=on)
+    later = trace(db, 2, start=on + SECOND, received=on + 2 * SECOND)
+    model = FakeModel()
+    assert runner(db, model, now=on + 60 * SECOND).run_once() == 1
+    assert [j.trace_id for j in judges.judgements(db, judge.id)] == [later]
+
+
+def test_placeholders_are_filled_once() -> None:
+    db = Store()
+    make(db, prompt="Q: {input}\nA: {output}")
+    trace_id = f"{1:032x}"
+    attributes: dict[str, Any] = {
+        "gen_ai.input.messages": "say {output} literally",
+        "gen_ai.output.messages": "ok",
+    }
+    db.insert(
+        [
+            Span(
+                trace_id=trace_id,
+                span_id="1" * 16,
+                parent_span_id=None,
+                name="agent",
+                start_ns=CREATED + SECOND,
+                end_ns=CREATED + 2 * SECOND,
+                attributes=attributes,
+            )
+        ],
+        received_ns=CREATED + 2 * SECOND,
+    )
+    model = FakeModel()
+    runner(db, model).run_once()
+    assert model.requests[0][2]["messages"][1]["content"] == "Q: say {output} literally\nA: ok"
+
+
+def test_redirects_are_refused_and_the_key_is_not_forwarded() -> None:
+    hits: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            hits.append(f"{self.path} {self.headers.get('authorization')}")
+            if self.path.startswith("/v1"):
+                self.send_response(302)
+                self.send_header("location", f"http://127.0.0.1:{port}/elsewhere")
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        def do_GET(self) -> None:
+            self.do_POST()
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        judge = make(Store(), base_url=f"http://127.0.0.1:{port}/v1")
+        with pytest.raises(judges.JudgeError, match="HTTP 302"):
+            judges.ask(
+                judge,
+                ("in", "out", "1" * 16),
+                post=judges.urllib_post,
+                env={"JUDGE_API_KEY": "secret"},
+            )
+    finally:
+        httpd.shutdown()
+    assert hits == ["/v1/chat/completions Bearer secret"]

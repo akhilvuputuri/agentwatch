@@ -28,9 +28,15 @@ export function Judges() {
   useEffect(() => {
     const controller = new AbortController();
     const load = () =>
-      listJudges(controller.signal).then(setJudges, (reason: unknown) => {
-        if (!controller.signal.aborted) setError(String(reason));
-      });
+      listJudges(controller.signal).then(
+        (found) => {
+          setJudges(found);
+          setError(null);
+        },
+        (reason: unknown) => {
+          if (!controller.signal.aborted) setError(String(reason));
+        },
+      );
     void load();
     // Judges run in the background; keep their counts current.
     const timer = window.setInterval(() => void load(), 15_000);
@@ -47,7 +53,7 @@ export function Judges() {
     if (
       !judge.enabled &&
       !window.confirm(
-        `Switch on "${judge.name}"? It sends the captured messages of up to ${judge.daily_limit} sampled traces a day to ${judge.base_url}, and each is a paid model call if that endpoint charges.`,
+        `Switch on "${judge.name}"? From now on, it sends the captured messages of up to ${judge.daily_limit} sampled new traces a day to ${judge.base_url}, and each is a paid model call if that endpoint charges.`,
       )
     )
       return;

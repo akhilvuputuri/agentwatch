@@ -26,14 +26,14 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 from urllib.parse import urlsplit
 
 import duckdb
 
 from agentwatch.datasets import INPUT_ATTRIBUTES, OUTPUT_ATTRIBUTES, captured
-from agentwatch.scores import BOOLEAN, EVAL, NUMERIC, Score
+from agentwatch.scores import BOOLEAN, EVAL, NUMERIC, Score, ScoreConflict
 from agentwatch.store import Store, StoredSpan
 
 log = logging.getLogger(__name__)
@@ -42,11 +42,14 @@ SCORE_TYPES = (BOOLEAN, NUMERIC)
 
 SCORED = "SCORED"
 FAILED = "FAILED"
+# A model call made (or about to be) whose result is not recorded yet. It is written before the
+# call, so a call whose result is lost (a crash, a reply that breaks the client) still counts.
+PENDING = "PENDING"
 NOT_SAMPLED = "NOT_SAMPLED"
 NO_CONTENT = "NO_CONTENT"
 OVER_LIMIT = "OVER_LIMIT"
 # Outcomes that cost a model call, and so count toward the daily limit.
-CALLED = (SCORED, FAILED)
+CALLED = (SCORED, FAILED, PENDING)
 
 DAY_NS = 24 * 3600 * 1_000_000_000
 # A trace is judged once no span of it has arrived for this long.
@@ -78,6 +81,7 @@ SYSTEM = "You grade an AI assistant's work. Judge only what the transcript shows
 # an unrelated secret in the server's environment.
 _KEY_ENV = re.compile(r"[A-Z][A-Z0-9_]{0,99}_API_KEY")
 _LOOPBACK = ("127.0.0.1", "localhost", "::1")
+_PLACEHOLDER = re.compile(r"\{(input|output)\}")
 
 # (url, headers, body, timeout) -> the parsed JSON reply. Raises on HTTP or network errors.
 Post = Callable[[str, dict[str, str], bytes, float], Any]
@@ -109,6 +113,8 @@ class Judge:
     service: str | None
     enabled: bool
     created_ns: int
+    # When it was last switched on; it judges traces that start after this.
+    enabled_ns: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +140,7 @@ class Verdict:
 
 _COLUMNS = (
     "id, name, model, base_url, api_key_env, prompt, score_type, sample_rate, daily_limit, "
-    "service, enabled, created_ns"
+    "service, enabled, created_ns, enabled_ns"
 )
 _JUDGEMENT_COLUMNS = (
     "trace_id, outcome, value, detail, input_tokens, output_tokens, cost_usd, created_ns"
@@ -156,16 +162,14 @@ def create_judge(store: Store, body: Any, *, now_ns: int | None = None) -> Judge
         "daily_limit": 100,
         "enabled": False,
     }
-    judge = _validated(
-        defaults | data,
-        judge_id=uuid.uuid4().hex,
-        created_ns=time.time_ns() if now_ns is None else now_ns,
-    )
+    created = time.time_ns() if now_ns is None else now_ns
+    judge = _validated(defaults | data, judge_id=uuid.uuid4().hex, created_ns=created)
+    judge = replace(judge, enabled_ns=created if judge.enabled else None)
     with store.transaction() as db:
         if db.execute("SELECT 1 FROM judges WHERE name = ?", [judge.name]).fetchone():
             raise Conflict(f"a judge named {judge.name!r} already exists")
         db.execute(
-            f"INSERT INTO judges ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO judges ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             _values(judge),
         )
     return judge
@@ -185,7 +189,7 @@ _EDITABLE = (
 )
 
 
-def update_judge(store: Store, judge_id: str, body: Any) -> Judge:
+def update_judge(store: Store, judge_id: str, body: Any, *, now_ns: int | None = None) -> Judge:
     data = _object(body)
     fixed = [key for key in data if key in _FIXED]
     unknown = [key for key in data if key not in _EDITABLE and key not in _FIXED]
@@ -198,9 +202,15 @@ def update_judge(store: Store, judge_id: str, body: Any) -> Judge:
         judge = _validated(
             asdict(current) | data, judge_id=current.id, created_ns=current.created_ns
         )
+        if judge.enabled and not current.enabled:
+            # Switched on: from now, never the backlog since it was created or last on.
+            judge = replace(judge, enabled_ns=time.time_ns() if now_ns is None else now_ns)
+        else:
+            judge = replace(judge, enabled_ns=current.enabled_ns)
         db.execute(
             "UPDATE judges SET model = ?, base_url = ?, api_key_env = ?, prompt = ?, "
-            "sample_rate = ?, daily_limit = ?, service = ?, enabled = ? WHERE id = ?",
+            "sample_rate = ?, daily_limit = ?, service = ?, enabled = ?, enabled_ns = ? "
+            "WHERE id = ?",
             [
                 judge.model,
                 judge.base_url,
@@ -210,6 +220,7 @@ def update_judge(store: Store, judge_id: str, body: Any) -> Judge:
                 judge.daily_limit,
                 judge.service,
                 judge.enabled,
+                judge.enabled_ns,
                 judge.id,
             ],
         )
@@ -244,7 +255,7 @@ def activity(store: Store, judge_id: str, *, now_ns: int | None = None) -> dict[
         "FROM judgements WHERE judge_id = ? AND created_ns >= ? GROUP BY outcome",
         [judge_id, since],
     )
-    counts = dict.fromkeys((SCORED, FAILED, NOT_SAMPLED, NO_CONTENT, OVER_LIMIT), 0)
+    counts = dict.fromkeys((SCORED, FAILED, PENDING, NOT_SAMPLED, NO_CONTENT, OVER_LIMIT), 0)
     cost = 0.0
     calls_without_cost = 0
     for outcome, count, spent, unpriced in rows:
@@ -254,7 +265,7 @@ def activity(store: Store, judge_id: str, *, now_ns: int | None = None) -> dict[
             calls_without_cost += unpriced
     return {
         "counts": counts,
-        "calls": counts[SCORED] + counts[FAILED],
+        "calls": sum(counts[outcome] for outcome in CALLED),
         "cost_usd": cost,
         "calls_without_cost": calls_without_cost,
     }
@@ -308,6 +319,7 @@ def _validated(fields: dict[str, Any], *, judge_id: str, created_ns: int) -> Jud
         service=None if service in (None, "") else _text(service, 200, "service"),
         enabled=enabled,
         created_ns=created_ns,
+        enabled_ns=fields.get("enabled_ns"),
     )
 
 
@@ -367,6 +379,7 @@ def _values(judge: Judge) -> list[Any]:
         judge.service,
         judge.enabled,
         judge.created_ns,
+        judge.enabled_ns,
     ]
 
 
@@ -426,7 +439,10 @@ def ask(
     env: Mapping[str, str],
 ) -> Verdict:
     """One model call for one trace. Raises JudgeError with a reason on any failure."""
-    question = judge.prompt.replace("{input}", content[0]).replace("{output}", content[1])
+    # One pass, so a trace whose input contains "{output}" is not filled in twice.
+    question = _PLACEHOLDER.sub(
+        lambda m: content[0] if m.group(1) == "input" else content[1], judge.prompt
+    )
     body = {
         "model": judge.model,
         "temperature": 0,
@@ -448,7 +464,7 @@ def ask(
         )
     except urllib.error.HTTPError as error:
         raise JudgeError(f"the model endpoint answered HTTP {error.code}") from error
-    except (urllib.error.URLError, OSError, ValueError) as error:
+    except Exception as error:  # any client failure (a truncated reply raises IncompleteRead)
         raise JudgeError(f"could not reach the model endpoint: {type(error).__name__}") from error
     try:
         text = reply["choices"][0]["message"]["content"]
@@ -504,9 +520,22 @@ def sampled(judge_id: str, trace_id: str, rate: float) -> bool:
     return int.from_bytes(digest[:8], "big") / 2**64 < rate
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an error: following one could send the key to another host or scheme."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def urllib_post(url: str, headers: dict[str, str], body: bytes, timeout: float) -> Any:
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    request = urllib.request.Request(url, data=body, method="POST")
+    for name, value in headers.items():
+        # Never copied to a redirect, should one ever be followed.
+        request.add_unredirected_header(name.capitalize(), value)
+    with _OPENER.open(request, timeout=timeout) as response:
         return json.loads(response.read())
 
 
@@ -566,35 +595,44 @@ class JudgeRunner:
             self.problems[judge.id] = f"{judge.api_key_env} is not set"
             return 0
         self.problems.pop(judge.id, None)
-        now = self.clock()
-        used = self.store.query_one(
-            "SELECT count(*) FROM judgements WHERE judge_id = ? AND created_ns >= ? "
-            "AND outcome IN (?, ?)",
-            [judge.id, now - DAY_NS, *CALLED],
-        )[0]
         recorded = 0
-        for trace_id in self._candidates(judge, now):
+        for trace_id in self._candidates(judge, self.clock()):
             if self._stop.is_set():
+                break
+            # Switched off, deleted or given a lower limit while this pass ran: obey it now.
+            try:
+                judge = get_judge(self.store, judge.id)
+            except NotFound:
+                break
+            if not judge.enabled:
                 break
             if not sampled(judge.id, trace_id, judge.sample_rate):
                 self._record(judge, trace_id, NOT_SAMPLED)
             elif (content := trace_content(self.store.trace(trace_id))) is None:
                 self._record(judge, trace_id, NO_CONTENT)
-            elif used >= judge.daily_limit:
+            elif self._calls(judge) >= judge.daily_limit:
                 self._record(judge, trace_id, OVER_LIMIT)
-            else:
-                used += 1
+            elif self._record(judge, trace_id, PENDING):
                 try:
                     verdict = ask(judge, content, post=self.post, env=self.env)
                 except JudgeError as error:
-                    self._record(judge, trace_id, FAILED, detail=str(error))
+                    self._finish(judge, trace_id, detail=str(error))
                 else:
-                    self._record(judge, trace_id, SCORED, verdict=verdict, span_id=content[2])
+                    self._finish(judge, trace_id, verdict=verdict, span_id=content[2])
             recorded += 1
         return recorded
 
+    def _calls(self, judge: Judge) -> int:
+        """Model calls in the last 24 hours, including any whose result was lost."""
+        placeholders = ", ".join("?" for _ in CALLED)
+        return self.store.query_one(
+            "SELECT count(*) FROM judgements WHERE judge_id = ? AND created_ns >= ? "
+            f"AND outcome IN ({placeholders})",
+            [judge.id, self.clock() - DAY_NS, *CALLED],
+        )[0]
+
     def _candidates(self, judge: Judge, now: int) -> list[str]:
-        """Settled traces that started after the judge was created and it has not seen."""
+        """Settled traces that started after the judge was switched on and it has not seen."""
         rows = self.store.query(
             """
             WITH t AS (
@@ -603,7 +641,8 @@ class JudgeRunner:
                     min(start_ns) AS start_ns,
                     max(received_ns) AS last_received,
                     bool_or(parent_span_id IS NULL) AS has_root,
-                    arg_min(service_name, (parent_span_id IS NOT NULL, start_ns)) AS service
+                    arg_min(service_name, (parent_span_id IS NOT NULL, start_ns, span_id))
+                        AS service
                 FROM spans
                 GROUP BY trace_id
             )
@@ -615,7 +654,7 @@ class JudgeRunner:
             LIMIT ?
             """,
             [
-                judge.created_ns,
+                judge.created_ns if judge.enabled_ns is None else judge.enabled_ns,
                 now - self.settle_ns,
                 judge.service,
                 judge.service,
@@ -625,54 +664,77 @@ class JudgeRunner:
         )
         return [row[0] for row in rows]
 
-    def _record(
+    def _record(self, judge: Judge, trace_id: str, outcome: str) -> bool:
+        """Records an outcome for a trace; False when the judge was deleted or the trace seen."""
+        with self.store.transaction() as db:
+            if db.execute("SELECT 1 FROM judges WHERE id = ?", [judge.id]).fetchone() is None:
+                return False
+            inserted = db.execute(
+                "INSERT OR IGNORE INTO judgements (judge_id, trace_id, outcome, created_ns) "
+                "VALUES (?, ?, ?, ?) RETURNING trace_id",
+                [judge.id, trace_id, outcome, self.clock()],
+            ).fetchone()
+        return inserted is not None
+
+    def _finish(
         self,
         judge: Judge,
         trace_id: str,
-        outcome: str,
         *,
         detail: str | None = None,
         verdict: Verdict | None = None,
         span_id: str | None = None,
     ) -> None:
-        now = self.clock()
-        with self.store.transaction() as db:
-            # Deleted while this pass ran: record nothing. (Switched off, it still records
-            # what this pass already did, so its calls count toward the limit.)
-            if db.execute("SELECT 1 FROM judges WHERE id = ?", [judge.id]).fetchone() is None:
+        """Turns a PENDING judgement into SCORED, with its score, or FAILED."""
+        if verdict is not None:
+            try:
+                with self.store.transaction() as db:
+                    self._update(db, judge, trace_id, SCORED, verdict.explanation, verdict)
+                    self.store.write_scores(
+                        [
+                            Score(
+                                id=f"judge.{judge.id}.{trace_id}",
+                                trace_id=trace_id,
+                                span_id=span_id,
+                                name=judge.name,
+                                data_type=judge.score_type,
+                                value=verdict.value,
+                                label=None,
+                                source=EVAL,
+                                comment=verdict.explanation,
+                                created_ns=self.clock(),
+                            )
+                        ]
+                    )
                 return
-            db.execute(
-                f"INSERT OR IGNORE INTO judgements (judge_id, {_JUDGEMENT_COLUMNS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    judge.id,
-                    trace_id,
-                    outcome,
-                    None if verdict is None else verdict.value,
-                    (detail or (verdict.explanation if verdict else None) or None),
-                    None if verdict is None else verdict.input_tokens,
-                    None if verdict is None else verdict.output_tokens,
-                    None if verdict is None else verdict.cost_usd,
-                    now,
-                ],
-            )
-            if verdict is not None:
-                self.store.write_scores(
-                    [
-                        Score(
-                            id=f"judge.{judge.id}.{trace_id}",
-                            trace_id=trace_id,
-                            span_id=span_id,
-                            name=judge.name,
-                            data_type=judge.score_type,
-                            value=verdict.value,
-                            label=None,
-                            source=EVAL,
-                            comment=verdict.explanation,
-                            created_ns=now,
-                        )
-                    ]
-                )
+            except ScoreConflict:
+                detail = "the score ID is already used on another trace"
+        with self.store.transaction() as db:
+            self._update(db, judge, trace_id, FAILED, detail, verdict)
+
+    @staticmethod
+    def _update(
+        db: duckdb.DuckDBPyConnection,
+        judge: Judge,
+        trace_id: str,
+        outcome: str,
+        detail: str | None,
+        verdict: Verdict | None,
+    ) -> None:
+        db.execute(
+            "UPDATE judgements SET outcome = ?, value = ?, detail = ?, input_tokens = ?, "
+            "output_tokens = ?, cost_usd = ? WHERE judge_id = ? AND trace_id = ?",
+            [
+                outcome,
+                verdict.value if verdict is not None and outcome == SCORED else None,
+                detail,
+                None if verdict is None else verdict.input_tokens,
+                None if verdict is None else verdict.output_tokens,
+                None if verdict is None else verdict.cost_usd,
+                judge.id,
+                trace_id,
+            ],
+        )
 
 
 def _count(value: Any) -> int | None:
