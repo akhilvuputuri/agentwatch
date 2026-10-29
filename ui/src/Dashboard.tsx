@@ -170,6 +170,7 @@ function Figures({ data }: { data: Metrics }) {
       </div>
 
       <h2 className="section">Scores</h2>
+      <p className="muted small">Scores recorded in this range, by when they were received.</p>
       <Table
         columns={["Score", "Type", "Count", "Mean", "Min", "Max", "Labels", "Sources"]}
         rows={data.scores.map((s) => [

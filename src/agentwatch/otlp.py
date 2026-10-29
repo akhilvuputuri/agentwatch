@@ -283,11 +283,13 @@ def decode_logs(body: bytes, content_type: str, content_encoding: str | None = N
                     continue
                 trace_id = record.trace_id.hex()
                 span_id = record.span_id.hex() or None
+                if span_id == "0" * 16:
+                    span_id = None  # OTLP treats an all-zero span ID as unset
                 problem = ""
                 if len(trace_id) != 32 or trace_id == "0" * 32:
                     # Correlating by gen_ai.response.id instead is not supported.
                     problem = "evaluation event without a trace ID"
-                elif span_id is not None and (len(span_id) != 16 or span_id == "0" * 16):
+                elif span_id is not None and len(span_id) != 16:
                     problem = "evaluation event with an invalid span ID"
                 time_ns = record.time_unix_nano or record.observed_time_unix_nano
                 if not problem and time_ns > MAX_TIME_NS:

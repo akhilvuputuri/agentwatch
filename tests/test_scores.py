@@ -289,3 +289,128 @@ def test_score_metrics() -> None:
     )
     assert rows["topic"]["labels"] == {"a": 1}
     assert rows["q"]["sources"] == {"API": 2}
+
+
+def test_an_id_cannot_move_a_score_to_another_trace() -> None:
+    other = "d" * 32
+    db = Store()
+    http = client(db)
+    assert (
+        http.post(
+            "/api/scores", json={"id": "k1", "trace_id": T, "name": "n", "value": 1}
+        ).status_code
+        == 201
+    )
+    moved = http.post("/api/scores", json={"id": "k1", "trace_id": other, "name": "n", "value": 2})
+    assert moved.status_code == 409
+    assert [s.value for s in db.scores(T)] == [1.0]
+    assert db.scores(other) == []
+    # The same ID on the same trace still replaces.
+    assert (
+        http.post(
+            "/api/scores", json={"id": "k1", "trace_id": T, "name": "n", "value": 3}
+        ).status_code
+        == 201
+    )
+    assert [s.value for s in db.scores(T)] == [3.0]
+    # Two traces for one ID within a batch fail the whole batch.
+    batch = {
+        "scores": [
+            {"id": "k2", "trace_id": T, "name": "n", "value": 1},
+            {"id": "k2", "trace_id": other, "name": "n", "value": 1},
+        ]
+    }
+    assert http.post("/api/scores", json=batch).status_code == 409
+    assert len(db.scores(T)) == 1
+
+
+@pytest.mark.parametrize("bad_id", ["a/b", "..", ".", "x y", "", "ü", "a" * 201])
+def test_score_ids_must_be_url_safe(bad_id: str) -> None:
+    with pytest.raises(scores.ScoreError, match="id must be"):
+        scores.from_api({"id": bad_id, "trace_id": T, "name": "n", "value": 1})
+
+
+def test_every_accepted_id_can_be_deleted() -> None:
+    db = Store()
+    http = client(db)
+    for score_id in ("a.b", "x:1", "A_-9", "..."):
+        assert (
+            http.post(
+                "/api/scores", json={"id": score_id, "trace_id": T, "name": "n", "value": 1}
+            ).status_code
+            == 201
+        )
+        assert http.delete(f"/api/scores/{score_id}").status_code == 204
+
+
+def test_huge_and_blank_values() -> None:
+    with pytest.raises(scores.ScoreError, match="too large"):
+        scores.from_api({"trace_id": T, "name": "n", "value": 10**400})
+    with pytest.raises(scores.ScoreError, match="value or a label"):
+        scores.from_api({"trace_id": T, "name": "n", "label": "   "})
+    assert scores.from_api({"trace_id": T, "name": " n ", "label": " a "}).label == "a"
+
+
+def test_scores_need_json_and_a_same_origin_browser() -> None:
+    db = Store()
+    http = TestClient(server.create_app(db), base_url="http://127.0.0.1:4318")
+    body = json.dumps({"trace_id": T, "name": "n", "value": 1})
+    form = http.post("/api/scores", content=body, headers={"content-type": "text/plain"})
+    assert form.status_code == 415
+    for origin, expected in [
+        ("http://127.0.0.1:4318", 201),
+        ("http://localhost:4318", 201),
+        ("http://localhost:9999", 403),
+        ("https://127.0.0.1:4318", 201),
+        ("http://evil.example:4318", 403),
+    ]:
+        response = http.post(
+            "/api/scores",
+            content=body,
+            headers={"content-type": "application/json", "origin": origin},
+        )
+        assert response.status_code == expected, origin
+    assert server.host_port("[::1]:4318") == 4318
+    assert server.host_port("localhost") == 80
+    assert server.host_port("localhost", "https") == 443
+
+
+def test_post_returns_stored_scores() -> None:
+    http = client(Store())
+    body = http.post("/api/scores", json={"trace_id": T, "name": "n", "value": 1}).json()
+    assert body["scores"][0]["id"] == body["ids"][0]
+    assert body["scores"][0]["created_ns"].isdigit()
+
+
+def test_label_ties_break_alphabetically() -> None:
+    db = Store()
+    db.insert([root()], received_ns=1)
+    db.upsert_scores(
+        [
+            scores.from_api({"trace_id": T, "name": "t", "label": label})
+            for label in ("y", "x", "y", "x")
+        ]
+    )
+    assert db.traces()[0].scores[0].label == "x"
+
+
+def test_zero_span_id_in_logs_means_unset() -> None:
+    request = ExportLogsServiceRequest()
+    record = LogRecord(
+        event_name=scores.EVALUATION_EVENT,
+        time_unix_nano=5,
+        trace_id=bytes.fromhex(T),
+        span_id=bytes(8),
+    )
+    record.attributes.extend(
+        key_values({scores.EVALUATION_NAME: "a", scores.EVALUATION_VALUE: 1.0})
+    )
+    request.resource_logs.add().scope_logs.add().log_records.append(record)
+    db = Store()
+    client(db).post(
+        "/v1/logs",
+        content=request.SerializeToString(),
+        headers={"content-type": "application/x-protobuf"},
+    )
+    [score] = db.scores(T)
+    assert score.span_id is None

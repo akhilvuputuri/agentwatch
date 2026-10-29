@@ -15,7 +15,7 @@ from typing import Any
 import duckdb
 
 from agentwatch import genai
-from agentwatch.scores import Score, from_span_events
+from agentwatch.scores import Score, ScoreConflict, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
 SCHEMA_VERSION = 3
@@ -297,10 +297,21 @@ totals AS (
             FILTER (WHERE user_id IS NOT NULL) AS user_id
     FROM spans GROUP BY trace_id
 ),
+score_labels AS (
+    SELECT trace_id, name, label, count(*) AS n
+    FROM scores WHERE label IS NOT NULL GROUP BY trace_id, name, label
+),
+top_labels AS (
+    -- The commonest label; ties go to the alphabetically first.
+    SELECT trace_id, name, arg_max(label, (n, -rank)) AS label
+    FROM (SELECT *, rank() OVER (PARTITION BY trace_id, name ORDER BY label) AS rank FROM score_labels)
+    GROUP BY trace_id, name
+),
 score_names AS (
-    SELECT trace_id, name, any_value(data_type) AS data_type, count(*) AS n,
-           avg(value) AS mean, mode(label) AS label
-    FROM scores GROUP BY trace_id, name
+    SELECT s.trace_id, s.name, any_value(s.data_type) AS data_type, count(*) AS n,
+           avg(s.value) AS mean, any_value(l.label) AS label
+    FROM scores s LEFT JOIN top_labels l USING (trace_id, name)
+    GROUP BY s.trace_id, s.name
 ),
 trace_scores AS (
     SELECT trace_id,
@@ -619,12 +630,16 @@ class Store:
         ]
 
     def upsert_scores(self, found: Sequence[Score]) -> int:
-        """Store scores; one with an existing ID replaces it."""
+        """Store scores; one with an existing ID replaces it, if it is on the same trace.
+
+        Raises ScoreConflict, storing nothing, when an ID is already used on another trace.
+        """
         if not found:
             return 0
         with self._lock:
             self._db.execute("BEGIN")
             try:
+                self._check_conflicts(found)
                 self._write_scores(found)
                 self._db.execute("COMMIT")
             except BaseException:
@@ -632,6 +647,22 @@ class Store:
                     self._db.execute("ROLLBACK")
                 raise
         return len(found)
+
+    def _check_conflicts(self, found: Sequence[Score]) -> None:
+        traces: dict[str, str] = {}
+        for score in found:
+            if traces.setdefault(score.id, score.trace_id) != score.trace_id:
+                raise ScoreConflict(f"score id {score.id!r} is given for two traces")
+        ids = list(traces)
+        for start in range(0, len(ids), _INSERT_CHUNK):
+            chunk = ids[start : start + _INSERT_CHUNK]
+            rows = self._db.execute(
+                f"SELECT id, trace_id FROM scores WHERE id IN ({', '.join('?' for _ in chunk)})",
+                chunk,
+            ).fetchall()
+            for score_id, trace_id in rows:
+                if traces[score_id] != trace_id:
+                    raise ScoreConflict(f"score id {score_id!r} is already used on another trace")
 
     def _write_scores(self, found: Sequence[Score]) -> None:
         latest = {score.id: score for score in found}

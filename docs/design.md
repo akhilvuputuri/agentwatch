@@ -15,7 +15,9 @@ about 0.9 s instead of 7.7 s on an M-series laptop).
 
 A host guard refuses requests whose `Host` (or, when present, `Origin`) names a host other than
 the loopback names, the bound address and any `--allow-host` names, with 403. A web page that
-rebinds its own domain to 127.0.0.1 therefore cannot read or write traces.
+rebinds its own domain to 127.0.0.1 therefore cannot read or write traces. When a request
+carries an `Origin`, its port must also match the `Host` header's, so a page served from another
+local port (another dev server) cannot write either.
 
 ## Ingest
 
@@ -107,8 +109,13 @@ They come in three ways:
 
 - `POST /api/scores` with one score object or `{"scores": [...]}` (up to 1,000, all validated before
   any is stored). Fields: `trace_id`, optional `span_id`, `name`, `value` (number or boolean) and/or
-  `label`, optional `comment`, `data_type` and `id`. A score with an existing `id` replaces it. The
-  UI posts with `?source=annotation`. `DELETE /api/scores/<id>` removes one.
+  `label`, optional `comment`, `data_type` and `id`. The body must be `application/json`. A
+  caller's `id` is 1 to 200 letters, digits or `. _ : -` (not `.` or `..`), so every score can be
+  deleted by URL. IDs are global: one with an existing `id` replaces it if it is on the same
+  trace, and the request fails with 409 if that `id` is used on another trace. The response
+  returns the stored scores. The UI posts with `?source=annotation`. `DELETE /api/scores/<id>`
+  removes one; the UI asks first, and warns that an evaluator's score returns if its event is
+  sent again.
 - `gen_ai.evaluation.result` events, the GenAI conventions' way of reporting an evaluation, sent
   as OTLP log records to `POST /v1/logs`. The event name is read from the record's `event_name`
   field or an `event.name` attribute; `gen_ai.evaluation.name`, `.score.value`, `.score.label` and
@@ -119,7 +126,13 @@ They come in three ways:
 - The same events attached to a span as span events, read when the span is stored.
 
 An event's score ID is a hash of its trace, span, name, time and result, so a re-sent event or
-span keeps one copy. The trace list shows each trace's scores per name (count, mean, commonest
+span keeps one copy. A span re-sent with a changed or removed evaluation event keeps the scores
+from the earlier copy. An all-zero span ID on a log record means no span. Scores record when they
+were received, which is the time the dashboard groups them by.
+
+Within a trace, scores of one name are summarised as their count, the mean of their values, and
+their commonest label (ties go to the alphabetically first). A name used with mixed types mixes
+their values in one mean. The trace list shows each trace's scores per name (count, mean, commonest
 label); the trace view lists them with a form to add and delete annotations; the dashboard
 summarises scores recorded in the window by name (count, mean, minimum, maximum, labels, sources).
 

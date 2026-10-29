@@ -20,6 +20,7 @@ test("scores show in the list, can be annotated and deleted on a trace", async (
   // Still there after a reload, then gone after deleting.
   await page.reload();
   await expect(page.getByTestId("score-table").getByRole("row", { name: /reviewer_rating/ })).toBeVisible();
+  page.once("dialog", (dialog) => void dialog.accept());
   await page.getByRole("button", { name: "Delete score reviewer_rating" }).click();
   await expect(page.getByTestId("score-table").getByRole("row", { name: /reviewer_rating/ })).toHaveCount(0);
 });

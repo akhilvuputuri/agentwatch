@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -35,11 +36,18 @@ EVALUATION_EXPLANATION = "gen_ai.evaluation.explanation"
 
 MAX_NAME = 200
 MAX_TEXT = 2000
-MAX_ID = 200
 
 
 class ScoreError(ValueError):
     """A score that cannot be stored, with the reason."""
+
+
+class ScoreConflict(ScoreError):
+    """A score ID already used on a different trace."""
+
+
+# Caller-chosen IDs: safe in a URL path segment, so every stored score can be deleted.
+_ID = re.compile(r"[A-Za-z0-9_.:-]{1,200}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +83,10 @@ def from_api(body: Any, *, source: str = API, now_ns: int | None = None) -> Scor
     if isinstance(raw_value, bool):
         data_type, value = BOOLEAN, 1.0 if raw_value else 0.0
     elif isinstance(raw_value, int | float):
-        value = float(raw_value)
+        try:
+            value = float(raw_value)
+        except OverflowError as error:
+            raise ScoreError("value is too large") from error
         if not math.isfinite(value):
             raise ScoreError("value must be a finite number")
         data_type = NUMERIC
@@ -91,10 +102,12 @@ def from_api(body: Any, *, source: str = API, now_ns: int | None = None) -> Scor
         else:
             raise ScoreError(f"data_type {declared} does not match the value given")
     given_id = data.get("id")
-    score_id = (
-        _text(given_id, MAX_ID, "id", required=True) if given_id is not None else uuid.uuid4().hex
-    )
-    assert score_id is not None
+    if given_id is None:
+        score_id = uuid.uuid4().hex
+    elif isinstance(given_id, str) and _ID.fullmatch(given_id) and given_id not in (".", ".."):
+        score_id = given_id
+    else:
+        raise ScoreError("id must be 1 to 200 letters, digits or . _ : - (not . or ..)")
     return Score(
         id=score_id,
         trace_id=trace_id,
@@ -176,6 +189,7 @@ def _text(value: Any, limit: int, field: str, *, required: bool = False) -> str 
         return None
     if not isinstance(value, str) or (required and not value.strip()):
         raise ScoreError(f"{field} must be a non-empty string")
+    value = value.strip()
     if len(value) > limit:
         raise ScoreError(f"{field} is longer than {limit} characters")
     return value or None

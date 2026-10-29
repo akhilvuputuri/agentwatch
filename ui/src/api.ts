@@ -62,16 +62,16 @@ export interface NewScore {
   comment?: string;
 }
 
-/** Adds a score as a human annotation. */
-export async function addScore(score: NewScore): Promise<string> {
+/** Adds a score as a human annotation and returns it as stored. */
+export async function addScore(score: NewScore): Promise<Score> {
   const response = await fetch("api/scores?source=annotation", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(score),
   });
   if (!response.ok) throw new Error(`${response.status} ${(await response.text()).trim()}`);
-  const body = (await response.json()) as { ids: string[] };
-  return body.ids[0]!;
+  const body = (await response.json()) as { scores: Score[] };
+  return body.scores[0]!;
 }
 
 export async function deleteScore(id: string): Promise<void> {

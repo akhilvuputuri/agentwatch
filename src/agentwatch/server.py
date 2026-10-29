@@ -107,6 +107,11 @@ def create_app(
 
     async def post_scores(request: Request) -> Response:
         """One score object, or {"scores": [...]}; all are validated before any is stored."""
+        # Requiring JSON makes any cross-origin browser request preflight, which this server
+        # never answers, so a page elsewhere cannot submit a form here.
+        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media != otlp.JSON:
+            return PlainTextResponse("send application/json", status_code=415)
         body = await _read_body(request, MAX_SCORE_REQUEST_BYTES)
         if body is None:
             return PlainTextResponse("request too large", status_code=413)
@@ -133,8 +138,14 @@ def create_app(
             found = [scores.from_api(item, source=source) for item in cast(list[Any], items)]
         except scores.ScoreError as error:
             return PlainTextResponse(str(error), status_code=400)
-        await run_in_threadpool(store.upsert_scores, found)
-        return JSONResponse({"ids": [score.id for score in found]}, status_code=201)
+        try:
+            await run_in_threadpool(store.upsert_scores, found)
+        except scores.ScoreConflict as error:
+            return PlainTextResponse(str(error), status_code=409)
+        return JSONResponse(
+            {"ids": [score.id for score in found], "scores": [_score_json(s) for s in found]},
+            status_code=201,
+        )
 
     async def delete_score(request: Request) -> Response:
         removed = await run_in_threadpool(store.delete_score, str(request.path_params["score_id"]))
@@ -299,12 +310,39 @@ class HostGuard:
             return
         headers = Headers(scope=scope)
         origin = headers.get("origin")
-        if host_name(headers.get("host", "")) not in self.allowed or (
-            origin is not None and (urlsplit(origin).hostname or "") not in self.allowed
+        host = headers.get("host", "")
+        if host_name(host) not in self.allowed or (
+            origin is not None and not _same_origin(origin, host, self.allowed)
         ):
             await PlainTextResponse("host not allowed", status_code=403)(scope, receive, send)
             return
         await self.app(scope, receive, send)
+
+
+def _same_origin(origin: str, host: str, allowed: frozenset[str]) -> bool:
+    """A browser Origin names an allowed host on the same port as the request's Host header.
+
+    Comparing ports keeps a page served from another local port (another dev server, say)
+    from writing here, although both are on localhost.
+    """
+    try:
+        parts = urlsplit(origin)
+        origin_port = parts.port or {"http": 80, "https": 443}.get(parts.scheme)
+    except ValueError:
+        return False
+    if (parts.hostname or "") not in allowed:
+        return False
+    return origin_port == host_port(host, parts.scheme)
+
+
+def host_port(authority: str, scheme: str = "http") -> int | None:
+    """The port of a Host header, or the scheme's default when it has none."""
+    authority = authority.strip()
+    tail = authority.rsplit("]", 1)[-1] if authority.startswith("[") else authority
+    if tail.count(":") == 1:
+        port = tail.rsplit(":", 1)[1]
+        return int(port) if port.isdigit() else None
+    return {"http": 80, "https": 443}.get(scheme)
 
 
 def host_name(authority: str) -> str:

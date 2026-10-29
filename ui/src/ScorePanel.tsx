@@ -17,6 +17,9 @@ export function ScorePanel({ traceId, spanId, spanName, scores, onChange }: Prop
   const [error, setError] = useState<string | null>(null);
 
   const remove = (score: Score) => {
+    const note =
+      score.source === "EVAL" ? " It came from an evaluator, so it returns if the evaluation is sent again." : "";
+    if (!window.confirm(`Delete the score "${score.name}"?${note}`)) return;
     deleteScore(score.id).then(
       () => onChange((current) => current.filter((s) => s.id !== score.id)),
       (reason: unknown) => setError(String(reason)),
@@ -112,20 +115,9 @@ function ScoreForm({
     if (onSpan && spanId) body.span_id = spanId;
     setSaving(true);
     addScore(body).then(
-      (id) => {
+      (stored) => {
         setSaving(false);
-        onAdded({
-          id,
-          trace_id: traceId,
-          span_id: body.span_id ?? null,
-          name: body.name,
-          data_type: type,
-          value: typeof body.value === "boolean" ? (body.value ? 1 : 0) : (body.value ?? null),
-          label: body.label ?? null,
-          source: "ANNOTATION",
-          comment: body.comment ?? null,
-          created_ns: String(BigInt(Date.now()) * 1_000_000n),
-        });
+        onAdded(stored);
       },
       (reason: unknown) => {
         setSaving(false);
