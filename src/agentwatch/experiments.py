@@ -23,6 +23,7 @@ from agentwatch.store import Store
 MAX_NAME = 200
 MAX_TEXT = 2000
 MAX_VALUE_BYTES = 512 * 1024
+MAX_FUTURE_NS = 24 * 3600 * 10**9
 SERVICE = "agentwatch.experiment"
 RUN_ID = "agentwatch.experiment.run_id"
 RUN_NAME = "agentwatch.experiment.run_name"
@@ -190,39 +191,71 @@ def run_items(store: Store, run_id: str) -> list[dict[str, Any]]:
 
 
 def add_run_items(store: Store, run_id: str, bodies: list[Any]) -> list[RunItem]:
-    """Record run items (an item run again replaces its earlier result); all or none."""
+    """Record run items in one transaction: all or none.
+
+    An item recorded again replaces its earlier result; when that result had a synthetic
+    trace, the trace and its scores are removed so they are not counted twice.
+    """
     run = get_run(store, run_id)
     now = time.time_ns()
     parsed = [_run_item(run, body, now) for body in bodies]
     ids = [item.item_id for item, _, _ in parsed]
     if len(set(ids)) != len(ids):
         raise Conflict("an item is given twice")
+    traced = [item.trace_id for item, _, given in parsed if given]
+    if len(set(traced)) != len(traced):
+        raise Conflict("a trace_id is given for two items")
     marks = ", ".join("?" for _ in ids)
-    known = {
-        row[0]: row[1]
-        for row in store.query(
-            f"SELECT id, input FROM dataset_items WHERE dataset_id = ? AND id IN ({marks})",
-            [run.dataset_id, *ids],
-        )
-    }
-    missing = [item_id for item_id in ids if item_id not in known]
-    if missing:
-        raise NotFound(f"item {missing[0]!r} is not in this run's dataset")
-    found_scores: list[scores.Score] = []
-    traces: list[Span] = []
-    for item, item_scores, traced in parsed:
-        found_scores.extend(item_scores)
-        if not traced:
-            traces.append(_item_trace(run, item, json.loads(known[item.item_id])))
-    # Scores first, so a score ID conflict fails before anything else is recorded; then the
-    # synthetic traces, so run items point at stored spans.
-    try:
-        store.upsert_scores(found_scores)
-    except scores.ScoreConflict as error:
-        raise Conflict(str(error)) from error
-    if traces:
-        store.insert(traces, now)
     with store.transaction() as db:
+        # Checked inside the transaction, so a concurrent delete cannot slip between.
+        current = db.execute(
+            "SELECT r.dataset_id FROM runs r JOIN datasets d ON d.id = r.dataset_id WHERE r.id = ?",
+            [run_id],
+        ).fetchone()
+        if current is None:
+            raise NotFound("run not found")
+        known = dict(
+            db.execute(
+                f"SELECT id, input FROM dataset_items WHERE dataset_id = ? AND id IN ({marks})",
+                [run.dataset_id, *ids],
+            ).fetchall()
+        )
+        missing = [item_id for item_id in ids if item_id not in known]
+        if missing:
+            raise NotFound(f"item {missing[0]!r} is not in this run's dataset")
+        if traced:
+            used = db.execute(
+                f"SELECT item_id FROM run_items WHERE run_id = ? AND item_id NOT IN ({marks}) "
+                f"AND trace_id IN ({', '.join('?' for _ in traced)})",
+                [run_id, *ids, *traced],
+            ).fetchone()
+            if used:
+                raise Conflict(f"a trace_id is already used by item {used[0]!r} of this run")
+        # Earlier results being replaced: drop their synthetic traces and those traces' scores.
+        previous = [
+            row[0]
+            for row in db.execute(
+                f"SELECT ri.trace_id FROM run_items ri WHERE ri.run_id = ? AND ri.item_id IN ({marks}) "
+                f"AND EXISTS (SELECT 1 FROM spans s WHERE s.trace_id = ri.trace_id "
+                f"AND s.service_name = '{SERVICE}')",
+                [run_id, *ids],
+            ).fetchall()
+        ]
+        if previous:
+            old = ", ".join("?" for _ in previous)
+            db.execute(f"DELETE FROM scores WHERE trace_id IN ({old})", previous)
+            db.execute(f"DELETE FROM spans WHERE trace_id IN ({old})", previous)
+        try:
+            store.write_scores([score for _, item_scores, _ in parsed for score in item_scores])
+        except scores.ScoreConflict as error:
+            raise Conflict(str(error)) from error
+        synthetic = [
+            _item_trace(run, item, json.loads(known[item.item_id]))
+            for item, _, given in parsed
+            if not given
+        ]
+        if synthetic:
+            store.write_spans(synthetic, now)
         for item, _, _ in parsed:
             db.execute(
                 "INSERT OR REPLACE INTO run_items VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -252,6 +285,9 @@ def _run_item(run: Run, body: Any, now: int) -> tuple[RunItem, list[scores.Score
     end_ns = _time(data.get("end_ns"), start_ns, "end_ns")
     if end_ns < start_ns:
         raise DatasetError("end_ns is before start_ns")
+    # A result from the future would sit at the top of the trace list for good.
+    if end_ns > now + MAX_FUTURE_NS:
+        raise DatasetError("end_ns is more than a day in the future")
     output = data.get("output")
     if len(_dumps(output)) > MAX_VALUE_BYTES:
         raise DatasetError(f"an output is limited to {MAX_VALUE_BYTES // 1024} KiB of JSON")

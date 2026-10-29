@@ -58,7 +58,7 @@ export function RunList({ datasetId }: { datasetId: string }) {
                     const s = r.scores.find((x) => x.name === n);
                     return (
                       <td key={n} className="num" title={s ? `${s.count} scores` : undefined}>
-                        {s && s.mean !== null ? (Math.round(s.mean * 100) / 100).toString() : "–"}
+                        {s && s.mean !== null ? Number(s.mean.toPrecision(3)).toString() : "–"}
                       </td>
                     );
                   })}

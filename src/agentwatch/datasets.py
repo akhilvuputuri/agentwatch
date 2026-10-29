@@ -116,12 +116,18 @@ def get_dataset(store: Store, dataset_id: str) -> Dataset:
 
 
 def delete_dataset(store: Store, dataset_id: str) -> None:
+    """Remove a dataset, its items and its experiment runs; their traces and scores stay."""
     with store.transaction() as db:
         if not db.execute(
             "DELETE FROM datasets WHERE id = ? RETURNING id", [dataset_id]
         ).fetchone():
             raise NotFound("dataset not found")
         db.execute("DELETE FROM dataset_items WHERE dataset_id = ?", [dataset_id])
+        db.execute(
+            "DELETE FROM run_items WHERE run_id IN (SELECT id FROM runs WHERE dataset_id = ?)",
+            [dataset_id],
+        )
+        db.execute("DELETE FROM runs WHERE dataset_id = ?", [dataset_id])
 
 
 def add_items(store: Store, dataset_id: str, bodies: list[Any]) -> list[Item]:

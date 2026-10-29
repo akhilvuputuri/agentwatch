@@ -81,14 +81,17 @@ Run a dataset through your agent and score the results:
 ```python
 from agentwatch.client import run_experiment
 
-def answer(question):                       # the task under test
+
+def answer(question):  # the task under test
     return my_agent(question)
 
-def exact(question, output, expected):      # a score named "exact"
+
+def exact(question, output, expected):  # a score named "exact"
     return output == expected
 
+
 result = run_experiment(dataset="Demo requests", name="prompt v2", task=answer, evaluators=[exact])
-print(result.scores)                        # {"exact": 0.83}
+print(result.scores)  # {"exact": 0.83}
 ```
 
 Each run appears on its dataset's page with per-item outputs, scores and traces.

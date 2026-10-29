@@ -193,3 +193,95 @@ def test_run_experiment_end_to_end(live_server: str) -> None:
         aw_client.run_experiment(dataset="math", name="eval v1", task=task, base_url=live_server)
     with pytest.raises(aw_client.AgentwatchError, match="no dataset"):
         aw_client.run_experiment(dataset="missing", name="x", task=task, base_url=live_server)
+
+
+def test_bad_scores_and_refused_results_do_not_stop_an_experiment(live_server: str) -> None:
+    client = aw_client.Client(live_server)
+    dataset_id = client.request("POST", "/api/datasets", {"name": "d"})["dataset"]["id"]
+    client.request(
+        "POST", f"/api/datasets/{dataset_id}/items", {"items": [{"input": i} for i in range(6)]}
+    )
+
+    def task(n: int) -> object:
+        return "x" * (600 * 1024) if n == 5 else n  # the last output is too large to store
+
+    def nan(_i: object, _o: object, _e: object) -> float:
+        return float("nan")
+
+    def ok(_i: object, output: object, _e: object) -> list[dict[str, object]]:
+        return [{"name": "ok", "value": 1}, {"name": "n" * 300, "value": 1}]
+
+    result = aw_client.run_experiment(
+        dataset="d", name="r", task=task, evaluators=[nan, ok], base_url=live_server
+    )
+    assert result.items == 6
+    assert len(result.failed_posts) == 1
+    assert "512 KiB" in result.failed_posts[0]
+    assert len(result.evaluator_errors) == 12  # a NaN and a long name on each of six items
+    assert result.scores == {"ok": 1.0}
+    assert len(client.request("GET", f"/api/runs/{result.run_id}")["items"]) == 5
+
+
+def test_an_unreachable_server_is_a_clear_error() -> None:
+    with pytest.raises(aw_client.AgentwatchError, match="could not reach"):
+        aw_client.Client("http://127.0.0.1:9", timeout=2).request("GET", "/api/datasets")
+
+
+def test_deleting_a_dataset_removes_its_runs() -> None:
+    db = Store()
+    http = http_client(db)
+    dataset_id, _ = setup(http)
+    run_id = http.post(f"/api/datasets/{dataset_id}/runs", json={"name": "v1"}).json()["run"]["id"]
+    http.post(f"/api/runs/{run_id}/items", json={"item_id": "a", "output": "4"})
+    assert http.delete(f"/api/datasets/{dataset_id}").status_code == 204
+    assert http.get(f"/api/runs/{run_id}").status_code == 404
+    assert db.query_one("SELECT count(*) FROM run_items")[0] == 0
+
+
+def test_rerunning_removes_the_old_synthetic_trace_and_its_scores() -> None:
+    db = Store()
+    http = http_client(db)
+    dataset_id, _ = setup(http)
+    run_id = http.post(f"/api/datasets/{dataset_id}/runs", json={"name": "v1"}).json()["run"]["id"]
+    first = http.post(
+        f"/api/runs/{run_id}/items",
+        json={"item_id": "a", "output": "5", "scores": [{"name": "exact", "value": 0}]},
+    )
+    old_trace = first.json()["items"][0]["trace_id"]
+    second = http.post(
+        f"/api/runs/{run_id}/items",
+        json={"item_id": "a", "output": "4", "scores": [{"name": "exact", "value": 1}]},
+    )
+    new_trace = second.json()["items"][0]["trace_id"]
+    assert db.trace(old_trace) == []
+    assert db.scores(old_trace) == []
+    assert [s.value for s in db.scores(new_trace)] == [1.0]
+    assert db.query_one("SELECT count(*) FROM scores")[0] == 1
+
+
+def test_trace_ids_are_not_shared_between_items_and_times_are_bounded() -> None:
+    http = http_client(Store())
+    dataset_id, _ = setup(http)
+    run_id = http.post(f"/api/datasets/{dataset_id}/runs", json={"name": "v1"}).json()["run"]["id"]
+    shared = "e" * 32
+    batch = {"items": [{"item_id": "a", "trace_id": shared}, {"item_id": "b", "trace_id": shared}]}
+    assert http.post(f"/api/runs/{run_id}/items", json=batch).status_code == 409
+    assert (
+        http.post(
+            f"/api/runs/{run_id}/items", json={"item_id": "a", "trace_id": shared}
+        ).status_code
+        == 201
+    )
+    assert (
+        http.post(
+            f"/api/runs/{run_id}/items", json={"item_id": "b", "trace_id": shared}
+        ).status_code
+        == 409
+    )
+    future = str(time.time_ns() + 10 * 24 * 3600 * 10**9)
+    assert (
+        http.post(
+            f"/api/runs/{run_id}/items", json={"item_id": "b", "start_ns": future, "end_ns": future}
+        ).status_code
+        == 400
+    )
