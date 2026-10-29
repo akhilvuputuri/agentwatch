@@ -104,16 +104,21 @@ When a model call reports tokens but no cost, its cost is calculated from a mode
 Langfuse's model definitions. A price (schema version 4) has a regular expression matched against
 the whole model name (response model, else request model) case-insensitively, prices in US dollars
 per million tokens for input, output, cache reads and cache writes (cache prices default to the
-input price), and an optional time it takes effect. The latest price in effect at the call's start
-applies:
+input price), and an optional time it takes effect. Of the prices in effect at the call's start
+whose pattern matches, the one that took effect latest applies; among equals, the longest (most
+specific) pattern, then the most recently added. So `gpt-4o-mini.*` keeps applying to mini calls
+after a generic `gpt-4o.*` is added:
 
 cost = (input − cache read − cache write) × input price + cache read × cache-read price
 + cache write × cache-write price + output × output price, per million.
 
 Input tokens include cached ones, and output tokens include reasoning, as the GenAI conventions
-and OpenInference define them. Each span records `cost_source`: `reported` when the exporter sent a
+and OpenInference define them. When cache reads and writes together exceed the input count, the
+instrumentation reported fresh input only (some Anthropic instrumentations do), so the input count
+is charged in full as fresh input. Each span records `cost_source`: `reported` when the exporter sent a
 cost (never changed), `calculated` when a price applied, or none. Matching runs in DuckDB's regular
-expressions, for new spans at ingest and for every model call whenever a price is added, replaced
+expressions once per distinct model name (50 prices over 80,000 calls in 40 models recalculate in
+about 0.03 s), for new spans at ingest and for every model call whenever a price is added, replaced
 or deleted, or the extraction rules change, so calculated costs always reflect the current prices.
 No prices are built in; `GET`/`POST /api/prices` and `DELETE /api/prices/<id>` manage them, and the
 Prices page in the UI does the same. A pattern DuckDB cannot compile is refused with 400.

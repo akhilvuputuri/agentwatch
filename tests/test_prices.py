@@ -204,3 +204,23 @@ def test_price_api() -> None:
     assert http.delete("/api/prices/p1").status_code == 204
     assert http.delete("/api/prices/p1").status_code == 404
     assert http.get(f"/api/traces/{T}").json()["spans"][0]["genai"]["cost_usd"] is None
+
+
+def test_a_more_specific_pattern_wins_over_a_newer_generic_one() -> None:
+    db = Store()
+    db.insert(
+        [call("1", "gpt-x-mini", input=1_000_000), call("2", "gpt-x-large", input=1_000_000)], 1
+    )
+    db.upsert_price(price("gpt-x-mini.*", 0.1, 0.0, id="mini"))
+    db.upsert_price(price("gpt-x.*", 1.0, 0.0, id="generic"))
+    found = costs(db)
+    assert found["1"][0] == pytest.approx(0.1)
+    assert found["2"][0] == pytest.approx(1.0)
+
+
+def test_input_that_excludes_cached_tokens_is_charged_as_fresh() -> None:
+    db = Store()
+    # Input 100 with 10,000 cache reads: input must be fresh-only.
+    db.insert([call("1", "m", input=100, cache_read=10_000, output=0)], 1)
+    db.upsert_price(price("m", 3.0, 0.0, cache_read_per_million=0.3))
+    assert costs(db)["1"][0] == pytest.approx((100 * 3.0 + 10_000 * 0.3) / 1e6)

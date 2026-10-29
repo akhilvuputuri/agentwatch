@@ -106,11 +106,17 @@ _PRICE_COLUMNS = (
 
 # Cost of a model call from a price row: fresh input, cache reads and cache writes (each at
 # its own price, or the input price when none is set) and output. Input tokens include the
-# cached ones, as the GenAI conventions and OpenInference both define them; reasoning tokens
-# are part of output.
+# cached ones, as the GenAI conventions and OpenInference both define them; when the cache
+# counts exceed input, the instrumentation reported fresh input only (as some Anthropic
+# instrumentations do), so input is then taken as fresh. Reasoning tokens are part of output.
 _COST = """(
-    greatest(coalesce(s.input_tokens, 0) - coalesce(s.cache_read_tokens, 0)
-             - coalesce(s.cache_write_tokens, 0), 0) * p.input_per_million
+    CASE
+        WHEN coalesce(s.cache_read_tokens, 0) + coalesce(s.cache_write_tokens, 0)
+             > coalesce(s.input_tokens, 0)
+        THEN coalesce(s.input_tokens, 0)
+        ELSE coalesce(s.input_tokens, 0) - coalesce(s.cache_read_tokens, 0)
+             - coalesce(s.cache_write_tokens, 0)
+    END * p.input_per_million
     + coalesce(s.cache_read_tokens, 0) * coalesce(p.cache_read_per_million, p.input_per_million)
     + coalesce(s.cache_write_tokens, 0) * coalesce(p.cache_write_per_million, p.input_per_million)
     + coalesce(s.output_tokens, 0) * p.output_per_million
@@ -823,7 +829,8 @@ class Store:
         """Set the cost of model calls that reported none from the best matching price.
 
         A price matches when its pattern matches the whole model name (case-insensitively) and
-        it took effect by the span's start; the latest to take effect wins. Calls with no
+        it took effect by the span's start. Of the matches, the latest to take effect wins,
+        then the longest (most specific) pattern, then the most recently added. Calls with no
         match have no cost. Reported costs are never touched. `traces` limits the work to
         those traces; None recalculates everything.
         """
@@ -841,17 +848,31 @@ class Store:
         )
         self._db.execute(
             f"""
-            UPDATE spans SET cost_usd = c.cost, cost_source = '{CALCULATED}'
-            FROM (
-                SELECT s.trace_id, s.span_id,
-                       arg_max({_COST}, (coalesce(p.start_ns, -1), p.created_ns, p.id)) AS cost
-                FROM spans s JOIN prices p
-                  ON regexp_full_match(coalesce(s.response_model, s.request_model), p.match_pattern, 'i')
-                 AND (p.start_ns IS NULL OR p.start_ns <= s.start_ns)
+            WITH targets AS (
+                SELECT s.trace_id, s.span_id, s.start_ns, s.input_tokens, s.output_tokens,
+                       s.cache_read_tokens, s.cache_write_tokens,
+                       coalesce(s.response_model, s.request_model) AS model
+                FROM spans s
                 WHERE s.is_model_call AND s.cost_source IS NULL
-                  AND (s.input_tokens IS NOT NULL OR s.output_tokens IS NOT NULL) {scope}
+                  AND (s.input_tokens IS NOT NULL OR s.output_tokens IS NOT NULL)
+                  AND coalesce(s.response_model, s.request_model) IS NOT NULL {scope}
+            ),
+            -- Regular expressions run once per distinct model name, not once per call.
+            matched AS (
+                SELECT m.model, p.*
+                FROM (SELECT DISTINCT model FROM targets) m
+                JOIN prices p ON regexp_full_match(m.model, p.match_pattern, 'i')
+            ),
+            costs AS (
+                SELECT s.trace_id, s.span_id,
+                       arg_max({_COST}, (coalesce(p.start_ns, -1), length(p.match_pattern),
+                                         p.created_ns, p.id)) AS cost
+                FROM targets s JOIN matched p USING (model)
+                WHERE p.start_ns IS NULL OR p.start_ns <= s.start_ns
                 GROUP BY s.trace_id, s.span_id
-            ) c
+            )
+            UPDATE spans SET cost_usd = c.cost, cost_source = '{CALCULATED}'
+            FROM costs c
             WHERE spans.trace_id = c.trace_id AND spans.span_id = c.span_id
             """,
             params,
