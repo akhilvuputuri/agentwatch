@@ -510,6 +510,9 @@ export interface BinaryComparison {
   difference_interval: [number, number] | null;
   p_value: number;
   minimum_detectable: number | null;
+  margin: number;
+  below_margin: boolean;
+  dropped_failures: number;
   verdict: Verdict;
 }
 
@@ -526,6 +529,8 @@ export interface NumericComparison {
   unchanged: number;
   minimum_detectable: number | null;
   margin: number;
+  below_margin: boolean;
+  dropped_failures: number;
   verdict: Verdict;
   unit?: string;
   lower_is_better?: boolean;
@@ -546,6 +551,7 @@ export interface Comparison {
   only_baseline: number;
   only_candidate: number;
   margin: number;
+  relative_margin: number;
   comparisons: (BinaryComparison | NumericComparison)[];
   latency: NumericComparison;
   items: {

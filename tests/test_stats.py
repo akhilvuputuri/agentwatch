@@ -78,9 +78,12 @@ def test_bootstrap_interval_covers_the_mean_about_95_percent_of_the_time() -> No
 
 
 def test_verdicts() -> None:
-    # Many identical outcomes: nothing changed, and that is well established.
-    same = [(True, True)] * 50 + [(False, False)] * 50
-    assert stats.compare_binary(same).verdict == stats.NO_DIFFERENCE
+    # Many identical outcomes: nothing changed, and with enough pairs that is established.
+    assert stats.compare_binary([(True, True)] * 150 + [(False, False)] * 150).verdict == (
+        stats.NO_DIFFERENCE
+    )
+    # Ten agreeing pairs could not have detected a 5-point change: not "no difference".
+    assert stats.compare_binary([(True, True)] * 10).verdict == stats.UNDERPOWERED
     # Too few pairs: never "no difference", whatever they show.
     assert stats.compare_binary([(True, True)] * 5).verdict == stats.UNDERPOWERED
     # Balanced flips on a small set: inconclusive.
@@ -103,6 +106,16 @@ def test_numeric_comparisons() -> None:
     assert result.regressed == 30
     steady = [(1.0, 1.0)] * 30
     assert stats.compare_numeric(steady).verdict == stats.NO_DIFFERENCE
+    # Below MIN_PAIRS, even consistent moves are not called.
+    assert stats.compare_numeric([(0.5, 0.6)] * 3).verdict == stats.UNDERPOWERED
+    assert stats.compare_numeric([(0.5, 0.6)]).difference_interval is None
+    # Significant but smaller than the margin is flagged.
+    tiny = [(1.0, 1.001 + 0.0001 * (k % 3)) for k in range(200)]
+    result = stats.compare_numeric(tiny, margin=0.01)
+    assert result.verdict == stats.BETTER
+    assert result.below_margin
+    # A near-zero baseline still gets a usable margin.
+    assert stats.compare_numeric([(0.001, 0.001)] * 20).margin == 0.01
 
 
 def test_results_are_reproducible() -> None:
@@ -110,3 +123,33 @@ def test_results_are_reproducible() -> None:
         (random.Random(i).random() < 0.5, random.Random(i + 99).random() < 0.6) for i in range(50)
     ]
     assert stats.compare_binary(pairs, seed=3) == stats.compare_binary(pairs, seed=3)
+
+
+def test_t_quantiles() -> None:
+    assert stats.t_975(1) == pytest.approx(12.706)
+    assert stats.t_975(30) == pytest.approx(2.042)
+    assert stats.t_975(60) == pytest.approx(2.000, abs=0.002)
+    assert stats.t_975(1000) == pytest.approx(1.962, abs=0.002)
+
+
+@pytest.mark.parametrize("n", [10, 20, 40])
+def test_numeric_false_positives_stay_near_5_percent(n: int) -> None:
+    rng = random.Random(10 + n)
+    trials = 1500
+    wrong = 0
+    for _ in range(trials):
+        pairs = [(x, x + rng.gauss(0, 1)) for x in (rng.gauss(0, 1) for _ in range(n))]
+        wrong += stats.compare_numeric(pairs).verdict in (stats.BETTER, stats.WORSE)
+    assert wrong / trials <= 0.07, (n, wrong / trials)
+
+
+@pytest.mark.parametrize("n", [10, 20])
+def test_a_real_regression_is_rarely_called_no_difference(n: int) -> None:
+    rng = random.Random(20 + n)
+    trials = 1000
+    reassured = 0
+    for _ in range(trials):
+        # The candidate passes 10 points less often than the baseline.
+        pairs = [(rng.random() < 0.8, rng.random() < 0.7) for _ in range(n)]
+        reassured += stats.compare_binary(pairs).verdict == stats.NO_DIFFERENCE
+    assert reassured / trials <= 0.02, (n, reassured / trials)

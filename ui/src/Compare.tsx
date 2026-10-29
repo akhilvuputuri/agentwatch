@@ -31,6 +31,21 @@ export function VerdictBadge({ verdict }: { verdict: Verdict }) {
   );
 }
 
+function Notes({ c }: { c: BinaryComparison | NumericComparison }) {
+  return (
+    <>
+      {c.below_margin && (
+        <div className="tile-note">Real but smaller than the change that matters.</div>
+      )}
+      {c.dropped_failures > 0 && (
+        <div className="tile-note warn-text">
+          {c.dropped_failures} item{c.dropped_failures > 1 ? "s" : ""} left out because a task failed; see "task succeeded".
+        </div>
+      )}
+    </>
+  );
+}
+
 function BinaryCard({ c }: { c: BinaryComparison }) {
   return (
     <div className="tile compare-card" data-testid="compare-card">
@@ -50,8 +65,9 @@ function BinaryCard({ c }: { c: BinaryComparison }) {
       </div>
       <div className="tile-note">
         Could detect a change of {c.minimum_detectable === null ? "–" : signedPct(c.minimum_detectable).replace("+", "")} (80%
-        power)
+        power); a change of {signedPct(c.margin).replace("+", "")} matters
       </div>
+      <Notes c={c} />
     </div>
   );
 }
@@ -77,8 +93,9 @@ function NumericCard({ c }: { c: NumericComparison }) {
         {c.improved} improved · {c.regressed} regressed · {c.pairs} pairs
       </div>
       <div className="tile-note">
-        Could detect {c.minimum_detectable === null ? "–" : fmt(c.minimum_detectable)}; margin {fmt(c.margin)}
+        Could detect {c.minimum_detectable === null ? "–" : fmt(c.minimum_detectable)}; a change of {fmt(c.margin)} matters
       </div>
+      <Notes c={c} />
     </div>
   );
 }

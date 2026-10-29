@@ -692,3 +692,7 @@ a.button-link {
   background: var(--panel);
   color: var(--text);
 }
+
+.warn-text {
+  color: var(--warn-fg);
+}

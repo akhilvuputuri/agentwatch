@@ -6,7 +6,7 @@ Ported from Chief's evals/decisions/stats.py, which this replaces there.
 A comparison ends in a verdict, never a bare difference:
 
 - `better` / `worse`: the difference is unlikely to be noise (exact McNemar test for pass/fail
-  scores, a paired bootstrap interval excluding zero for numeric ones);
+  scores, a paired t interval excluding zero for numeric ones, from MIN_PAIRS pairs);
 - `no detectable difference`: not significant, and the comparison could have detected a
   difference as large as the margin that matters (its minimum detectable effect is within it);
 - `underpowered`: not significant, but too few pairs to rule out a difference that matters.
@@ -31,6 +31,24 @@ MIN_PAIRS = 10
 Z_95 = 1.959963984540054
 # z for 80% power at a two-sided 5% level: 1.96 + 0.84.
 Z_POWER = Z_95 + 0.8416212335729143
+
+
+# Two-sided 95% critical values of Student's t for 1 to 30 degrees of freedom.
+_T_975 = (
+    12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+    2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+    2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+)  # fmt: skip
+
+
+def t_975(df: int) -> float:
+    """The 97.5th percentile of Student's t: exact table to 30 df, a series expansion above."""
+    if df < 1:
+        return math.inf
+    if df <= len(_T_975):
+        return _T_975[df - 1]
+    z = Z_95
+    return z + (z**3 + z) / (4 * df) + (5 * z**5 + 16 * z**3 + 3 * z) / (96 * df**2)
 
 
 def wilson(successes: int, total: int, z: float = Z_95) -> tuple[float, float] | None:
@@ -104,6 +122,9 @@ class BinaryComparison:
     difference_interval: tuple[float, float] | None
     p_value: float
     minimum_detectable: float | None
+    margin: float
+    # True when the difference is significant but smaller than the margin that matters.
+    below_margin: bool
     verdict: str
 
 
@@ -123,7 +144,7 @@ def compare_binary(
     rate_b = (both + only_b) / n if n else math.nan
     diffs = [float(b) - float(a) for a, b in pairs]
     p = mcnemar_exact(only_a, only_b)
-    mde = _minimum_detectable(diffs)
+    mde = _binary_minimum_detectable(only_a + only_b, n)
     return BinaryComparison(
         pairs=n,
         both=both,
@@ -138,6 +159,8 @@ def compare_binary(
         difference_interval=bootstrap(diffs, mean, seed=seed),
         p_value=p,
         minimum_detectable=mde,
+        margin=margin,
+        below_margin=p < ALPHA and n > 0 and abs(rate_b - rate_a) < margin,
         verdict=_verdict(
             significant=p < ALPHA, direction=only_b - only_a, mde=mde, margin=margin, pairs=n
         ),
@@ -158,6 +181,7 @@ class NumericComparison:
     unchanged: int
     minimum_detectable: float | None
     margin: float
+    below_margin: bool
     verdict: str
 
 
@@ -165,23 +189,25 @@ def compare_numeric(
     pairs: Sequence[tuple[float, float]],
     *,
     margin: float | None = None,
+    relative_margin: float = 0.05,
+    margin_floor: float = 0.01,
     higher_is_better: bool = True,
-    seed: int = 7,
 ) -> NumericComparison:
-    """Compare paired numbers with a seeded bootstrap interval for the mean difference.
+    """Compare paired numbers with a paired t interval for the mean difference.
 
-    `margin` is the smallest mean change that matters; by default 5% of the baseline's mean
-    magnitude (or 0.05 when that is zero).
+    `margin` is the smallest mean change that matters; by default `relative_margin` of the
+    baseline's mean magnitude, but never below `margin_floor`. Below MIN_PAIRS pairs no
+    verdict other than underpowered is given: the interval is not trustworthy that small.
     """
     n = len(pairs)
     diffs = [b - a for a, b in pairs]
     mean_a = mean([a for a, _ in pairs])
     mean_b = mean([b for _, b in pairs])
     if margin is None:
-        margin = 0.05 * abs(mean_a) if n and mean_a else 0.05
-    interval = bootstrap(diffs, mean, seed=seed)
-    significant = interval is not None and (interval[0] > 0 or interval[1] < 0)
+        margin = max(relative_margin * abs(mean_a) if n else 0.0, margin_floor)
     difference = mean(diffs)
+    interval = _t_interval(diffs)
+    significant = n >= MIN_PAIRS and interval is not None and (interval[0] > 0 or interval[1] < 0)
     mde = _minimum_detectable(diffs)
     direction = difference if higher_is_better else -difference
     return NumericComparison(
@@ -195,10 +221,34 @@ def compare_numeric(
         unchanged=sum(1 for d in diffs if d == 0),
         minimum_detectable=mde,
         margin=margin,
+        below_margin=significant and abs(difference) < margin,
         verdict=_verdict(
             significant=significant, direction=direction, mde=mde, margin=margin, pairs=n
         ),
     )
+
+
+def _t_interval(diffs: Sequence[float]) -> tuple[float, float] | None:
+    """95% paired t interval for the mean difference; None below two pairs."""
+    n = len(diffs)
+    if n < 2:
+        return None
+    centre = mean(diffs)
+    half = t_975(n - 1) * stdev(diffs) / math.sqrt(n)
+    return (centre - half, centre + half)
+
+
+def _binary_minimum_detectable(discordant: int, n: int) -> float | None:
+    """Smallest true change in pass rate detected 80% of the time (5% level).
+
+    The variance of a paired pass/fail difference is at most the share of discordant pairs,
+    so this uses the upper Wilson bound of that share rather than the observed spread: with no
+    flips observed, it still reports what the comparison could have missed.
+    """
+    bounds = wilson(discordant, n)
+    if bounds is None:
+        return None
+    return Z_POWER * math.sqrt(bounds[1]) / math.sqrt(n)
 
 
 def _minimum_detectable(diffs: Sequence[float]) -> float | None:

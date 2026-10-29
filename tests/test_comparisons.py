@@ -55,7 +55,8 @@ def test_a_clear_improvement_is_better_and_flips_are_listed() -> None:
     assert exact["baseline_rate"] == 0.5
     assert by_name["quality"]["kind"] == "numeric"
     assert by_name["quality"]["verdict"] == stats.BETTER
-    assert by_name["task succeeded"]["verdict"] == stats.NO_DIFFERENCE
+    # 40 items that all succeeded could not rule out a 5-point change in success.
+    assert by_name["task succeeded"]["verdict"] == stats.UNDERPOWERED
     flipped = [i for i in result["items"] if i["flips"].get("exact")]
     assert len(flipped) == 18
     assert {i["flips"]["exact"] for i in flipped} == {"improved"}
@@ -137,3 +138,50 @@ def test_small_numeric_changes_are_not_flips() -> None:
     result = http.get("/api/compare", params={"baseline": a, "candidate": b}).json()
     changed = [i["item_id"] for i in result["items"] if i["flips"]]
     assert changed == ["i0"]
+
+
+def test_numeric_cards_count_pairs_dropped_for_failures_and_booleans_need_all_to_pass() -> None:
+    http, a, b = setup(12)
+    record(
+        http,
+        a,
+        [
+            {
+                "item_id": f"i{k}",
+                "scores": [
+                    {"name": "q", "value": 0.5},
+                    {"name": "ok", "value": True},
+                    {"name": "ok", "value": k != 0},
+                ],
+            }
+            for k in range(12)
+        ],
+    )
+    record(
+        http,
+        b,
+        [
+            {"item_id": f"i{k}", "error": "X: y"}
+            if k < 3
+            else {
+                "item_id": f"i{k}",
+                "scores": [{"name": "q", "value": 0.6}, {"name": "ok", "value": True}],
+            }
+            for k in range(12)
+        ],
+    )
+    result = http.get(
+        "/api/compare", params={"baseline": a, "candidate": b, "relative_margin": "0.1"}
+    ).json()
+    by_name = {c["name"]: c for c in result["comparisons"]}
+    assert by_name["q"]["dropped_failures"] == 3
+    assert by_name["q"]["pairs"] == 9
+    assert result["relative_margin"] == 0.1
+    # Item i0's baseline had one passing and one failing "ok": it counts as failing.
+    assert by_name["ok"]["baseline_rate"] == 11 / 12
+    assert (
+        http.get(
+            "/api/compare", params={"baseline": a, "candidate": b, "relative_margin": "0"}
+        ).status_code
+        == 400
+    )

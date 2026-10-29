@@ -281,16 +281,22 @@ def create_app(
         baseline, candidate = query.get("baseline", ""), query.get("candidate", "")
         if not baseline or not candidate:
             return PlainTextResponse("baseline and candidate run IDs are required", status_code=400)
-        try:
-            margin = float(query.get("margin", "0.05"))
-        except ValueError:
-            margin = -1.0
-        if not 0 < margin <= 1:
-            return PlainTextResponse(
-                "margin must be a number above 0 and at most 1", status_code=400
-            )
+        margins: dict[str, float] = {}
+        for key in ("margin", "relative_margin"):
+            try:
+                margins[key] = float(query.get(key, "0.05"))
+            except ValueError:
+                margins[key] = -1.0
+            if not 0 < margins[key] <= 1:
+                return PlainTextResponse(f"{key} must be a number above 0 and at most 1", 400)
         return await _dataset_call(
-            lambda: comparisons.compare_runs(store, baseline, candidate, margin=margin)
+            lambda: comparisons.compare_runs(
+                store,
+                baseline,
+                candidate,
+                margin=margins["margin"],
+                relative_margin=margins["relative_margin"],
+            )
         )
 
     async def list_prices(_: Request) -> Response:

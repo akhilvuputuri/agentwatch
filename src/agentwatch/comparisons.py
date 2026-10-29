@@ -20,8 +20,17 @@ SUCCESS = "task succeeded"
 
 
 def compare_runs(
-    store: Store, baseline_id: str, candidate_id: str, *, margin: float = 0.05, seed: int = 7
+    store: Store,
+    baseline_id: str,
+    candidate_id: str,
+    *,
+    margin: float = 0.05,
+    relative_margin: float = 0.05,
+    seed: int = 7,
 ) -> dict[str, Any]:
+    """`margin`: the change in pass rate that matters (absolute); `relative_margin`: the change
+    in a numeric mean that matters, as a share of the baseline mean (with a floor of 0.01, or
+    1 ms for latency)."""
     baseline = experiments.get_run(store, baseline_id)
     candidate = experiments.get_run(store, candidate_id)
     if baseline.dataset_id != candidate.dataset_id:
@@ -33,15 +42,24 @@ def compare_runs(
     paired = sorted(set(a_items) & set(b_items))
 
     def values(item: dict[str, Any]) -> dict[str, tuple[str, float]]:
-        """Mean value per score name on an item (several scores of one name are averaged)."""
+        """One value per score name on an item.
+
+        Several numeric scores of one name are averaged; several boolean ones pass only if
+        all pass. A name used with both types is compared as numeric.
+        """
         found: dict[str, list[float]] = {}
-        types: dict[str, str] = {}
+        types: dict[str, set[str]] = {}
         for score in item["scores"]:
             if score["value"] is None:
                 continue  # labels only: not compared
             found.setdefault(score["name"], []).append(float(score["value"]))
-            types[score["name"]] = score["data_type"]
-        return {name: (types[name], sum(v) / len(v)) for name, v in found.items()}
+            types.setdefault(score["name"], set()).add(score["data_type"])
+        return {
+            name: ("BOOLEAN", min(v))
+            if types[name] == {"BOOLEAN"}
+            else ("NUMERIC", sum(v) / len(v))
+            for name, v in found.items()
+        }
 
     a_values = {item_id: values(a_items[item_id]) for item_id in paired}
     b_values = {item_id: values(b_items[item_id]) for item_id in paired}
@@ -51,7 +69,7 @@ def compare_runs(
 
     success_pairs = [(a_items[i]["error"] is None, b_items[i]["error"] is None) for i in paired]
     comparisons.append(
-        _binary(SUCCESS, stats.compare_binary(success_pairs, margin=margin, seed=seed))
+        _binary(SUCCESS, stats.compare_binary(success_pairs, margin=margin, seed=seed), 0)
     )
     for item_id, (a_ok, b_ok) in zip(paired, success_pairs, strict=True):
         if a_ok != b_ok:
@@ -61,6 +79,7 @@ def compare_runs(
         kinds = {v[name][0] for v in (*a_values.values(), *b_values.values()) if name in v}
         binary = kinds == {"BOOLEAN"}
         pairs: list[tuple[str, float, float]] = []
+        dropped = 0  # pairs left out because one side's task failed
         for item_id in paired:
             a = a_values[item_id].get(name)
             b = b_values[item_id].get(name)
@@ -69,7 +88,11 @@ def compare_runs(
             if a is None or b is None:
                 # Only a failed task's missing score is filled in, as a failure; any other
                 # missing score leaves the pair out.
+                failed = (a is None and a_items[item_id]["error"] is not None) or (
+                    b is None and b_items[item_id]["error"] is not None
+                )
                 if not binary:
+                    dropped += failed
                     continue
                 if a is None and a_items[item_id]["error"] is not None:
                     a = ("BOOLEAN", 0.0)
@@ -84,13 +107,15 @@ def compare_runs(
             result = stats.compare_binary(
                 [(a >= 0.5, b >= 0.5) for _, a, b in pairs], margin=margin, seed=seed
             )
-            comparisons.append(_binary(name, result))
+            comparisons.append(_binary(name, result, dropped))
             for item_id, a, b in pairs:
                 if (a >= 0.5) != (b >= 0.5):
                     flips[item_id][name] = "improved" if b >= 0.5 else "regressed"
         else:
-            result = stats.compare_numeric([(a, b) for _, a, b in pairs], seed=seed)
-            comparisons.append(_numeric(name, result))
+            result = stats.compare_numeric(
+                [(a, b) for _, a, b in pairs], relative_margin=relative_margin
+            )
+            comparisons.append(_numeric(name, result, dropped))
             # A numeric change counts as a flip only beyond the margin that matters.
             for item_id, a, b in pairs:
                 if abs(b - a) > result.margin:
@@ -99,7 +124,8 @@ def compare_runs(
     latency = stats.compare_numeric(
         [(a_items[i]["latency_ms"], b_items[i]["latency_ms"]) for i in paired],
         higher_is_better=False,
-        seed=seed,
+        relative_margin=relative_margin,
+        margin_floor=1.0,  # a millisecond
     )
     return {
         "baseline": asdict(baseline) | {"created_ns": str(baseline.created_ns)},
@@ -109,7 +135,8 @@ def compare_runs(
         "only_candidate": len(set(b_items) - set(a_items)),
         "margin": margin,
         "comparisons": comparisons,
-        "latency": _numeric(LATENCY, latency) | {"unit": "ms", "lower_is_better": True},
+        "relative_margin": relative_margin,
+        "latency": _numeric(LATENCY, latency, 0) | {"unit": "ms", "lower_is_better": True},
         "items": [
             {
                 "item_id": item_id,
@@ -128,12 +155,12 @@ def _side(item: dict[str, Any]) -> dict[str, Any]:
     return {key: item[key] for key in ("output", "error", "trace_id", "latency_ms", "scores")}
 
 
-def _binary(name: str, result: stats.BinaryComparison) -> dict[str, Any]:
-    return {"name": name, "kind": "binary"} | _clean(asdict(result))
+def _binary(name: str, result: stats.BinaryComparison, dropped: int) -> dict[str, Any]:
+    return {"name": name, "kind": "binary", "dropped_failures": dropped} | _clean(asdict(result))
 
 
-def _numeric(name: str, result: stats.NumericComparison) -> dict[str, Any]:
-    return {"name": name, "kind": "numeric"} | _clean(asdict(result))
+def _numeric(name: str, result: stats.NumericComparison, dropped: int) -> dict[str, Any]:
+    return {"name": name, "kind": "numeric", "dropped_failures": dropped} | _clean(asdict(result))
 
 
 def _clean(data: dict[str, Any]) -> dict[str, Any]:
