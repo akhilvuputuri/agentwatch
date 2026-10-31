@@ -9,6 +9,7 @@ describe("route", () => {
     expect(route("#/sessions")).toEqual({ page: "sessions" });
     expect(route("#/prices")).toEqual({ page: "prices" });
     expect(route("#/judges")).toEqual({ page: "judges" });
+    expect(route("#/alerts")).toEqual({ page: "alerts" });
     expect(route("#/datasets")).toEqual({ page: "datasets" });
     expect(route(links.run("r 1"))).toEqual({ page: "run", runId: "r 1" });
     expect(route(links.compare("a/1", "b"))).toEqual({ page: "compare", baseline: "a/1", candidate: "b" });

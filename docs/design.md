@@ -367,11 +367,95 @@ scores are evidence to read alongside others, not ground truth. Whether a judge 
 people has not been measured; a judge's question should be checked on a few traces with the
 trial endpoint before it is switched on.
 
+## Monitors and alerts
+
+A monitor (`monitors` table, schema version 9) compares one metric over a trailing window with a
+threshold: a unique name, the metric, the score name (for `score_mean` only), an optional root
+service, a window of 1 to 43,200 minutes, `above` or `below`, a finite threshold (0 to 1 for the
+error rates, where 0.05 means 5%), `min_samples` (1 to 100,000; by default 3 for the error rates,
+since the Wilson bound already guards them at low volume, and 10 for the rest),
+`cooldown_minutes` (0 to 43,200, default 60) and whether it is enabled (by default it is). A name
+may not contain control, format or bidi characters (Unicode Cc and Cf, such as a newline or U+202E)
+or line separators, since it is shown wherever an alert is delivered. The background runner
+evaluates every enabled monitor each minute; a monitor that fails is logged, and the others go on.
+
+**Metrics.** Windows are half-open and end now. Populations follow the dashboard's: spans that
+started in the window, limited to traces whose root service matches.
+
+| Metric | Value | Samples | Compared by |
+| --- | --- | --- | --- |
+| `model_error_rate` | failed model calls / model calls | model calls | Wilson bound |
+| `tool_error_rate` | failed tool calls / tool calls | tool calls | Wilson bound |
+| `cost_usd` | sum of cost (spans that count toward totals) | model calls; `min_samples` ignored | point value |
+| `model_p95_ms` | 95th percentile of model call latency | model calls | point value |
+| `trace_count` | traces whose root started in the window | always 1; `min_samples` ignored | point value |
+| `score_mean` | mean of the named BOOLEAN or NUMERIC score recorded in the window, any source | scores | Wilson bound if all BOOLEAN, otherwise point value |
+
+An error-rate window must be longer than the longest model call. A call counts from when it
+started but arrives when it ends, so a call longer than the window has already left the window by
+the time it arrives, and a failure that takes that long is missed.
+
+`cost_usd` ignores `min_samples` because a cost spike must alert even from few calls, and
+`trace_count` because a `below` monitor on it is how silence is caught. With fewer samples than
+`min_samples`, a monitor's state stays as it is and the evaluation is recorded as `insufficient`,
+including a firing monitor whose traffic stopped: nothing has shown that it recovered.
+
+**The Wilson rule.** One failure in three calls is a 33% error rate, and almost no evidence of
+anything: `min_samples` alone cannot tell it from 30 failures in 90. So a rate fires on the 95%
+Wilson bound (the one in `stats`) on the threshold's side: `above` when the lower bound exceeds the
+threshold, `below` when the upper bound is under it. At a threshold of 20%, 1 failure in 3 (lower
+bound 6%) does not fire, and 30 in 50 (lower bound 46%) does; 5 in 5 (lower bound 57%) fires with
+the default `min_samples`. Recovery compares the point value, so a monitor does not have to wait
+for a bound to clear, which at low volume could take very long. A value exactly on the threshold
+is on the good side. Non-rates compare the point value both ways.
+
+**Cooldown.** A value that sits at its threshold would otherwise fire and resolve over and over:
+a `trace_count` below 3 over 5 minutes, with one trace every other minute, wrote 17 alerts in 20
+minutes. So a firing monitor, rate or not, stays firing until its point value has been on the good
+side continuously for `cooldown_minutes` (`good_since_ns` in its state). Any evaluation on the bad
+side clears that. An evaluation with too few samples neither clears nor advances it: the good time
+built up is kept, and the time passed adds nothing (`good_since_ns` moves forward by it), so a
+firing monitor does not resolve from silence on a rate. A cooldown of 0 resolves at once.
+
+**State machine.** One `monitor_states` row per monitor: `OK` or `FIRING`, the last value, bound,
+samples, evaluation time, when the state began, whether the evaluation was insufficient, and
+since when a firing monitor has been good.
+`OK` to `FIRING` writes a `firing` alert, `FIRING` to `OK` a `resolved` one, each in one
+transaction with the state, so there is no alert while a monitor stays firing. The query runs
+before that transaction, under the store's lock only for itself; a monitor deleted or changed
+during its query discards the result.
+
+A change to the metric, score name, service, window, comparison, threshold or minimum samples, or
+switching a monitor off or on, deletes its state, so it starts from `OK` and re-evaluates. A
+rename or a new cooldown keeps the state and writes no alert. If the monitor was firing, the reset
+first writes one `resolved` alert in the same transaction, so what the owner last heard is not
+"still firing": `reason` is `changed`, `value` is null, samples is 0, and the alert describes the
+old rule under the old name. Deleting a firing monitor does the same with `reason` `removed`.
+Deleting a monitor deletes its state and keeps its alerts.
+
+**What an alert contains.** Names and numbers only: monitor ID and name (copied, so it outlives
+the monitor), kind, metric, comparison, threshold, value, bound, samples, window, creation time,
+delivery time and `reason` (null unless an edit resolved it, as above). No trace content. `Store.prune` deletes alerts older than its cutoff by creation
+time, delivered or not; monitors and states are not affected.
+
+**Delivery is polling.** There are no webhooks, so no URL or secret is ever stored and agentwatch
+sends nothing. A client polls `GET /api/alerts?undelivered=1`, which lists the oldest first, acts
+on each and confirms with `POST /api/alerts/<id>/delivered`. Confirming is idempotent and keeps the
+first time, so a client that retries after a lost reply changes nothing; a client that crashes
+before confirming sees the alert again, so delivery is at least once.
+
+API: `GET/POST /api/monitors`, `GET/PATCH/DELETE /api/monitors/<id>` (each with its current state),
+`GET /api/alerts?limit=&undelivered=1` (newest first unless `undelivered`) and
+`POST /api/alerts/<id>/delivered` (404 if unknown; the body is ignored, but the request must say
+`application/json` as every write does). The UI's Alerts page adds monitors, lists them with their
+state, and lists recent alerts. Whether these thresholds and windows suit real traffic has not
+been measured.
+
 ## Retention and the server image
 
 `agentwatch serve --retain-days N` (1 to 36,500) deletes, at start and every 6 hours, every
-trace whose last span arrived more than N days ago, with its scores and judgements
-(`Store.prune`). Age is the server's arrival time, not the exporter's span times, so a client
+trace whose last span arrived more than N days ago, with its scores and judgements, and every
+alert created more than N days ago, delivered or not (`Store.prune`). Age is the server's arrival time, not the exporter's span times, so a client
 with a wrong clock cannot get new traces deleted. A trace with any recent span is kept whole.
 Traces and scores of experiment runs are kept, since their runs still show them. Scores and
 judgements older than the cutoff whose trace no longer exists, or never arrived, are deleted
@@ -381,9 +465,9 @@ the freed space rather than shrinking the file. Without the flag, nothing is del
 `--memory-limit` sets DuckDB's `memory_limit` (it spills to disk beyond it), for a shared host.
 The value is checked against a size pattern, and must be at least 64MB, before it is used.
 
-On shutdown the server waits at most 3 seconds each for an in-flight judge call or prune, so it
-stops within a container's default 10-second grace period; the database is closed only if both
-have finished, and DuckDB replays its log at the next start otherwise.
+On shutdown the server waits at most 3 seconds each for an in-flight judge call, monitor query or
+prune, so it stops within a container's default 10-second grace period; the database is closed only
+if all have finished, and DuckDB replays its log at the next start otherwise.
 
 The image (`Dockerfile`) builds the UI in a Node stage and installs the locked dependencies with
 uv into a Python 3.13 slim image; all three base images are pinned by digest. It runs as UID

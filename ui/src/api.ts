@@ -627,3 +627,76 @@ export async function deleteJudge(id: string): Promise<void> {
 export async function listJudgements(id: string, signal?: AbortSignal): Promise<Judgement[]> {
   return (await getJson<{ judgements: Judgement[] }>(`api/judges/${encodeURIComponent(id)}/judgements`, signal)).judgements;
 }
+
+export type MonitorMetric = "model_error_rate" | "tool_error_rate" | "cost_usd" | "model_p95_ms" | "trace_count" | "score_mean";
+
+export interface MonitorState {
+  state: "OK" | "FIRING";
+  value: number | null;
+  /** A rate's Wilson bound on the threshold's side; null for anything that is not a rate. */
+  bound: number | null;
+  samples: number | null;
+  evaluated_ns: string | null;
+  since_ns: string | null;
+  /** The last evaluation had too few samples to compare, so the state stayed as it was. */
+  insufficient: boolean;
+  /** While firing: since when the value has been on the good side. */
+  good_since_ns: string | null;
+}
+
+export interface Monitor {
+  id: string;
+  name: string;
+  metric: MonitorMetric;
+  score_name: string | null;
+  service: string | null;
+  window_minutes: number;
+  comparison: "above" | "below";
+  threshold: number;
+  min_samples: number;
+  cooldown_minutes: number;
+  enabled: boolean;
+  created_ns: string;
+  state: MonitorState;
+}
+
+export type NewMonitor = Pick<Monitor, "name" | "metric" | "score_name" | "service" | "window_minutes" | "comparison" | "threshold" | "cooldown_minutes"> &
+  Partial<Pick<Monitor, "min_samples">>;
+
+export interface Alert {
+  id: string;
+  monitor_id: string;
+  monitor_name: string;
+  kind: "firing" | "resolved";
+  metric: MonitorMetric;
+  comparison: "above" | "below";
+  threshold: number;
+  /** Null when an edit, not the metric, resolved it. */
+  value: number | null;
+  bound: number | null;
+  samples: number;
+  window_minutes: number;
+  created_ns: string;
+  delivered_ns: string | null;
+  reason: "changed" | "removed" | null;
+}
+
+export async function listMonitors(signal?: AbortSignal): Promise<Monitor[]> {
+  return (await getJson<{ monitors: Monitor[] }>("api/monitors", signal)).monitors;
+}
+
+export async function createMonitor(monitor: NewMonitor): Promise<Monitor> {
+  return (await send<{ monitor: Monitor }>("POST", "api/monitors", monitor)).monitor;
+}
+
+export async function updateMonitor(id: string, fields: Partial<NewMonitor & { enabled: boolean }>): Promise<Monitor> {
+  return (await send<{ monitor: Monitor }>("PATCH", `api/monitors/${encodeURIComponent(id)}`, fields)).monitor;
+}
+
+export async function deleteMonitor(id: string): Promise<void> {
+  await send<void>("DELETE", `api/monitors/${encodeURIComponent(id)}`);
+}
+
+export async function listAlerts(signal?: AbortSignal): Promise<Alert[]> {
+  return (await getJson<{ alerts: Alert[] }>("api/alerts", signal)).alerts;
+}

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Alerts } from "./Alerts";
 import { CompareView } from "./Compare";
 import { Dashboard } from "./Dashboard";
 import { DatasetList, DatasetView } from "./Datasets";
@@ -14,6 +15,7 @@ export type Route =
   | { page: "dashboard" }
   | { page: "prices" }
   | { page: "judges" }
+  | { page: "alerts" }
   | { page: "datasets" }
   | { page: "dataset"; datasetId: string }
   | { page: "run"; runId: string }
@@ -27,6 +29,7 @@ export function route(hash: string): Route {
   if (hash === "#/sessions") return { page: "sessions" };
   if (hash === "#/prices") return { page: "prices" };
   if (hash === "#/judges") return { page: "judges" };
+  if (hash === "#/alerts") return { page: "alerts" };
   if (hash === "#/datasets") return { page: "datasets" };
   const compare = /^#\/compare\/([^/]+)\/([^/]+)$/.exec(hash);
   if (compare) {
@@ -87,7 +90,7 @@ export function App() {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
   const section =
-    current.page === "dashboard" || current.page === "prices" || current.page === "judges"
+    current.page === "dashboard" || current.page === "prices" || current.page === "judges" || current.page === "alerts"
       ? current.page
       : current.page === "sessions" || current.page === "session"
         ? "sessions"
@@ -119,6 +122,9 @@ export function App() {
           <a href="#/judges" aria-current={section === "judges" ? "page" : undefined}>
             Judges
           </a>
+          <a href="#/alerts" aria-current={section === "alerts" ? "page" : undefined}>
+            Alerts
+          </a>
           <a href="#/prices" aria-current={section === "prices" ? "page" : undefined}>
             Prices
           </a>
@@ -131,6 +137,8 @@ export function App() {
           <Prices />
         ) : current.page === "judges" ? (
           <Judges />
+        ) : current.page === "alerts" ? (
+          <Alerts />
         ) : current.page === "datasets" ? (
           <DatasetList />
         ) : current.page === "dataset" ? (

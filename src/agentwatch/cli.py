@@ -130,6 +130,7 @@ def _serve(
 
     from agentwatch import demo as dataset
     from agentwatch.judges import JudgeRunner
+    from agentwatch.monitors import MonitorRunner
     from agentwatch.retention import Retention
     from agentwatch.server import LOOPBACK_HOSTS, create_app
     from agentwatch.store import Store
@@ -160,6 +161,8 @@ def _serve(
     # Judges are disabled until switched on, so the runner makes no model call until then.
     runner = JudgeRunner(store, policy=judge_policy or JudgePolicy())
     runner.start()
+    monitor_runner = MonitorRunner(store)
+    monitor_runner.start()
     retention = Retention(store, retain_days) if retain_days is not None else None
     if retention is not None:
         retention.start()
@@ -171,13 +174,18 @@ def _serve(
             log_level="warning",
         )
     finally:
-        # Within a container's stop grace period: an in-flight judge call or prune is left
-        # to the daemon threads, and the database is closed only if they have finished
-        # (DuckDB replays its log at the next start otherwise).
+        # Within a container's stop grace period: an in-flight judge call, monitor query or
+        # prune is left to the daemon threads, and the database is closed only if they have
+        # finished (DuckDB replays its log at the next start otherwise).
         runner.stop(timeout_s=3)
+        monitor_runner.stop(timeout_s=3)
         if retention is not None:
             retention.stop(timeout_s=3)
-        if not runner.running and (retention is None or not retention.running):
+        if (
+            not runner.running
+            and not monitor_runner.running
+            and (retention is None or not retention.running)
+        ):
             store.close()
     return 0
 

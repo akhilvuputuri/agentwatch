@@ -19,7 +19,7 @@ from agentwatch import genai
 from agentwatch.scores import Score, ScoreConflict, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
 # database and an upgraded one end up identical.
@@ -170,6 +170,49 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         )""",
     ),
     8: ("ALTER TABLE judges ADD COLUMN sessions_only BOOLEAN NOT NULL DEFAULT false",),
+    9: (
+        """CREATE TABLE monitors (
+            id VARCHAR PRIMARY KEY,
+            name VARCHAR NOT NULL UNIQUE,
+            metric VARCHAR NOT NULL,
+            score_name VARCHAR,
+            service VARCHAR,
+            window_minutes INTEGER NOT NULL,
+            comparison VARCHAR NOT NULL,
+            threshold DOUBLE NOT NULL,
+            min_samples INTEGER NOT NULL,
+            cooldown_minutes INTEGER NOT NULL,
+            enabled BOOLEAN NOT NULL,
+            created_ns BIGINT NOT NULL
+        )""",
+        """CREATE TABLE monitor_states (
+            monitor_id VARCHAR PRIMARY KEY,
+            state VARCHAR NOT NULL,
+            value DOUBLE,
+            bound DOUBLE,
+            samples BIGINT NOT NULL,
+            evaluated_ns BIGINT NOT NULL,
+            since_ns BIGINT NOT NULL,
+            insufficient BOOLEAN NOT NULL,
+            good_since_ns BIGINT
+        )""",
+        """CREATE TABLE alerts (
+            id VARCHAR PRIMARY KEY,
+            monitor_id VARCHAR NOT NULL,
+            monitor_name VARCHAR NOT NULL,
+            kind VARCHAR NOT NULL,
+            metric VARCHAR NOT NULL,
+            comparison VARCHAR NOT NULL,
+            threshold DOUBLE NOT NULL,
+            value DOUBLE,
+            bound DOUBLE,
+            samples BIGINT NOT NULL,
+            window_minutes INTEGER NOT NULL,
+            created_ns BIGINT NOT NULL,
+            delivered_ns BIGINT,
+            reason VARCHAR
+        )""",
+    ),
 }
 REPORTED = "reported"
 CALCULATED = "calculated"
@@ -636,7 +679,8 @@ class Store:
                 raise
 
     def prune(self, before_ns: int) -> int:
-        """Deletes traces last received before `before_ns`, with their scores and judgements.
+        """Deletes traces last received before `before_ns`, with their scores and judgements,
+        and every alert created before it, delivered or not.
 
         Age is the server's own arrival time, not the exporter's span times, so a client with
         a wrong clock (or microseconds sent as nanoseconds) cannot get a new trace deleted.
@@ -661,6 +705,7 @@ class Store:
                     [before_ns],
                 )
             db.execute("DROP TABLE pruned")
+            db.execute("DELETE FROM alerts WHERE created_ns < ?", [before_ns])
         return count[0] if count else 0
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> Any:

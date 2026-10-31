@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agentwatch.otlp import MAX_TIME_NS
+from agentwatch.scores import BOOLEAN, NUMERIC
 from agentwatch.spans import STATUS_ERROR
 from agentwatch.store import ROOTS_SQL, Store
 
@@ -333,6 +334,44 @@ _SCORES = f"""
     GROUP BY name
     ORDER BY count DESC, name
 """
+
+
+# The figures monitors compare, from the same populations as the overview, without its per-trace
+# work, since every monitor runs this every minute.
+_MONITOR_FIGURES = f"""
+    WITH {_SCOPE}
+    SELECT
+        (SELECT count(*) FROM started) AS traces,
+        count(*) FILTER (WHERE is_model_call) AS model_calls,
+        count(*) FILTER (WHERE is_model_call AND status_code = {STATUS_ERROR}) AS model_errors,
+        count(*) FILTER (WHERE operation = 'execute_tool') AS tool_calls,
+        count(*) FILTER (WHERE operation = 'execute_tool' AND status_code = {STATUS_ERROR}) AS tool_errors,
+        sum(cost_usd) FILTER (WHERE counts_toward_totals) AS cost_usd,
+        quantile_cont({_DURATION_MS}, 0.95) FILTER (WHERE is_model_call) AS model_p95_ms
+    FROM windowed
+"""
+
+# One score name in the window, on traces in scope. Parameter 5 is the name. Categorical scores
+# have no value to average.
+_SCORE_FIGURES = f"""
+    WITH {_SCOPE}
+    SELECT count(*) AS samples, avg(value) AS mean,
+           count(*) FILTER (WHERE data_type = '{BOOLEAN}') AS booleans,
+           coalesce(sum(value) FILTER (WHERE data_type = '{BOOLEAN}'), 0) AS successes
+    FROM scores
+    WHERE name = ?5 AND data_type IN ('{BOOLEAN}', '{NUMERIC}') AND value IS NOT NULL
+      AND created_ns >= ?3 AND created_ns < ?4 AND trace_id IN (SELECT trace_id FROM traces)
+"""
+
+
+def monitor_figures(store: Store, window: Window) -> dict[str, Any]:
+    [row] = store.query(_MONITOR_FIGURES, _params(window), with_names=True)
+    return {key: _clean(value) for key, value in row.items()}
+
+
+def score_figures(store: Store, window: Window, name: str) -> dict[str, Any]:
+    [row] = store.query(_SCORE_FIGURES, [*_params(window), name], with_names=True)
+    return {key: _clean(value) for key, value in row.items()}
 
 
 def _scores(store: Store, params: list[Any]) -> list[dict[str, Any]]:
