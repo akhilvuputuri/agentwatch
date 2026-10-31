@@ -116,6 +116,7 @@ def make(db: Store, metric: str = monitors.MODEL_ERROR_RATE, **fields: Any) -> m
         "comparison": "above",
         "threshold": 0.2,
         "min_samples": 1,
+        "cooldown_minutes": 0,
     }
     return monitors.create_monitor(db, body | fields, now_ns=NOW)
 
@@ -203,6 +204,24 @@ def test_window_edges(db: Store, traces: Traces) -> None:
 
 
 # --- Evaluation --------------------------------------------------------------------------
+
+
+def test_five_failures_in_five_calls_fire_with_the_defaults(db: Store, traces: Traces) -> None:
+    traces.calls(MODEL, failed=5, total=5)
+    monitor = monitors.create_monitor(
+        db,
+        {
+            "name": "defaults",
+            "metric": monitors.MODEL_ERROR_RATE,
+            "window_minutes": 10,
+            "comparison": "above",
+            "threshold": 0.2,
+        },
+    )
+    assert monitor.min_samples == 3
+    state = monitors.evaluate(db, monitor, NOW)
+    assert state is not None
+    assert state.state == FIRING
 
 
 def test_too_few_samples_keeps_the_state_and_says_so(db: Store, traces: Traces) -> None:
@@ -346,26 +365,225 @@ def test_firing_then_resolved_make_one_alert_each(db: Store, traces: Traces) -> 
     assert (state.state, state.since_ns) == (OK, later)
 
 
-def test_a_change_starts_again_from_ok(db: Store, traces: Traces) -> None:
+def firing(db: Store, traces: Traces, **fields: Any) -> monitors.Monitor:
     traces.calls(MODEL, failed=20, total=20)
-    monitor = make(db)
+    monitor = make(db, **fields)
     monitors.evaluate(db, monitor, NOW)
     assert monitors.get_state(db, monitor.id).state == FIRING
-    # Saying what is already so is no change.
-    monitors.update_monitor(db, monitor.id, {"threshold": 0.2, "name": "watch"})
-    assert monitors.get_state(db, monitor.id).state == FIRING
-    changed = monitors.update_monitor(db, monitor.id, {"threshold": 0.3, "name": "renamed"})
-    assert changed.name == "renamed"
+    return monitor
+
+
+def test_a_no_op_or_a_rename_or_a_cooldown_keeps_the_state(db: Store, traces: Traces) -> None:
+    monitor = firing(db, traces)
+    before = monitors.get_state(db, monitor.id)
+    monitors.update_monitor(db, monitor.id, {"threshold": 0.2, "name": "watch", "service": None})
+    assert monitors.get_state(db, monitor.id) == before
+    renamed = monitors.update_monitor(db, monitor.id, {"name": "renamed"})
+    assert renamed.name == "renamed"
+    assert monitors.get_state(db, monitor.id) == before
+    cooled = monitors.update_monitor(db, monitor.id, {"cooldown_minutes": 5})
+    assert cooled.cooldown_minutes == 5
+    assert monitors.get_state(db, monitor.id) == before
+    assert [a.kind for a in alerts(db)] == ["firing"]
+    # The state carries on under the new name, with no second alert.
+    state = monitors.evaluate(db, cooled, NOW + 1)
+    assert state is not None
+    assert state.state == FIRING
+    assert len(alerts(db)) == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"metric": monitors.TOOL_ERROR_RATE},
+        {"metric": monitors.SCORE_MEAN, "score_name": "q"},
+        {"service": "other"},
+        {"window_minutes": 20},
+        {"comparison": "below"},
+        {"threshold": 0.3},
+        {"min_samples": 2},
+        {"enabled": False},
+    ],
+)
+def test_a_rule_change_while_firing_writes_one_resolved_alert(
+    db: Store, traces: Traces, change: dict[str, Any]
+) -> None:
+    monitor = firing(db, traces)
+    monitors.update_monitor(db, monitor.id, change, now_ns=NOW + 1)
     assert monitors.get_state(db, monitor.id) == monitors.MonitorState(monitor.id)
-    monitors.evaluate(db, changed, NOW + 1)
+    fired, resolved = alerts(db)
+    assert fired.reason is None
+    assert (resolved.kind, resolved.reason, resolved.value) == ("resolved", "changed", None)
+    assert (resolved.bound, resolved.samples, resolved.created_ns) == (None, 0, NOW + 1)
+    # It describes the rule that was firing.
+    assert (resolved.metric, resolved.threshold) == (monitor.metric, monitor.threshold)
+
+
+def test_a_rule_change_that_also_renames_uses_the_old_name(db: Store, traces: Traces) -> None:
+    monitor = firing(db, traces)
+    changed = monitors.update_monitor(
+        db, monitor.id, {"threshold": 0.3, "name": "renamed"}, now_ns=NOW + 1
+    )
+    monitors.evaluate(db, changed, NOW + 2)
     assert [(a.kind, a.monitor_name) for a in alerts(db)] == [
         ("firing", "watch"),
+        ("resolved", "watch"),
         ("firing", "renamed"),
     ]
-    # Off and on again is also a new start.
-    off = monitors.update_monitor(db, monitor.id, {"enabled": False})
+
+
+def test_a_change_while_ok_writes_no_alert(db: Store) -> None:
+    monitor = make(db)
+    monitors.evaluate(db, monitor, NOW)
+    monitors.update_monitor(db, monitor.id, {"threshold": 0.3})
+    monitors.update_monitor(db, monitor.id, {"enabled": False})
+    monitors.update_monitor(db, monitor.id, {"enabled": True})
+    monitors.delete_monitor(db, monitor.id)
+    assert alerts(db) == []
+
+
+def test_deleting_a_firing_monitor_writes_one_resolved_alert(db: Store, traces: Traces) -> None:
+    monitor = firing(db, traces)
+    monitors.delete_monitor(db, monitor.id, now_ns=NOW + 1)
+    fired, resolved = alerts(db)
+    assert fired.kind == "firing"
+    assert (resolved.kind, resolved.reason, resolved.value) == ("resolved", "removed", None)
+    assert resolved.monitor_name == "watch"
+    assert db.query("SELECT * FROM monitor_states") == []
+    with pytest.raises(monitors.NotFound):
+        monitors.delete_monitor(db, monitor.id)
+
+
+def test_disable_then_enable_starts_again(db: Store, traces: Traces) -> None:
+    monitor = firing(db, traces)
+    monitors.update_monitor(db, monitor.id, {"enabled": False}, now_ns=NOW + 1)
     assert monitors.get_state(db, monitor.id).evaluated_ns is None
-    assert off.enabled is False
+    on = monitors.update_monitor(db, monitor.id, {"enabled": True}, now_ns=NOW + 2)
+    assert monitors.get_state(db, monitor.id).evaluated_ns is None
+    assert [a.kind for a in alerts(db)] == ["firing", "resolved"]
+    monitors.evaluate(db, on, NOW + 3)
+    assert [a.kind for a in alerts(db)] == ["firing", "resolved", "firing"]
+
+
+# --- Cooldown ----------------------------------------------------------------------------
+
+
+def alternating(db: Store, traces: Traces, **fields: Any) -> list[monitors.Alert]:
+    """A trace every other minute against a count that needs 3 in 5 minutes, for 20 minutes:
+    the count moves between 2 and 3, so it crosses the threshold at every evaluation."""
+    for minute in range(-10, 21, 2):
+        traces.add({}, start=NOW + minute * MINUTE)
+    monitor = make(
+        db, monitors.TRACE_COUNT, window_minutes=5, comparison="below", threshold=3, **fields
+    )
+    for minute in range(21):
+        monitors.evaluate(db, monitor, NOW + minute * MINUTE)
+    return alerts(db)
+
+
+def test_a_value_at_its_threshold_makes_one_alert_within_the_cooldown(
+    db: Store, traces: Traces
+) -> None:
+    assert [a.kind for a in alternating(db, traces, cooldown_minutes=60)] == ["firing"]
+
+
+def test_a_cooldown_of_zero_resolves_at_once(db: Store, traces: Traces) -> None:
+    kinds = [a.kind for a in alternating(db, traces, cooldown_minutes=0)]
+    assert kinds[:4] == ["firing", "resolved", "firing", "resolved"]
+
+
+def count_monitor(db: Store) -> monitors.Monitor:
+    """Fires above 0 traces in 5 minutes; a window without traces is on the good side."""
+    return make(
+        db, monitors.TRACE_COUNT, window_minutes=5, threshold=0, cooldown_minutes=30, name="count"
+    )
+
+
+def test_resolves_after_the_cooldown(db: Store, traces: Traces) -> None:
+    traces.add({}, start=NOW - MINUTE)
+    monitor = count_monitor(db)
+    assert_state(db, monitor, NOW, FIRING, good_since=None)
+    good = NOW + 10 * MINUTE
+    assert_state(db, monitor, good, FIRING, good_since=good)
+    assert_state(db, monitor, good + 30 * MINUTE - 1, FIRING, good_since=good)
+    assert_state(db, monitor, good + 30 * MINUTE, OK, good_since=None)
+    assert [a.kind for a in alerts(db)] == ["firing", "resolved"]
+    assert alerts(db)[1].reason is None
+    assert alerts(db)[1].value == 0.0
+
+
+def test_a_bad_evaluation_starts_the_cooldown_again(db: Store, traces: Traces) -> None:
+    traces.add({}, start=NOW - MINUTE)
+    monitor = count_monitor(db)
+    assert_state(db, monitor, NOW, FIRING, good_since=None)
+    good = NOW + 10 * MINUTE
+    assert_state(db, monitor, good, FIRING, good_since=good)
+    bad = good + 29 * MINUTE
+    traces.add({}, start=bad - MINUTE)
+    assert_state(db, monitor, bad, FIRING, good_since=None)
+    again = bad + 10 * MINUTE
+    assert_state(db, monitor, again, FIRING, good_since=again)
+    assert_state(db, monitor, again + 30 * MINUTE, OK, good_since=None)
+    assert [a.kind for a in alerts(db)] == ["firing", "resolved"]
+
+
+def assert_state(
+    db: Store, monitor: monitors.Monitor, now: int, state: str, *, good_since: int | None
+) -> None:
+    result = monitors.evaluate(db, monitor, now)
+    assert result is not None
+    assert (result.state, result.good_since_ns) == (state, good_since)
+
+
+def test_a_rate_recovers_by_the_point_value_after_the_cooldown(db: Store, traces: Traces) -> None:
+    monitor = firing(db, traces, cooldown_minutes=30)
+    # One failure in two: the lower bound is under the threshold but the point value is not.
+    bad = NOW + 11 * MINUTE
+    traces.calls(MODEL, failed=1, total=2, start=bad - MINUTE)
+    assert_state(db, monitor, bad, FIRING, good_since=None)
+    # Back on the good side, by the point value alone.
+    good = bad + 11 * MINUTE
+    traces.calls(MODEL, failed=1, total=5, start=good - MINUTE)
+    assert_state(db, monitor, good, FIRING, good_since=good)
+    last = good + 30 * MINUTE
+    traces.calls(MODEL, failed=0, total=5, start=last - MINUTE)
+    assert_state(db, monitor, last, OK, good_since=None)
+
+
+def test_insufficient_samples_neither_clear_nor_advance_the_cooldown(
+    db: Store, traces: Traces
+) -> None:
+    monitor = firing(db, traces, cooldown_minutes=30, min_samples=3)
+    start = NOW + 11 * MINUTE
+    traces.calls(MODEL, failed=0, total=5, start=start - MINUTE)
+    assert_state(db, monitor, start, FIRING, good_since=start)
+    # Eight good minutes build up, with the same calls in the window.
+    built = start + 8 * MINUTE
+    assert_state(db, monitor, built, FIRING, good_since=start)
+    # Two hours of silence: not resolved, and no closer to it. The eight minutes are still there.
+    for hours in (1, 2):
+        at = built + hours * 60 * MINUTE
+        result = monitors.evaluate(db, monitor, at)
+        assert result is not None
+        assert (result.state, result.insufficient) == (FIRING, True)
+        assert result.good_since_ns == at - 8 * MINUTE
+    silent_end = built + 120 * MINUTE
+    # Calls return, and time counts again from the last silent evaluation: 8 + 21 is still short
+    # of the cooldown, and 8 + 22 reaches it.
+    back = silent_end + 21 * MINUTE
+    traces.calls(MODEL, failed=0, total=5, start=back - MINUTE)
+    assert_state(db, monitor, back, FIRING, good_since=silent_end - 8 * MINUTE)
+    done = silent_end + 22 * MINUTE
+    assert_state(db, monitor, done, OK, good_since=None)
+    assert [a.kind for a in alerts(db)] == ["firing", "resolved"]
+
+
+def test_a_rate_does_not_resolve_from_silence(db: Store, traces: Traces) -> None:
+    monitor = firing(db, traces, cooldown_minutes=0)
+    state = monitors.evaluate(db, monitor, NOW + 1000 * MINUTE)
+    assert state is not None
+    assert (state.state, state.insufficient) == (FIRING, True)
+    assert [a.kind for a in alerts(db)] == ["firing"]
 
 
 def test_a_result_read_before_a_change_is_discarded(db: Store) -> None:
@@ -424,10 +642,22 @@ def test_runner_starts_and_stops(db: Store) -> None:
         ({"window_minutes": 1.5}, "window_minutes"),
         ({"min_samples": 0}, "min_samples"),
         ({"min_samples": 100_001}, "min_samples"),
+        ({"cooldown_minutes": -1}, "cooldown_minutes"),
+        ({"cooldown_minutes": 43201}, "cooldown_minutes"),
+        ({"cooldown_minutes": 1.5}, "cooldown_minutes"),
+        ({"threshold": 5}, "0.05 means 5%"),
+        ({"threshold": -0.1}, "0.05 means 5%"),
+        ({"metric": monitors.TOOL_ERROR_RATE, "threshold": 1.01}, "0.05 means 5%"),
         ({"comparison": "equal"}, "comparison must be"),
         ({"enabled": "yes"}, "enabled"),
         ({"name": ""}, "name is required"),
         ({"name": "x" * 201}, "longer than"),
+        ({"name": "two\nlines"}, "control or formatting"),
+        ({"name": "trailing\n"}, "control or formatting"),
+        ({"name": "bell\x07"}, "control or formatting"),
+        ({"name": "evil\u202egnp.exe"}, "control or formatting"),
+        ({"name": "zero\u200bwidth"}, "control or formatting"),
+        ({"name": "line\u2028separator"}, "control or formatting"),
         ({"service": 3}, "service"),
         ({"id": "chosen"}, "unknown field"),
         ({"webhook": "https://example.com"}, "unknown field"),
@@ -436,6 +666,22 @@ def test_runner_starts_and_stops(db: Store) -> None:
 def test_validation_refusals(db: Store, fields: dict[str, Any], message: str) -> None:
     with pytest.raises(monitors.MonitorError, match=message):
         make(db, **fields)
+
+
+def test_a_threshold_outside_0_to_1_is_fine_except_on_error_rates(db: Store) -> None:
+    assert make(db, monitors.COST_USD, threshold=50, name="cost").threshold == 50.0
+    assert make(db, threshold=1, name="edge").threshold == 1.0
+    assert make(db, threshold=0, name="zero").threshold == 0.0
+    cost = make(db, monitors.COST_USD, threshold=50, name="switch")
+    with pytest.raises(monitors.MonitorError, match=r"0\.05 means 5%"):
+        monitors.update_monitor(db, cost.id, {"metric": monitors.MODEL_ERROR_RATE})
+
+
+def test_a_bad_name_is_refused_on_update(db: Store) -> None:
+    monitor = make(db)
+    with pytest.raises(monitors.MonitorError, match="control or formatting"):
+        monitors.update_monitor(db, monitor.id, {"name": "a\u202eb"})
+    assert monitors.get_monitor(db, monitor.id).name == "watch"
 
 
 def test_a_request_must_be_an_object(db: Store) -> None:
@@ -466,10 +712,36 @@ def test_defaults_and_score_name_only_for_the_score_metric(db: Store) -> None:
         },
     )
     assert monitor.min_samples == 10
+    assert monitor.cooldown_minutes == 60
     assert monitor.enabled
     assert monitor.score_name is None
     assert monitor.service is None
     assert monitor.threshold == 1.0
+
+
+@pytest.mark.parametrize(
+    ("metric", "minimum"),
+    [
+        (monitors.MODEL_ERROR_RATE, 3),
+        (monitors.TOOL_ERROR_RATE, 3),
+        (monitors.COST_USD, 10),
+        (monitors.MODEL_P95_MS, 10),
+        (monitors.TRACE_COUNT, 10),
+        (monitors.SCORE_MEAN, 10),
+    ],
+)
+def test_default_min_samples_per_metric(db: Store, metric: str, minimum: int) -> None:
+    body = {
+        "name": "n",
+        "metric": metric,
+        "score_name": "q",
+        "window_minutes": 1,
+        "comparison": "above",
+        "threshold": 0.5,
+    }
+    assert monitors.create_monitor(db, body).min_samples == minimum
+    given = monitors.create_monitor(db, body | {"name": "given", "min_samples": 7})
+    assert given.min_samples == 7
 
 
 # --- API ---------------------------------------------------------------------------------
@@ -502,6 +774,7 @@ def test_api_crud(client: TestClient, db: Store, traces: Traces) -> None:
         "evaluated_ns": None,
         "since_ns": None,
         "insufficient": False,
+        "good_since_ns": None,
     }
     path = f"/api/monitors/{monitor['id']}"
     assert client.get(path).json()["monitor"] == monitor
@@ -525,7 +798,12 @@ def test_api_crud(client: TestClient, db: Store, traces: Traces) -> None:
     assert client.patch(path, json={"threshold": "x"}).status_code == 400
     assert client.patch("/api/monitors/none", json={}).status_code == 404
 
+    # Back to firing: deleting says so through the API too.
+    MonitorRunner(db, clock=lambda: NOW).run_once()
+    assert client.get(path).json()["monitor"]["state"]["state"] == "FIRING"
     assert client.delete(path).status_code == 204
+    latest = client.get("/api/alerts").json()["alerts"][0]
+    assert (latest["kind"], latest["reason"], latest["value"]) == ("resolved", "removed", None)
     assert client.get(path).status_code == 404
     assert client.delete(path).status_code == 404
 
@@ -563,6 +841,7 @@ def test_alerts_order_and_delivery(client: TestClient, db: Store, traces: Traces
         "window_minutes",
         "created_ns",
         "delivered_ns",
+        "reason",
     }
     oldest = client.get("/api/alerts?undelivered=1").json()["alerts"]
     assert [a["kind"] for a in oldest] == ["firing", "resolved"]

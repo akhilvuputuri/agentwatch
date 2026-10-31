@@ -35,17 +35,21 @@ function figure(metric: MonitorMetric, value: number | null, rate: boolean): str
 
 const isErrorRate = (metric: MonitorMetric) => metric === "model_error_rate" || metric === "tool_error_rate";
 
-/** Monitors over recent metrics, and the alerts they raised. */
 function windowText(minutes: number): string {
   if (minutes % 1440 === 0) return minutes === 1440 ? "24 hours" : `${minutes / 1440} days`;
   if (minutes % 60 === 0) return minutes === 60 ? "1 hour" : `${minutes / 60} hours`;
   return `${minutes} min`;
 }
 
+const usesMinSamples = (metric: MonitorMetric) => metric !== "cost_usd" && metric !== "trace_count";
+
+/** Monitors over recent metrics, and the alerts they raised. */
 export function Alerts() {
   const [monitors, setMonitors] = useState<Monitor[] | null>(null);
   const [alerts, setAlerts] = useState<Alert[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // Apart, so a refresh that works clears a failed refresh but not what a person needs to fix.
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -54,10 +58,10 @@ export function Alerts() {
         ([foundMonitors, foundAlerts]) => {
           setMonitors(foundMonitors);
           setAlerts(foundAlerts);
-          setError(null);
+          setLoadError(null);
         },
         (reason: unknown) => {
-          if (!controller.signal.aborted) setError(String(reason));
+          if (!controller.signal.aborted) setLoadError(String(reason));
         },
       );
     void load();
@@ -70,17 +74,30 @@ export function Alerts() {
   }, []);
 
   const toggle = (monitor: Monitor) => {
+    if (
+      monitor.enabled &&
+      monitor.state.state === "FIRING" &&
+      !window.confirm(`Disable "${monitor.name}"? It is firing, so a resolved alert is sent.`)
+    )
+      return;
     updateMonitor(monitor.id, { enabled: !monitor.enabled }).then(
-      (updated) => setMonitors((current) => (current ?? []).map((m) => (m.id === updated.id ? updated : m))),
-      (reason: unknown) => setError(String(reason)),
+      (updated) => {
+        setMonitors((current) => (current ?? []).map((m) => (m.id === updated.id ? updated : m)));
+        setActionError(null);
+      },
+      (reason: unknown) => setActionError(String(reason)),
     );
   };
 
   const remove = (monitor: Monitor) => {
-    if (!window.confirm(`Delete the monitor "${monitor.name}"? The alerts it raised stay.`)) return;
+    const firing = monitor.state.state === "FIRING" ? " It is firing, so a resolved alert is sent." : "";
+    if (!window.confirm(`Delete the monitor "${monitor.name}"? The alerts it raised stay.${firing}`)) return;
     deleteMonitor(monitor.id).then(
-      () => setMonitors((current) => (current ?? []).filter((m) => m.id !== monitor.id)),
-      (reason: unknown) => setError(String(reason)),
+      () => {
+        setMonitors((current) => (current ?? []).filter((m) => m.id !== monitor.id));
+        setActionError(null);
+      },
+      (reason: unknown) => setActionError(String(reason)),
     );
   };
 
@@ -90,16 +107,19 @@ export function Alerts() {
       <p className="muted small">
         A monitor compares a metric over a trailing window with a threshold, every minute. Rates fire only when the
         statistical bound (95% Wilson) clears the threshold, not on the value alone, so a few unlucky calls cannot set
-        one off; they resolve once the value is back on the good side. A client collects alerts by polling the API:
-        agentwatch sends nothing itself.
+        one off. A firing monitor resolves once its value has stayed on the good side for its cooldown; evaluations with
+        too few samples do not count toward that. A client collects alerts by polling the API: agentwatch sends nothing
+        itself.
       </p>
-      {error && <p className="error">{error}</p>}
+      {loadError && <p className="error">{loadError}</p>}
+      {actionError && <p className="error">{actionError}</p>}
       <MonitorForm
         onAdded={(monitor) => {
           setMonitors((current) => [...(current ?? []), monitor]);
-          setError(null);
+          setActionError(null);
         }}
-        onError={setError}
+        onError={setActionError}
+        onEdit={() => setActionError(null)}
       />
       {monitors && monitors.length === 0 && <p className="empty">No monitors yet.</p>}
       {monitors && monitors.length > 0 && (
@@ -151,6 +171,7 @@ export function Alerts() {
                     </td>
                     <td>
                       <span className={`badge ${a.kind === "firing" ? "bad" : "ok"}`}>{a.kind}</span>
+                      {a.reason && <div className="muted small">monitor {a.reason}</div>}
                     </td>
                     <td className="num">{figure(a.metric, a.value, rate)}</td>
                     <td>
@@ -193,7 +214,8 @@ function MonitorRow({
         {monitor.comparison} {figure(monitor.metric, monitor.threshold, rate)}
         <div className="muted small">
           over {windowText(monitor.window_minutes)}
-          {monitor.metric === "cost_usd" || monitor.metric === "trace_count" ? "" : ` · at least ${count(monitor.min_samples)} samples`}
+          {usesMinSamples(monitor.metric) ? ` · at least ${count(monitor.min_samples)} samples` : ""}
+          {monitor.cooldown_minutes === 0 ? " · no cooldown" : ` · cooldown ${windowText(monitor.cooldown_minutes)}`}
         </div>
       </td>
       <td>
@@ -203,6 +225,9 @@ function MonitorRow({
           <span className="badge neutral">off</span>
         )}
         {monitor.enabled && s.insufficient && <div className="muted small">too few samples</div>}
+        {monitor.enabled && s.state === "FIRING" && s.good_since_ns !== null && (
+          <div className="muted small">recovering since {timestamp(s.good_since_ns)}</div>
+        )}
       </td>
       <td className="num">{figure(monitor.metric, s.value, rate)}</td>
       <td className="num">{s.bound === null ? "–" : figure(monitor.metric, s.bound, true)}</td>
@@ -219,14 +244,24 @@ function MonitorRow({
   );
 }
 
-function MonitorForm({ onAdded, onError }: { onAdded: (monitor: Monitor) => void; onError: (message: string) => void }) {
+function MonitorForm({
+  onAdded,
+  onError,
+  onEdit,
+}: {
+  onAdded: (monitor: Monitor) => void;
+  onError: (message: string) => void;
+  onEdit: () => void;
+}) {
   const [name, setName] = useState("");
   const [metric, setMetric] = useState<MonitorMetric>("model_error_rate");
   const [scoreName, setScoreName] = useState("");
   const [windowMinutes, setWindowMinutes] = useState("60");
   const [comparison, setComparison] = useState<NewMonitor["comparison"]>("above");
   const [threshold, setThreshold] = useState("");
-  const [minSamples, setMinSamples] = useState("10");
+  // Blank takes the server's default for the metric.
+  const [minSamples, setMinSamples] = useState("");
+  const [cooldown, setCooldown] = useState("60");
   const [service, setService] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -235,9 +270,11 @@ function MonitorForm({ onAdded, onError }: { onAdded: (monitor: Monitor) => void
     const minutes = Number(windowMinutes);
     const limit = Number(threshold);
     const samples = Number(minSamples);
+    const cooldownMinutes = Number(cooldown);
     if (!Number.isInteger(minutes) || minutes < 1) return onError("The window must be a whole number of minutes.");
     if (threshold.trim() === "" || !Number.isFinite(limit)) return onError("The threshold must be a number.");
-    if (!Number.isInteger(samples) || samples < 1) return onError("Min samples must be a whole number of at least 1.");
+    if (minSamples.trim() !== "" && (!Number.isInteger(samples) || samples < 1)) return onError("Min samples must be a whole number of at least 1.");
+    if (cooldown.trim() === "" || !Number.isInteger(cooldownMinutes) || cooldownMinutes < 0) return onError("The cooldown must be a whole number of minutes, or 0.");
     setSaving(true);
     createMonitor({
       name: name.trim(),
@@ -247,7 +284,8 @@ function MonitorForm({ onAdded, onError }: { onAdded: (monitor: Monitor) => void
       window_minutes: minutes,
       comparison,
       threshold: limit,
-      min_samples: samples,
+      cooldown_minutes: cooldownMinutes,
+      ...(minSamples.trim() === "" || !usesMinSamples(metric) ? {} : { min_samples: samples }),
     }).then(
       (monitor) => {
         setSaving(false);
@@ -262,7 +300,7 @@ function MonitorForm({ onAdded, onError }: { onAdded: (monitor: Monitor) => void
   };
 
   return (
-    <form className="score-form" onSubmit={submit} aria-label="Add monitor">
+    <form className="score-form" onSubmit={submit} onChange={onEdit} aria-label="Add monitor">
       <label>
         Name <input value={name} onChange={(e) => setName(e.target.value)} placeholder="model errors" required maxLength={200} />
       </label>
@@ -294,11 +332,14 @@ function MonitorForm({ onAdded, onError }: { onAdded: (monitor: Monitor) => void
       <label>
         Threshold{isErrorRate(metric) ? " (0.2 is 20%)" : ""} <input value={threshold} onChange={(e) => setThreshold(e.target.value)} inputMode="decimal" size={8} required />
       </label>
-      {metric !== "cost_usd" && metric !== "trace_count" && (
+      {usesMinSamples(metric) && (
         <label>
-          Min samples <input value={minSamples} onChange={(e) => setMinSamples(e.target.value)} inputMode="numeric" size={6} />
+          Min samples <input value={minSamples} onChange={(e) => setMinSamples(e.target.value)} inputMode="numeric" size={6} placeholder={isErrorRate(metric) ? "3" : "10"} />
         </label>
       )}
+      <label>
+        Cooldown (minutes) <input value={cooldown} onChange={(e) => setCooldown(e.target.value)} inputMode="numeric" size={6} />
+      </label>
       <label>
         Service <input value={service} onChange={(e) => setService(e.target.value)} placeholder="all" size={12} />
       </label>

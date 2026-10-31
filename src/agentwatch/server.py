@@ -818,7 +818,7 @@ async def _monitor_call(work: Callable[[], Any], *, status: int = 200) -> Respon
 def _state_json(state: monitors.MonitorState) -> dict[str, Any]:
     data = asdict(state)
     del data["monitor_id"]
-    for key in ("evaluated_ns", "since_ns"):
+    for key in ("evaluated_ns", "since_ns", "good_since_ns"):
         data[key] = None if data[key] is None else str(data[key])
     return data
 

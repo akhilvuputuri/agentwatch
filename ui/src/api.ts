@@ -640,6 +640,8 @@ export interface MonitorState {
   since_ns: string | null;
   /** The last evaluation had too few samples to compare, so the state stayed as it was. */
   insufficient: boolean;
+  /** While firing: since when the value has been on the good side. */
+  good_since_ns: string | null;
 }
 
 export interface Monitor {
@@ -652,12 +654,14 @@ export interface Monitor {
   comparison: "above" | "below";
   threshold: number;
   min_samples: number;
+  cooldown_minutes: number;
   enabled: boolean;
   created_ns: string;
   state: MonitorState;
 }
 
-export type NewMonitor = Pick<Monitor, "name" | "metric" | "score_name" | "service" | "window_minutes" | "comparison" | "threshold" | "min_samples">;
+export type NewMonitor = Pick<Monitor, "name" | "metric" | "score_name" | "service" | "window_minutes" | "comparison" | "threshold" | "cooldown_minutes"> &
+  Partial<Pick<Monitor, "min_samples">>;
 
 export interface Alert {
   id: string;
@@ -667,12 +671,14 @@ export interface Alert {
   metric: MonitorMetric;
   comparison: "above" | "below";
   threshold: number;
-  value: number;
+  /** Null when an edit, not the metric, resolved it. */
+  value: number | null;
   bound: number | null;
   samples: number;
   window_minutes: number;
   created_ns: string;
   delivered_ns: string | null;
+  reason: "changed" | "removed" | null;
 }
 
 export async function listMonitors(signal?: AbortSignal): Promise<Monitor[]> {

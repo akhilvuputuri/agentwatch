@@ -132,7 +132,8 @@ A monitor watches a metric over a trailing window: model or tool error rate, cos
 latency, trace count, or the mean of a score. Add one on the Alerts page or with
 `POST /api/monitors`. Each one is evaluated every minute, and an alert is recorded when it starts
 firing and when it resolves. Error rates fire only when a 95% statistical bound clears the
-threshold, so a few unlucky calls cannot set one off. agentwatch sends nothing itself: a client
+threshold, so a few unlucky calls cannot set one off, and a firing monitor resolves only after its
+value has stayed good for a cooldown (60 minutes by default). agentwatch sends nothing itself: a client
 polls `GET /api/alerts?undelivered=1` and confirms each alert with
 `POST /api/alerts/<id>/delivered`. See [the design notes](docs/design.md#monitors-and-alerts).
 

@@ -7,8 +7,11 @@ not repeat itself and an alert is never lost from a move that happened.
 A rate from few calls says little: one failure in three calls is a 33% error rate, and means
 almost nothing. So a rate fires on a Wilson 95% bound, not on its point value: an "above" monitor
 when the lower bound exceeds the threshold, a "below" monitor when the upper bound is under it.
-It recovers once the point value is back on the good side of the threshold, so a monitor does
-not flap around the bound or wait for a bound to clear. Everything else compares its point value.
+Everything else compares its point value.
+
+A firing monitor resolves only once its point value has stayed on the good side of the threshold
+for a cooldown, with no bound to clear. Without one, a value that sits at the threshold (a trace
+count that moves between 2 and 3 at a threshold of 3) would write an alert every other minute.
 
 Alerts carry only names and numbers. Delivery is a client polling for undelivered alerts, so
 agentwatch stores no URL or secret and calls nothing.
@@ -20,6 +23,7 @@ import logging
 import math
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -50,11 +54,23 @@ FIRING = "FIRING"
 # Kinds of alert.
 FIRED = "firing"
 RESOLVED = "resolved"
+# Why a resolved alert came from an edit, not from the metric. It then has no value.
+CHANGED = "changed"
+REMOVED = "removed"
 
 MINUTE_NS = 60 * 1_000_000_000
 MAX_WINDOW_MINUTES = 30 * 24 * 60
 MAX_MIN_SAMPLES = 100_000
 MAX_NAME = 200
+# Error rates are proportions. The Wilson bound already guards them at low volume, so they need
+# fewer samples by default than a metric compared by its point value.
+ERROR_RATES = (MODEL_ERROR_RATE, TOOL_ERROR_RATE)
+RATE_MIN_SAMPLES = 3
+DEFAULT_MIN_SAMPLES = 10
+DEFAULT_COOLDOWN_MINUTES = 60
+# Controls, format and bidi characters, and line breaks: a name is shown wherever an alert is
+# delivered, and must not be able to fake a new line or reorder what is around it.
+_REFUSED_IN_NAME = ("Cc", "Cf", "Cs", "Zl", "Zp")
 
 
 class MonitorError(ValueError):
@@ -82,6 +98,8 @@ class Monitor:
     comparison: str
     threshold: float
     min_samples: int
+    # How long the value must stay on the good side before a firing monitor resolves.
+    cooldown_minutes: int
     enabled: bool
     created_ns: int
 
@@ -100,6 +118,8 @@ class MonitorState:
     since_ns: int | None = None
     # The last evaluation had too few samples to compare, so the state stayed as it was.
     insufficient: bool = False
+    # While firing: since when the value has been on the good side. Any bad evaluation clears it.
+    good_since_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,12 +132,15 @@ class Alert:
     metric: str
     comparison: str
     threshold: float
-    value: float
+    # None when an edit, not the metric, resolved it.
+    value: float | None
     bound: float | None
     samples: int
     window_minutes: int
     created_ns: int
     delivered_ns: int | None
+    # CHANGED or REMOVED when an edit resolved it; otherwise None.
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,15 +157,30 @@ class Reading:
 
 _COLUMNS = (
     "id, name, metric, score_name, service, window_minutes, comparison, threshold, min_samples, "
-    "enabled, created_ns"
+    "cooldown_minutes, enabled, created_ns"
 )
-_STATE_COLUMNS = "monitor_id, state, value, bound, samples, evaluated_ns, since_ns, insufficient"
+_STATE_COLUMNS = (
+    "monitor_id, state, value, bound, samples, evaluated_ns, since_ns, insufficient, good_since_ns"
+)
 _ALERT_COLUMNS = (
     "id, monitor_id, monitor_name, kind, metric, comparison, threshold, value, bound, samples, "
-    "window_minutes, created_ns, delivered_ns"
+    "window_minutes, created_ns, delivered_ns, reason"
 )
 _FIELDS = (
     "name",
+    "metric",
+    "score_name",
+    "service",
+    "window_minutes",
+    "comparison",
+    "threshold",
+    "min_samples",
+    "cooldown_minutes",
+    "enabled",
+)
+# What the state's meaning depends on: a change to any of these starts the monitor again. A name
+# or a cooldown changes nothing about what was measured.
+_RULE_FIELDS = (
     "metric",
     "score_name",
     "service",
@@ -159,13 +197,19 @@ _FIELDS = (
 
 def create_monitor(store: Store, body: Any, *, now_ns: int | None = None) -> Monitor:
     data = _known(body)
-    defaults: dict[str, Any] = {"min_samples": 10, "enabled": True}
+    defaults: dict[str, Any] = {
+        "min_samples": (
+            RATE_MIN_SAMPLES if data.get("metric") in ERROR_RATES else DEFAULT_MIN_SAMPLES
+        ),
+        "cooldown_minutes": DEFAULT_COOLDOWN_MINUTES,
+        "enabled": True,
+    }
     created = time.time_ns() if now_ns is None else now_ns
     monitor = _validated(defaults | data, monitor_id=uuid.uuid4().hex, created_ns=created)
     with store.transaction() as db:
         _check_name_free(db, monitor.name)
         db.execute(
-            f"INSERT INTO monitors ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO monitors ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 monitor.id,
                 monitor.name,
@@ -176,6 +220,7 @@ def create_monitor(store: Store, body: Any, *, now_ns: int | None = None) -> Mon
                 monitor.comparison,
                 monitor.threshold,
                 monitor.min_samples,
+                monitor.cooldown_minutes,
                 monitor.enabled,
                 monitor.created_ns,
             ],
@@ -183,9 +228,12 @@ def create_monitor(store: Store, body: Any, *, now_ns: int | None = None) -> Mon
     return monitor
 
 
-def update_monitor(store: Store, monitor_id: str, body: Any) -> Monitor:
-    """Applies the fields given. Any real change sends the monitor back to OK, to re-evaluate:
-    its state described the old rule, or a time when it was switched off."""
+def update_monitor(
+    store: Store, monitor_id: str, body: Any, *, now_ns: int | None = None
+) -> Monitor:
+    """Applies the fields given. A change to the rule, or switching the monitor on or off, sends
+    it back to OK to re-evaluate, since its state described the old rule or a time it was off. If
+    it was firing, that first writes a resolved alert, so its last word is not "still firing"."""
     data = _known(body)
     with store.transaction() as db:
         current = _get(db, monitor_id)
@@ -199,7 +247,8 @@ def update_monitor(store: Store, monitor_id: str, body: Any) -> Monitor:
             db.execute("UPDATE monitors SET name = ? WHERE id = ?", [monitor.name, monitor.id])
         db.execute(
             "UPDATE monitors SET metric = ?, score_name = ?, service = ?, window_minutes = ?, "
-            "comparison = ?, threshold = ?, min_samples = ?, enabled = ? WHERE id = ?",
+            "comparison = ?, threshold = ?, min_samples = ?, cooldown_minutes = ?, enabled = ? "
+            "WHERE id = ?",
             [
                 monitor.metric,
                 monitor.score_name,
@@ -208,22 +257,33 @@ def update_monitor(store: Store, monitor_id: str, body: Any) -> Monitor:
                 monitor.comparison,
                 monitor.threshold,
                 monitor.min_samples,
+                monitor.cooldown_minutes,
                 monitor.enabled,
                 monitor.id,
             ],
         )
-        db.execute("DELETE FROM monitor_states WHERE monitor_id = ?", [monitor.id])
+        if any(getattr(monitor, f) != getattr(current, f) for f in _RULE_FIELDS):
+            # The alert describes the rule that was firing, under the name it was firing as.
+            _end_state(db, current, CHANGED, time.time_ns() if now_ns is None else now_ns)
     return monitor
 
 
-def delete_monitor(store: Store, monitor_id: str) -> None:
-    """Deletes the monitor and its state; the alerts it raised stay."""
+def delete_monitor(store: Store, monitor_id: str, *, now_ns: int | None = None) -> None:
+    """Deletes the monitor and its state, after a resolved alert if it was firing. Its alerts
+    stay."""
     with store.transaction() as db:
-        if not db.execute(
-            "DELETE FROM monitors WHERE id = ? RETURNING id", [monitor_id]
-        ).fetchone():
-            raise NotFound("monitor not found")
-        db.execute("DELETE FROM monitor_states WHERE monitor_id = ?", [monitor_id])
+        current = _get(db, monitor_id)
+        db.execute("DELETE FROM monitors WHERE id = ?", [monitor_id])
+        _end_state(db, current, REMOVED, time.time_ns() if now_ns is None else now_ns)
+
+
+def _end_state(db: duckdb.DuckDBPyConnection, monitor: Monitor, reason: str, now_ns: int) -> None:
+    firing = db.execute(
+        "SELECT 1 FROM monitor_states WHERE monitor_id = ? AND state = ?", [monitor.id, FIRING]
+    ).fetchone()
+    if firing:
+        _write_alert(db, monitor, RESOLVED, now_ns, reason=reason)
+    db.execute("DELETE FROM monitor_states WHERE monitor_id = ?", [monitor.id])
 
 
 def list_monitors(store: Store) -> list[Monitor]:
@@ -281,7 +341,7 @@ def _known(body: Any) -> dict[str, Any]:
 
 def _validated(fields: dict[str, Any], *, monitor_id: str, created_ns: int) -> Monitor:
     """A monitor from untrusted field values, or MonitorError naming the first bad one."""
-    name = _text(fields.get("name"), "name")
+    name = _name(fields.get("name"))
     metric = fields.get("metric")
     if metric not in METRICS:
         raise MonitorError(f"metric must be one of {', '.join(METRICS)}")
@@ -305,14 +365,17 @@ def _validated(fields: dict[str, Any], *, monitor_id: str, created_ns: int) -> M
         service=None if service in (None, "") else _text(service, "service"),
         window_minutes=_whole(fields.get("window_minutes"), MAX_WINDOW_MINUTES, "window_minutes"),
         comparison=comparison,
-        threshold=_threshold(fields.get("threshold")),
+        threshold=_threshold(fields.get("threshold"), metric),
         min_samples=_whole(fields.get("min_samples"), MAX_MIN_SAMPLES, "min_samples"),
+        cooldown_minutes=_whole(
+            fields.get("cooldown_minutes"), MAX_WINDOW_MINUTES, "cooldown_minutes", minimum=0
+        ),
         enabled=enabled,
         created_ns=created_ns,
     )
 
 
-def _threshold(value: Any) -> float:
+def _threshold(value: Any, metric: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise MonitorError("threshold must be a finite number")
     try:
@@ -321,13 +384,24 @@ def _threshold(value: Any) -> float:
         raise MonitorError("threshold must be a finite number") from error
     if not math.isfinite(number):
         raise MonitorError("threshold must be a finite number")
+    if metric in ERROR_RATES and not 0 <= number <= 1:
+        raise MonitorError("an error rate's threshold must be from 0 to 1: 0.05 means 5%")
     return number
 
 
-def _whole(value: Any, maximum: int, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
-        raise MonitorError(f"{field} must be a whole number from 1 to {maximum}")
+def _whole(value: Any, maximum: int, field: str, *, minimum: int = 1) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise MonitorError(f"{field} must be a whole number from {minimum} to {maximum}")
     return value
+
+
+def _name(value: Any) -> str:
+    # Checked before _text strips the ends, so a trailing newline is refused, not tidied away.
+    if isinstance(value, str) and any(
+        unicodedata.category(character) in _REFUSED_IN_NAME for character in value
+    ):
+        raise MonitorError("name must not contain control or formatting characters")
+    return _text(value, "name")
 
 
 def _text(value: Any, field: str) -> str:
@@ -394,12 +468,24 @@ def _rate(monitor: Monitor, successes: int, total: int) -> Reading:
     return Reading(successes / total, total, bound)
 
 
-def next_state(monitor: Monitor, reading: Reading, state: str) -> str:
-    """Firing needs the bound (for a rate) past the threshold; recovery only the point value."""
+def next_state(
+    monitor: Monitor, reading: Reading, state: str, good_since: int | None, now_ns: int
+) -> tuple[str, int | None]:
+    """The state after a comparable reading, and since when a firing monitor has been good.
+
+    Firing needs the bound (for a rate) past the threshold. Recovery looks only at the point
+    value, which must stay on the good side for the cooldown; one bad reading starts it again.
+    """
     assert reading.value is not None
-    if state == FIRING or reading.bound is None:
-        return FIRING if _past(monitor, reading.value) else OK
-    return FIRING if _past(monitor, reading.bound) else OK
+    if state == OK:
+        compared = reading.value if reading.bound is None else reading.bound
+        return (FIRING if _past(monitor, compared) else OK), None
+    if _past(monitor, reading.value):
+        return FIRING, None
+    good_since = now_ns if good_since is None else good_since
+    if now_ns - good_since >= monitor.cooldown_minutes * MINUTE_NS:
+        return OK, None
+    return FIRING, good_since
 
 
 def _past(monitor: Monitor, value: float) -> bool:
@@ -421,17 +507,35 @@ def evaluate(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None
         if row is None or Monitor(*row) != monitor:
             return None  # deleted or changed during the read, which no longer applies
         stored = db.execute(
-            "SELECT state, since_ns FROM monitor_states WHERE monitor_id = ?", [monitor.id]
+            "SELECT state, since_ns, good_since_ns, evaluated_ns FROM monitor_states "
+            "WHERE monitor_id = ?",
+            [monitor.id],
         ).fetchone()
         state: str = OK if stored is None else stored[0]
         since: int = now_ns if stored is None else stored[1]
+        good_since: int | None = None if stored is None else stored[2]
         insufficient = reading.value is None or (
             reading.needs_samples and reading.samples < monitor.min_samples
         )
-        following = state if insufficient else next_state(monitor, reading, state)
+        if insufficient:
+            # No evidence either way: moved forward by the time passed, so the good time built
+            # up is kept but silence adds none, and a rate cannot resolve because calls stopped.
+            following = state
+            if stored is not None and good_since is not None:
+                good_since += max(0, now_ns - stored[3])
+        else:
+            following, good_since = next_state(monitor, reading, state, good_since, now_ns)
         if following != state:
             since = now_ns
-            _write_alert(db, monitor, reading, following, now_ns)
+            _write_alert(
+                db,
+                monitor,
+                FIRED if following == FIRING else RESOLVED,
+                now_ns,
+                value=reading.value,
+                bound=reading.bound,
+                samples=reading.samples,
+            )
         result = MonitorState(
             monitor_id=monitor.id,
             state=following,
@@ -441,10 +545,11 @@ def evaluate(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None
             evaluated_ns=now_ns,
             since_ns=since,
             insufficient=insufficient,
+            good_since_ns=good_since,
         )
         db.execute(
             f"INSERT OR REPLACE INTO monitor_states ({_STATE_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 result.monitor_id,
                 result.state,
@@ -454,29 +559,40 @@ def evaluate(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None
                 result.evaluated_ns,
                 result.since_ns,
                 result.insufficient,
+                result.good_since_ns,
             ],
         )
     return result
 
 
 def _write_alert(
-    db: duckdb.DuckDBPyConnection, monitor: Monitor, reading: Reading, state: str, now_ns: int
+    db: duckdb.DuckDBPyConnection,
+    monitor: Monitor,
+    kind: str,
+    now_ns: int,
+    *,
+    value: float | None = None,
+    bound: float | None = None,
+    samples: int = 0,
+    reason: str | None = None,
 ) -> None:
     db.execute(
-        f"INSERT INTO alerts ({_ALERT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        f"INSERT INTO alerts ({_ALERT_COLUMNS}) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
         [
             uuid.uuid4().hex,
             monitor.id,
             monitor.name,
-            FIRED if state == FIRING else RESOLVED,
+            kind,
             monitor.metric,
             monitor.comparison,
             monitor.threshold,
-            reading.value,
-            reading.bound,
-            reading.samples,
+            value,
+            bound,
+            samples,
             monitor.window_minutes,
             now_ns,
+            reason,
         ],
     )
 

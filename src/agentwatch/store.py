@@ -181,6 +181,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             comparison VARCHAR NOT NULL,
             threshold DOUBLE NOT NULL,
             min_samples INTEGER NOT NULL,
+            cooldown_minutes INTEGER NOT NULL,
             enabled BOOLEAN NOT NULL,
             created_ns BIGINT NOT NULL
         )""",
@@ -192,7 +193,8 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             samples BIGINT NOT NULL,
             evaluated_ns BIGINT NOT NULL,
             since_ns BIGINT NOT NULL,
-            insufficient BOOLEAN NOT NULL
+            insufficient BOOLEAN NOT NULL,
+            good_since_ns BIGINT
         )""",
         """CREATE TABLE alerts (
             id VARCHAR PRIMARY KEY,
@@ -202,12 +204,13 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             metric VARCHAR NOT NULL,
             comparison VARCHAR NOT NULL,
             threshold DOUBLE NOT NULL,
-            value DOUBLE NOT NULL,
+            value DOUBLE,
             bound DOUBLE,
             samples BIGINT NOT NULL,
             window_minutes INTEGER NOT NULL,
             created_ns BIGINT NOT NULL,
-            delivered_ns BIGINT
+            delivered_ns BIGINT,
+            reason VARCHAR
         )""",
     ),
 }

@@ -371,8 +371,12 @@ trial endpoint before it is switched on.
 
 A monitor (`monitors` table, schema version 9) compares one metric over a trailing window with a
 threshold: a unique name, the metric, the score name (for `score_mean` only), an optional root
-service, a window of 1 to 43,200 minutes, `above` or `below`, a finite threshold, `min_samples`
-(1 to 100,000, default 10) and whether it is enabled (by default it is). The background runner
+service, a window of 1 to 43,200 minutes, `above` or `below`, a finite threshold (0 to 1 for the
+error rates, where 0.05 means 5%), `min_samples` (1 to 100,000; by default 3 for the error rates,
+since the Wilson bound already guards them at low volume, and 10 for the rest),
+`cooldown_minutes` (0 to 43,200, default 60) and whether it is enabled (by default it is). A name
+may not contain control, format or bidi characters (Unicode Cc and Cf, such as a newline or U+202E)
+or line separators, since it is shown wherever an alert is delivered. The background runner
 evaluates every enabled monitor each minute; a monitor that fails is logged, and the others go on.
 
 **Metrics.** Windows are half-open and end now. Populations follow the dashboard's: spans that
@@ -387,6 +391,10 @@ started in the window, limited to traces whose root service matches.
 | `trace_count` | traces whose root started in the window | always 1; `min_samples` ignored | point value |
 | `score_mean` | mean of the named BOOLEAN or NUMERIC score recorded in the window, any source | scores | Wilson bound if all BOOLEAN, otherwise point value |
 
+An error-rate window must be longer than the longest model call. A call counts from when it
+started but arrives when it ends, so a call longer than the window has already left the window by
+the time it arrives, and a failure that takes that long is missed.
+
 `cost_usd` ignores `min_samples` because a cost spike must alert even from few calls, and
 `trace_count` because a `below` monitor on it is how silence is caught. With fewer samples than
 `min_samples`, a monitor's state stays as it is and the evaluation is recorded as `insufficient`,
@@ -396,24 +404,38 @@ including a firing monitor whose traffic stopped: nothing has shown that it reco
 anything: `min_samples` alone cannot tell it from 30 failures in 90. So a rate fires on the 95%
 Wilson bound (the one in `stats`) on the threshold's side: `above` when the lower bound exceeds the
 threshold, `below` when the upper bound is under it. At a threshold of 20%, 1 failure in 3 (lower
-bound 6%) does not fire, and 30 in 50 (lower bound 46%) does. Recovery compares the point value,
-so a monitor neither has to wait for a bound to clear, which at low volume could take very long,
-nor flaps, since firing needed the point value well past the threshold. A value exactly on the
-threshold is on the good side. Non-rates compare the point value both ways.
+bound 6%) does not fire, and 30 in 50 (lower bound 46%) does; 5 in 5 (lower bound 57%) fires with
+the default `min_samples`. Recovery compares the point value, so a monitor does not have to wait
+for a bound to clear, which at low volume could take very long. A value exactly on the threshold
+is on the good side. Non-rates compare the point value both ways.
+
+**Cooldown.** A value that sits at its threshold would otherwise fire and resolve over and over:
+a `trace_count` below 3 over 5 minutes, with one trace every other minute, wrote 17 alerts in 20
+minutes. So a firing monitor, rate or not, stays firing until its point value has been on the good
+side continuously for `cooldown_minutes` (`good_since_ns` in its state). Any evaluation on the bad
+side clears that. An evaluation with too few samples neither clears nor advances it: the good time
+built up is kept, and the time passed adds nothing (`good_since_ns` moves forward by it), so a
+firing monitor does not resolve from silence on a rate. A cooldown of 0 resolves at once.
 
 **State machine.** One `monitor_states` row per monitor: `OK` or `FIRING`, the last value, bound,
-samples, evaluation time, when the state began, and whether the evaluation was insufficient.
+samples, evaluation time, when the state began, whether the evaluation was insufficient, and
+since when a firing monitor has been good.
 `OK` to `FIRING` writes a `firing` alert, `FIRING` to `OK` a `resolved` one, each in one
 transaction with the state, so there is no alert while a monitor stays firing. The query runs
 before that transaction, under the store's lock only for itself; a monitor deleted or changed
-during its query discards the result. A real change through the API, including switching a monitor
-off or on, deletes its state, so it starts from `OK` and re-evaluates, with no `resolved` alert:
-what it was firing about no longer applies. Deleting a monitor deletes its state and keeps its
-alerts.
+during its query discards the result.
+
+A change to the metric, score name, service, window, comparison, threshold or minimum samples, or
+switching a monitor off or on, deletes its state, so it starts from `OK` and re-evaluates. A
+rename or a new cooldown keeps the state and writes no alert. If the monitor was firing, the reset
+first writes one `resolved` alert in the same transaction, so what the owner last heard is not
+"still firing": `reason` is `changed`, `value` is null, samples is 0, and the alert describes the
+old rule under the old name. Deleting a firing monitor does the same with `reason` `removed`.
+Deleting a monitor deletes its state and keeps its alerts.
 
 **What an alert contains.** Names and numbers only: monitor ID and name (copied, so it outlives
-the monitor), kind, metric, comparison, threshold, value, bound, samples, window, creation time and
-delivery time. No trace content. `Store.prune` deletes alerts older than its cutoff by creation
+the monitor), kind, metric, comparison, threshold, value, bound, samples, window, creation time,
+delivery time and `reason` (null unless an edit resolved it, as above). No trace content. `Store.prune` deletes alerts older than its cutoff by creation
 time, delivered or not; monitors and states are not affected.
 
 **Delivery is polling.** There are no webhooks, so no URL or secret is ever stored and agentwatch
