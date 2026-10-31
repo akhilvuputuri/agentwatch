@@ -6,8 +6,9 @@ span, stores everything in a local DuckDB file and shows it in a web UI: a trace
 cache share and cost per trace, a span waterfall for each trace, sessions (traces grouped by
 conversation) and users, scores (from an API, OTel `gen_ai.evaluation.result` events, or added by
 hand), datasets (items written by hand, through the API, or made from any trace), experiment runs
-over datasets, LLM judges that score a sample of new traces, and a dashboard of cost, tokens,
-cache share and latency over time and by model, tool and agent.
+over datasets, LLM judges that score a sample of new traces, a dashboard of cost, tokens, cache
+share and latency over time and by model, tool and agent, and monitors that raise alerts when a
+recent metric crosses a threshold.
 
 It runs on one machine for one person. There is no authentication, so it binds to `127.0.0.1` by
 default and refuses requests addressed to any other host name, which blocks DNS-rebinding and
@@ -16,8 +17,8 @@ address clients will use with `--allow-host`.
 
 > Status: early development, following the plan in
 > [chief-agent#323](https://github.com/akhilvuputuri/chief-agent/issues/323). Tracing, dashboards,
-> scores, datasets, experiments with paired statistics, and LLM judges work; monitors and alerts
-> come next. Not yet published to PyPI.
+> scores, datasets, experiments with paired statistics, LLM judges, and monitors with alerts work.
+> Not yet published to PyPI.
 
 ## Run it
 
@@ -124,6 +125,16 @@ start switched off, see only traces that arrive after they were switched on, and
 messages were not captured. Judging sends those messages to the endpoint you chose; nothing
 else leaves the machine. On a shared machine, pin what judges may do with `serve --judge-endpoint`,
 `--judge-key-env` and `--judge-max-daily`. See [the design notes](docs/design.md#llm-judges).
+
+## Monitors
+
+A monitor watches a metric over a trailing window: model or tool error rate, cost, p95 model
+latency, trace count, or the mean of a score. Add one on the Alerts page or with
+`POST /api/monitors`. Each one is evaluated every minute, and an alert is recorded when it starts
+firing and when it resolves. Error rates fire only when a 95% statistical bound clears the
+threshold, so a few unlucky calls cannot set one off. agentwatch sends nothing itself: a client
+polls `GET /api/alerts?undelivered=1` and confirms each alert with
+`POST /api/alerts/<id>/delivered`. See [the design notes](docs/design.md#monitors-and-alerts).
 
 ## Develop
 

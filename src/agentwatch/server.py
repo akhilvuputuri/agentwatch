@@ -28,7 +28,17 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from agentwatch import comparisons, datasets, experiments, judges, metrics, otlp, prices, scores
+from agentwatch import (
+    comparisons,
+    datasets,
+    experiments,
+    judges,
+    metrics,
+    monitors,
+    otlp,
+    prices,
+    scores,
+)
 from agentwatch.scores import Score
 from agentwatch.spans import jsonable
 from agentwatch.store import (
@@ -406,6 +416,67 @@ def create_app(
 
         return await _judge_call(work)
 
+    def monitor_json(monitor: monitors.Monitor) -> dict[str, Any]:
+        return asdict(monitor) | {
+            "created_ns": str(monitor.created_ns),
+            "state": _state_json(monitors.get_state(store, monitor.id)),
+        }
+
+    async def monitors_index(request: Request) -> Response:
+        if request.method == "GET":
+            return await _monitor_call(
+                lambda: {"monitors": [monitor_json(m) for m in monitors.list_monitors(store)]}
+            )
+        body = await _json_body(request, MAX_SCORE_REQUEST_BYTES)
+        if isinstance(body, Response):
+            return body
+        return await _monitor_call(
+            lambda: {"monitor": monitor_json(monitors.create_monitor(store, body))}, status=201
+        )
+
+    async def monitor_detail(request: Request) -> Response:
+        monitor_id = str(request.path_params["monitor_id"])
+        if request.method == "GET":
+            return await _monitor_call(
+                lambda: {"monitor": monitor_json(monitors.get_monitor(store, monitor_id))}
+            )
+        if request.method == "DELETE":
+            return await _monitor_call(
+                lambda: monitors.delete_monitor(store, monitor_id), status=204
+            )
+        body = await _json_body(request, MAX_SCORE_REQUEST_BYTES)
+        if isinstance(body, Response):
+            return body
+        return await _monitor_call(
+            lambda: {"monitor": monitor_json(monitors.update_monitor(store, monitor_id, body))}
+        )
+
+    async def alerts_index(request: Request) -> Response:
+        query = request.query_params
+        try:
+            limit = max(1, min(int(query.get("limit", "50")), 500))
+        except ValueError:
+            return PlainTextResponse("limit must be an integer", status_code=400)
+        undelivered = query.get("undelivered") in ("1", "true")
+        return await _monitor_call(
+            lambda: {
+                "alerts": [
+                    _alert_json(a)
+                    for a in monitors.list_alerts(store, limit=limit, undelivered=undelivered)
+                ]
+            }
+        )
+
+    async def alert_delivered(request: Request) -> Response:
+        """The body is ignored, but the media type is still required: see `_json_body`."""
+        alert_id = str(request.path_params["alert_id"])
+        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media != otlp.JSON:
+            return PlainTextResponse("send application/json", status_code=415)
+        return await _monitor_call(
+            lambda: {"alert": _alert_json(monitors.mark_delivered(store, alert_id))}
+        )
+
     async def delete_price(request: Request) -> Response:
         removed = await run_in_threadpool(store.delete_price, str(request.path_params["price_id"]))
         return (
@@ -546,6 +617,10 @@ def create_app(
         Route("/api/judges/{judge_id}", judge_detail, methods=["GET", "PATCH", "DELETE"]),
         Route("/api/judges/{judge_id}/judgements", judge_judgements, methods=["GET"]),
         Route("/api/judges/{judge_id}/try", judge_try, methods=["POST"]),
+        Route("/api/monitors", monitors_index, methods=["GET", "POST"]),
+        Route("/api/monitors/{monitor_id}", monitor_detail, methods=["GET", "PATCH", "DELETE"]),
+        Route("/api/alerts", alerts_index, methods=["GET"]),
+        Route("/api/alerts/{alert_id}/delivered", alert_delivered, methods=["POST"]),
         Route("/api/prices", list_prices, methods=["GET"]),
         Route("/api/prices", post_price, methods=["POST"]),
         Route("/api/prices/{price_id}", delete_price, methods=["DELETE"]),
@@ -723,6 +798,36 @@ async def _judge_call(work: Callable[[], Any], *, status: int = 200) -> Response
     if status == 204:
         return Response(status_code=204)
     return JSONResponse(result, status_code=status)
+
+
+async def _monitor_call(work: Callable[[], Any], *, status: int = 200) -> Response:
+    """Run a monitors operation in the threadpool and map its errors to HTTP statuses."""
+    try:
+        result = await run_in_threadpool(work)
+    except monitors.NotFound as error:
+        return PlainTextResponse(str(error), status_code=404)
+    except monitors.Conflict as error:
+        return PlainTextResponse(str(error), status_code=409)
+    except monitors.MonitorError as error:
+        return PlainTextResponse(str(error), status_code=400)
+    if status == 204:
+        return Response(status_code=204)
+    return JSONResponse(result, status_code=status)
+
+
+def _state_json(state: monitors.MonitorState) -> dict[str, Any]:
+    data = asdict(state)
+    del data["monitor_id"]
+    for key in ("evaluated_ns", "since_ns"):
+        data[key] = None if data[key] is None else str(data[key])
+    return data
+
+
+def _alert_json(alert: monitors.Alert) -> dict[str, Any]:
+    return asdict(alert) | {
+        "created_ns": str(alert.created_ns),
+        "delivered_ns": None if alert.delivered_ns is None else str(alert.delivered_ns),
+    }
 
 
 def _dataset_json(dataset: datasets.Dataset) -> dict[str, Any]:
