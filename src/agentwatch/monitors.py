@@ -154,6 +154,9 @@ class MonitorState:
     # Drift only: the baseline window's value, and how many evaluations in a row have breached.
     baseline_value: float | None = None
     breaches: int = 0
+    # While firing: whether its firing alert was muted. Its resolve goes the same way, whatever
+    # the monitor is by then and whether or not that alert is still kept.
+    alert_muted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +205,7 @@ _COLUMNS = (
 )
 _STATE_COLUMNS = (
     "monitor_id, state, value, bound, samples, evaluated_ns, since_ns, insufficient, "
-    "good_since_ns, baseline_value, breaches"
+    "good_since_ns, baseline_value, breaches, alert_muted"
 )
 _ALERT_COLUMNS = (
     "id, monitor_id, monitor_name, kind, metric, comparison, threshold, value, bound, samples, "
@@ -293,7 +296,7 @@ def update_monitor(
         current = _get(db, monitor_id)
         if data.get("mode") == DRIFT and current.mode != DRIFT and "cooldown_minutes" not in data:
             # As for a new drift monitor: long enough that one shift cannot fire twice.
-            data["cooldown_minutes"] = data.get("window_minutes", current.window_minutes)
+            data = {"cooldown_minutes": data.get("window_minutes", current.window_minutes), **data}
         monitor = _validated(
             asdict(current) | data, monitor_id=current.id, created_ns=current.created_ns
         )
@@ -339,10 +342,11 @@ def delete_monitor(store: Store, monitor_id: str, *, now_ns: int | None = None) 
 
 def _end_state(db: duckdb.DuckDBPyConnection, monitor: Monitor, reason: str, now_ns: int) -> None:
     firing = db.execute(
-        "SELECT 1 FROM monitor_states WHERE monitor_id = ? AND state = ?", [monitor.id, FIRING]
+        "SELECT alert_muted FROM monitor_states WHERE monitor_id = ? AND state = ?",
+        [monitor.id, FIRING],
     ).fetchone()
     if firing:
-        _write_alert(db, monitor, RESOLVED, now_ns, reason=reason)
+        _write_alert(db, monitor, RESOLVED, now_ns, muted=firing[0], reason=reason)
     db.execute("DELETE FROM monitor_states WHERE monitor_id = ?", [monitor.id])
 
 
@@ -589,13 +593,14 @@ def evaluate(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None
         if row is None or Monitor(*row) != monitor:
             return None  # deleted or changed during the read, which no longer applies
         stored = db.execute(
-            "SELECT state, since_ns, good_since_ns, evaluated_ns FROM monitor_states "
-            "WHERE monitor_id = ?",
+            "SELECT state, since_ns, good_since_ns, evaluated_ns, alert_muted "
+            "FROM monitor_states WHERE monitor_id = ?",
             [monitor.id],
         ).fetchone()
         state: str = OK if stored is None else stored[0]
         since: int = now_ns if stored is None else stored[1]
         good_since: int | None = None if stored is None else stored[2]
+        alert_muted: bool = False if stored is None else stored[4]
         insufficient = reading.value is None or (
             reading.needs_samples and reading.samples < monitor.min_samples
         )
@@ -609,11 +614,13 @@ def evaluate(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None
             following, good_since = next_state(monitor, reading, state, good_since, now_ns)
         if following != state:
             since = now_ns
+            alert_muted = monitor.muted if following == FIRING else alert_muted
             _write_alert(
                 db,
                 monitor,
                 FIRED if following == FIRING else RESOLVED,
                 now_ns,
+                muted=alert_muted,
                 value=reading.value,
                 bound=reading.bound,
                 samples=reading.samples,
@@ -628,6 +635,7 @@ def evaluate(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None
             since_ns=since,
             insufficient=insufficient,
             good_since_ns=good_since,
+            alert_muted=alert_muted,
         )
         _write_state(db, result)
     return result
@@ -636,7 +644,7 @@ def evaluate(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None
 def _write_state(db: duckdb.DuckDBPyConnection, state: MonitorState) -> None:
     db.execute(
         f"INSERT OR REPLACE INTO monitor_states ({_STATE_COLUMNS}) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             state.monitor_id,
             state.state,
@@ -649,6 +657,7 @@ def _write_state(db: duckdb.DuckDBPyConnection, state: MonitorState) -> None:
             state.good_since_ns,
             state.baseline_value,
             state.breaches,
+            state.alert_muted,
         ],
     )
 
@@ -680,15 +689,15 @@ def next_drift_state(
     of breaches. A gap of over DRIFT_MAX_GAP_NS does the same, since "in a row" needs related
     windows and nothing was measured during it.
     """
-    if last_evaluated is not None and now_ns - last_evaluated > DRIFT_MAX_GAP_NS:
+    elapsed = 0 if last_evaluated is None else max(0, now_ns - last_evaluated)
+    underpowered = result.verdict == drift.UNDERPOWERED
+    if underpowered or elapsed > DRIFT_MAX_GAP_NS:
         if state == OK:
             breaches = 0
-        elif good_since is not None:
-            good_since += now_ns - last_evaluated
-    if result.verdict == drift.UNDERPOWERED:
-        if good_since is not None and last_evaluated is not None:
-            good_since += max(0, now_ns - last_evaluated)
-        return state, 0 if state == OK else breaches, good_since
+        if good_since is not None:
+            good_since += elapsed
+    if underpowered:
+        return state, breaches, good_since
     breaching = drift_breach(monitor, result)
     if state == OK:
         breaches = breaches + 1 if breaching else 0
@@ -733,12 +742,13 @@ def _evaluate_drift(store: Store, monitor: Monitor, now_ns: int) -> MonitorState
         if row is None or Monitor(*row) != monitor:
             return None
         stored = db.execute(
-            "SELECT state, since_ns, good_since_ns, evaluated_ns, breaches FROM monitor_states "
-            "WHERE monitor_id = ?",
+            "SELECT state, since_ns, good_since_ns, evaluated_ns, breaches, alert_muted "
+            "FROM monitor_states WHERE monitor_id = ?",
             [monitor.id],
         ).fetchone()
         state: str = OK if stored is None else stored[0]
         since: int = now_ns if stored is None else stored[1]
+        alert_muted: bool = False if stored is None else stored[5]
         following, breaches, good_since = next_drift_state(
             monitor,
             result,
@@ -751,11 +761,13 @@ def _evaluate_drift(store: Store, monitor: Monitor, now_ns: int) -> MonitorState
         bound = _near_edge(monitor, result)
         if following != state:
             since = now_ns
+            alert_muted = monitor.muted if following == FIRING else alert_muted
             _write_alert(
                 db,
                 monitor,
                 FIRED if following == FIRING else RESOLVED,
                 now_ns,
+                muted=alert_muted,
                 value=result.current_value,
                 bound=bound,
                 samples=result.current_samples,
@@ -773,6 +785,7 @@ def _evaluate_drift(store: Store, monitor: Monitor, now_ns: int) -> MonitorState
             good_since_ns=good_since,
             baseline_value=result.baseline_value,
             breaches=breaches,
+            alert_muted=alert_muted,
         )
         _write_state(db, written)
     return written
@@ -784,22 +797,13 @@ def _write_alert(
     kind: str,
     now_ns: int,
     *,
+    muted: bool,
     value: float | None = None,
     bound: float | None = None,
     samples: int = 0,
     reason: str | None = None,
     baseline_value: float | None = None,
 ) -> None:
-    muted = monitor.muted
-    if kind == RESOLVED:
-        # Goes the way its firing alert went: toggling mid-incident must not leave a client with
-        # a "firing" that never ends, or a "resolved" of something it never heard about.
-        fired = db.execute(
-            "SELECT muted FROM alerts WHERE monitor_id = ? AND kind = ? "
-            "ORDER BY created_ns DESC LIMIT 1",
-            [monitor.id, FIRED],
-        ).fetchone()
-        muted = monitor.muted if fired is None else bool(fired[0])
     db.execute(
         f"INSERT INTO alerts ({_ALERT_COLUMNS}) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

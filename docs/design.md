@@ -482,8 +482,8 @@ given, no interval and no claim. `changed` when the interval excludes zero. `no 
 difference` otherwise, with `detectable`, a change this size would usually show, so it is not read
 as "no change". A true change equal to the interval's half-width clears it under half the time, so
 `detectable` is the half-width scaled by (z + 0.84) / z at the interval's level, which aims at 80%
-power. Measured, a true change of that size showed 57 to 77% of the time (300 runs at rates of 0.02,
-0.1 and 0.4 with 15 and 30 traces a side, about 3 points of noise), so read it as about 60 to 80%.
+power. Measured, a true change of that size showed 57 to 77% of the time (200 to 300 runs at rates of
+0.02, 0.1 and 0.4 with 15 and 30 traces a side, about 3 points of noise), so read it as about 60 to 80%.
 It is null, shown as "can't say", when a window has no spread at all (every trace alike), since the
 bootstrap then has nothing to measure; a proportion at 0 or 1 still has its Wilson width. `direction`
 is `higher` or `lower` only for `changed`. It never says better or worse, since only the caller knows which way is bad, and it does
@@ -545,7 +545,8 @@ simply filled the two windows. Threshold monitors otherwise behave as before.
 they are written as already delivered and flagged `muted`, so a polling client never sees them.
 Toggling it changes no state and no earlier alert. A resolved alert goes the way its firing alert
 went, whatever the monitor is now: muting mid-incident still sends the resolve of what the client was
-told, and unmuting mid-incident sends nothing until the next firing. This is how a drift monitor
+told, and unmuting mid-incident sends nothing until the next firing. The monitor's state records how
+the firing alert went, so this holds if retention has removed that alert. This is how a drift monitor
 should be trialled on real traffic, given the results below, before it can reach a phone.
 
 **Load, measured in process on a laptop.** The bootstrap holds no store lock, but it is pure Python.

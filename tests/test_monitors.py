@@ -777,6 +777,7 @@ def test_api_crud(client: TestClient, db: Store, traces: Traces) -> None:
         "good_since_ns": None,
         "baseline_value": None,
         "breaches": 0,
+        "alert_muted": False,
     }
     path = f"/api/monitors/{monitor['id']}"
     assert client.get(path).json()["monitor"] == monitor
@@ -990,3 +991,18 @@ def test_unmuting_mid_incident_sends_no_resolve_of_what_was_never_sent(
     monitors.delete_monitor(db, monitor.id, now_ns=NOW + 2)
     assert [a.muted for a in alerts(db)] == [True, True]
     assert monitors.list_alerts(db, undelivered=True) == []
+
+
+@pytest.mark.parametrize("fired_muted", [True, False])
+def test_a_resolve_follows_its_firing_alert_after_that_alert_is_pruned(
+    db: Store, traces: Traces, fired_muted: bool
+) -> None:
+    traces.calls(MODEL, failed=20, total=20)
+    monitor = make(db, muted=fired_muted)
+    monitors.evaluate(db, monitor, NOW)
+    with db.transaction() as connection:
+        connection.execute("DELETE FROM alerts")
+    monitors.update_monitor(db, monitor.id, {"muted": not fired_muted}, now_ns=NOW + 1)
+    monitors.delete_monitor(db, monitor.id, now_ns=NOW + 2)
+    resolved = alerts(db)[-1]
+    assert (resolved.kind, resolved.muted) == ("resolved", fired_muted)

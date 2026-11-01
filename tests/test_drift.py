@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -865,6 +866,7 @@ def test_migration_from_schema_9(tmp_path: Path) -> None:
         ("monitors", "mode"),
         ("monitors", "baseline_minutes"),
         ("monitors", "muted"),
+        ("monitor_states", "alert_muted"),
         ("monitor_states", "baseline_value"),
         ("monitor_states", "breaches"),
         ("alerts", "mode"),
@@ -939,8 +941,8 @@ def test_one_shift_fires_once_with_the_window_as_cooldown() -> None:
     assert len(fired) == 1
 
 
-def test_time_without_evaluations_does_not_count_toward_the_cooldown() -> None:
-    monitor = monitors.Monitor(
+def _monitor() -> monitors.Monitor:
+    return monitors.Monitor(
         id="m",
         name="m",
         metric=drift.TOOL_ERROR_RATE,
@@ -956,6 +958,10 @@ def test_time_without_evaluations_does_not_count_toward_the_cooldown() -> None:
         mode=monitors.DRIFT,
         baseline_minutes=7 * 24 * 60,
     )
+
+
+def test_time_without_evaluations_does_not_count_toward_the_cooldown() -> None:
+    monitor = _monitor()
     good = _no_change()
     hour = monitors.DRIFT_INTERVAL_NS
     start = 1_000 * hour
@@ -968,6 +974,23 @@ def test_time_without_evaluations_does_not_count_toward_the_cooldown() -> None:
         monitor, good, state, 0, good_since, start + hour, later
     )
     assert state == monitors.FIRING
+    assert good_since == later - hour
+
+
+def test_a_gap_before_an_underpowered_reading_is_not_counted_twice() -> None:
+    monitor = _monitor()
+    hour = monitors.DRIFT_INTERVAL_NS
+    start = 1_000 * hour
+    later = start + 48 * hour
+    _, _, good_since = monitors.next_drift_state(
+        monitor,
+        replace(_no_change(), verdict=drift.UNDERPOWERED),
+        monitors.FIRING,
+        0,
+        start - hour,
+        start,
+        later,
+    )
     assert good_since == later - hour
 
 

@@ -219,6 +219,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE monitors ADD COLUMN muted BOOLEAN NOT NULL DEFAULT false",
         "ALTER TABLE monitor_states ADD COLUMN baseline_value DOUBLE",
         "ALTER TABLE monitor_states ADD COLUMN breaches INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE monitor_states ADD COLUMN alert_muted BOOLEAN NOT NULL DEFAULT false",
         "ALTER TABLE alerts ADD COLUMN mode VARCHAR NOT NULL DEFAULT 'threshold'",
         "ALTER TABLE alerts ADD COLUMN baseline_value DOUBLE",
         "ALTER TABLE alerts ADD COLUMN baseline_minutes INTEGER",
