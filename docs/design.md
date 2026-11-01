@@ -537,11 +537,11 @@ unrelated windows cannot combine.
 
 Alerts add `mode`, `baseline_value` and `baseline_minutes` (null for threshold monitors); `value` is
 the current value and `bound` the interval's edge on the threshold's side, so a difference, which
-can be negative. A resolved drift alert means the monitor no longer sees a change in the bad
-direction, for its cooldown. It does not mean the level recovered, or even that the windows agree:
-`value` and `baseline_value` are both there to read. They are both high if a shift simply filled the
-two windows, and the baseline is the higher one if a brief incident has moved into it. Threshold
-monitors otherwise behave as before.
+can be negative. A resolved drift alert means the monitor has seen no clear change of at least its
+threshold in the bad direction, for its cooldown. It does not mean the level recovered, or even that
+the windows agree: `value` and `baseline_value` are both there to read. They are alike if a shift
+simply filled the two windows, and the baseline holds the incident if a brief one has moved into it.
+Threshold monitors otherwise behave as before.
 
 **Muted monitors.** A monitor of either mode with `muted` evaluates and records alerts as usual, but
 they are written as already delivered and flagged `muted`, so a polling client never sees them.

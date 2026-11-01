@@ -180,7 +180,8 @@ class Alert:
     reason: str | None = None
     mode: str = THRESHOLD
     # Drift only: the two windows' values and the baseline's length. `bound` is then a difference.
-    # A resolved alert means no change in the bad direction now, not that the level has come back.
+    # A resolved alert means no clear change of at least the threshold now, not that the level is
+    # back.
     baseline_value: float | None = None
     baseline_minutes: int | None = None
     # Its monitor was muted, so it was written as already delivered.
