@@ -143,7 +143,9 @@ The Drift page compares each metric over the last 1, 7 or 30 days with the same 
 lists when each model and `service.version` first appeared, so you can compare before and after
 one. A comparison resamples whole traces, and says a metric changed only if its interval excludes
 zero; with fewer than 10 traces on a side it says there is too little data. A monitor in `drift`
-mode alerts on such a change. See [the design notes](docs/design.md#drift-detection).
+mode alerts on such a change. Simulated traffic with ordinary overdispersion fires falsely about
+once a month, so trial one with `muted`, which records alerts without sending them to any client.
+See [the design notes](docs/design.md#drift-detection).
 
 ## Develop
 

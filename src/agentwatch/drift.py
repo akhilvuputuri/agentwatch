@@ -9,8 +9,8 @@ The verdict says only what the data can support:
 
 - `underpowered`: a window has fewer than MIN_TRACES traces, so nothing is claimed;
 - `changed`: the interval excludes zero;
-- `no detectable difference`: it does not. `detectable`, the interval's half-width, says how small
-  a change this data could have shown, so this is not read as "no change".
+- `no detectable difference`: it does not. `detectable` is the size of change this data would
+  usually have shown (about 80% of the time), so this is not read as "no change".
 
 It never says better or worse, since only the caller knows which way is bad, and it does not say
 why: a window can differ from the one before for reasons no deploy caused, such as the day of the
@@ -38,6 +38,7 @@ from agentwatch.stats import (
     CHANGED,
     NO_DIFFERENCE,
     UNDERPOWERED,
+    Z_80,
     newcombe,
     quantile,
     unpaired_cluster_bootstrap,
@@ -77,6 +78,11 @@ MAX_QUANTILE_SAMPLES = 20_000
 RESAMPLES = 1000
 SEED = 7
 MAX_SCORE_NAMES = 50
+# The chance of a false "changed" across a whole page, shared out among what it compares. The
+# interval's tails then shrink, so the resamples grow to leave a few draws beyond each end.
+PAGE_ALPHA = 0.05
+RESAMPLES_PER_COMPARISON = 200
+MAX_PAGE_RESAMPLES = 2000
 
 
 class DriftError(ValueError):
@@ -122,7 +128,8 @@ class Comparison:
     # Which way it moved, when it did: "none" unless the verdict is "changed".
     direction: str
     verdict: str
-    # The interval's half-width: the smallest change this data could have shown.
+    # The change this data would usually have shown (80% power). None when it cannot say: a
+    # window with no spread at all gives the bootstrap nothing to go on.
     detectable: float | None
     truncated: bool
     # Whether the values are proportions, so a page can show them as percentages.
@@ -247,11 +254,37 @@ def compare_records(
         current_samples=sum(map(_denominator, current.traces)),
         direction=direction,
         verdict=verdict,
-        detectable=None if interval is None else (interval[1] - interval[0]) / 2,
+        detectable=_detectable(interval, metric, baseline, current, proportion, confidence),
         truncated=baseline.truncated or current.truncated,
         proportion=proportion,
         confidence=confidence,
     )
+
+
+def _detectable(
+    interval: tuple[float, float] | None,
+    metric: str,
+    baseline: Records,
+    current: Records,
+    proportion: bool,
+    confidence: float,
+) -> float | None:
+    """The interval's half-width, which a true change of that size clears only half the time,
+    scaled up to the change that clears it with 80% power. A proportion at 0 or 1 has a Wilson
+    width instead, so only other metrics can be left with no measure of spread."""
+    if interval is None or interval[1] <= interval[0]:
+        return None
+    if not proportion and (_no_spread(metric, baseline) or _no_spread(metric, current)):
+        return None
+    z = z_for(confidence)
+    return (interval[1] - interval[0]) / 2 * (z + Z_80) / z
+
+
+def _no_spread(metric: str, found: Records) -> bool:
+    """Whether every trace has the same value, so that every resample of the window is alike."""
+    if metric == MODEL_P95_MS:
+        return len({value for trace in found.traces for value in trace.values}) <= 1
+    return len({trace.numerator / trace.denominator for trace in found.traces}) <= 1
 
 
 def _widened(
@@ -310,20 +343,40 @@ def compare(
     )
 
 
+def page_confidence(comparisons: int) -> float:
+    """A Bonferroni-style level for a page that tests this many comparisons at once."""
+    return 1 - PAGE_ALPHA / max(1, comparisons)
+
+
 def summary(store: Store, *, service: str | None, days: int, now_ns: int) -> list[Comparison]:
     """Every call metric and score name: the last `days` days against the same length before."""
     length = days * 24 * 3600 * 1_000_000_000
-    current = (now_ns - length, now_ns)
-    baseline = (now_ns - 2 * length, now_ns - length)
-    found = [
-        compare(store, metric, baseline=baseline, current=current, service=service)
-        for metric in CALL_METRICS
-    ]
-    names = score_names(store, Window(baseline[0], now_ns, service), limit=MAX_SCORE_NAMES)
-    found.extend(
-        compare(
-            store, SCORE_MEAN, baseline=baseline, current=current, service=service, score_name=name
-        )
-        for name in names
+    return summary_between(
+        store,
+        service=service,
+        baseline=(now_ns - 2 * length, now_ns - length),
+        current=(now_ns - length, now_ns),
     )
-    return found
+
+
+def summary_between(
+    store: Store, *, service: str | None, baseline: tuple[int, int], current: tuple[int, int]
+) -> list[Comparison]:
+    """Every call metric and score name over two windows, each interval at the page's level."""
+    names = score_names(store, Window(baseline[0], current[1], service), limit=MAX_SCORE_NAMES)
+    wanted = [*((metric, None) for metric in CALL_METRICS), *((SCORE_MEAN, n) for n in names)]
+    confidence = page_confidence(len(wanted))
+    resamples = max(RESAMPLES, min(MAX_PAGE_RESAMPLES, len(wanted) * RESAMPLES_PER_COMPARISON))
+    return [
+        compare(
+            store,
+            metric,
+            baseline=baseline,
+            current=current,
+            service=service,
+            score_name=name,
+            confidence=confidence,
+            resamples=resamples,
+        )
+        for metric, name in wanted
+    ]

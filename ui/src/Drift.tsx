@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import {
-  getDrift,
+  getDriftAround,
   getDriftSummary,
   listChanges,
   listServices,
@@ -14,7 +14,8 @@ import { count, duration, timestamp, usd } from "./format";
 
 const DAYS = [1, 7, 30];
 const DAY_NS = 24n * 3600n * 1_000_000_000n;
-const CALL_METRICS: DriftMetric[] = ["model_error_rate", "tool_error_rate", "model_mean_ms", "model_p95_ms", "cost_per_trace"];
+const RETRY_MS = 3000;
+const RETRIES = 20;
 
 const LABELS: Record<DriftMetric, string> = {
   model_error_rate: "Model error rate",
@@ -41,6 +42,23 @@ export function beforeAfter(firstSeenNs: string, days: number, nowNs: bigint): D
   };
 }
 
+/** The service to compare a change within: its own when it has one, as a service version does. */
+export function changeService(change: DetectedChange, selected: string): string {
+  return change.service ?? selected;
+}
+
+/** The server runs one comparison at a time and answers 429 meanwhile, so a page waits its turn. */
+async function waitingTurn<T>(work: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await work();
+    } catch (reason) {
+      if (attempt >= RETRIES || signal.aborted || !String(reason).includes("429")) throw reason;
+      await new Promise((resolve) => window.setTimeout(resolve, RETRY_MS));
+    }
+  }
+}
+
 function figure(c: DriftComparison, value: number | null): string {
   if (value === null) return "–";
   if (c.proportion) return `${Math.round(value * 1000) / 10}%`;
@@ -58,10 +76,15 @@ function signed(c: DriftComparison, value: number | null): string {
 function verdictText(c: DriftComparison): string {
   if (c.verdict === "underpowered") return "too little data: under 10 traces on a side";
   if (c.verdict === "changed") return `changed: ${c.direction}`;
-  return `no detectable difference; could have shown about ${figure(c, c.detectable)}`;
+  if (c.detectable === null) return "no detectable difference; can't say how large a change would show";
+  return `no detectable difference; a change of about ${figure(c, c.detectable)} would usually show`;
 }
 
 const label = (c: DriftComparison) => (c.score_name ? `${LABELS.score_mean}: ${c.score_name}` : LABELS[c.metric]);
+
+/** How the page's intervals allow for testing several metrics at once. */
+const levelText = (summary: DriftSummary) =>
+  `Each interval here is at ${Math.round(summary.confidence * 10000) / 100}%, not 95%, because ${summary.comparisons.length} comparisons are tested at once.`;
 
 function ComparisonTable({ comparisons, testId }: { comparisons: DriftComparison[]; testId: string }) {
   return (
@@ -115,7 +138,7 @@ export function Drift() {
   const [summary, setSummary] = useState<DriftSummary | null>(null);
   const [changes, setChanges] = useState<DetectedChange[] | null>(null);
   const [chosen, setChosen] = useState<DetectedChange | null>(null);
-  const [around, setAround] = useState<DriftComparison[] | null>(null);
+  const [around, setAround] = useState<DriftSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -131,7 +154,7 @@ export function Drift() {
     };
     setError(null);
     setSummary(null);
-    getDriftSummary(days, service, controller.signal).then(setSummary, fail);
+    waitingTurn(() => getDriftSummary(days, service, controller.signal), controller.signal).then(setSummary, fail);
     listChanges(service, controller.signal).then(setChanges, fail);
     return () => controller.abort();
   }, [days, service]);
@@ -142,7 +165,8 @@ export function Drift() {
     const windows = beforeAfter(chosen.first_seen_ns, days, BigInt(Date.now()) * 1_000_000n);
     if (!windows) return;
     const controller = new AbortController();
-    Promise.all(CALL_METRICS.map((metric) => getDrift(metric, windows, service, controller.signal))).then(setAround, (reason: unknown) => {
+    // All traffic of the change's service, with scores, since a new model moves those most.
+    waitingTurn(() => getDriftAround(windows, changeService(chosen, service), controller.signal), controller.signal).then(setAround, (reason: unknown) => {
       if (!controller.signal.aborted) setError(String(reason));
     });
     return () => controller.abort();
@@ -153,9 +177,9 @@ export function Drift() {
       <h1>Drift</h1>
       <p className="muted small">
         Each metric now, against the same length of time directly before. Traffic differs between the two, so this resamples
-        whole traces: a metric reads as changed only if the 95% interval of the difference excludes zero. That says it moved,
-        not why, nor whether that is bad: two windows can differ because of the day of the week. "No difference seen" gives
-        the smallest change the data could have shown.
+        whole traces: a metric reads as changed only if the interval of the difference excludes zero. That says it moved,
+        not why, nor whether that is bad: two windows can differ because of the day of the week, and a day's rate varies
+        by more than this allows for. "No difference seen" gives the size of change that would usually show.
       </p>
       <div className="toolbar">
         <label>
@@ -183,6 +207,7 @@ export function Drift() {
       </div>
       {error && <p className="error">{error}</p>}
       {!summary && !error && <p className="muted">Comparing…</p>}
+      {summary && <p className="muted small">{levelText(summary)}</p>}
       {summary && <ComparisonTable comparisons={summary.comparisons} testId="drift-table" />}
       <h2>Detected changes</h2>
       {changes && changes.length === 0 && <p className="empty">No models or service versions seen yet.</p>}
@@ -218,7 +243,8 @@ export function Drift() {
           <h2>
             Before and after {chosen.name} ({timestamp(chosen.first_seen_ns)})
           </h2>
-          {around ? <ComparisonTable comparisons={around} testId="around-table" /> : <p className="muted">Comparing…</p>}
+          {around && <p className="muted small">{levelText(around)}</p>}
+          {around ? <ComparisonTable comparisons={around.comparisons} testId="around-table" /> : <p className="muted">Comparing…</p>}
         </>
       )}
     </section>

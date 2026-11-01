@@ -33,8 +33,10 @@ ALPHA = 0.05
 # standard deviation from so few pairs is too unreliable to claim there is no difference.
 MIN_PAIRS = 10
 Z_95 = 1.959963984540054
+# z for 80% power on top of a level's own z.
+Z_80 = 0.8416212335729143
 # z for 80% power at a two-sided 5% level: 1.96 + 0.84.
-Z_POWER = Z_95 + 0.8416212335729143
+Z_POWER = Z_95 + Z_80
 
 
 # Two-sided 95% critical values of Student's t for 1 to 30 degrees of freedom.

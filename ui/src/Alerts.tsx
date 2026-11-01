@@ -57,6 +57,19 @@ const usesMinSamples = (metric: MonitorMetric) => metric !== "cost_usd" && metri
 const isRate = (metric: MonitorMetric, mode: MonitorMode, bound: number | null) =>
   isErrorRate(metric) || (mode === "threshold" && bound !== null);
 
+/** A drift monitor's bound is a difference, which can be negative: every unit below expects a size. */
+export function boundText(metric: MonitorMetric, bound: number, rate: boolean): string {
+  return `${bound < 0 ? "−" : "+"}${figure(metric, Math.abs(bound), rate)}`;
+}
+
+/** What a drift alert says. A resolved one says the windows agree, not that the level came back. */
+export function driftAlertText(alert: Alert, rate: boolean): string {
+  if (alert.value === null) return "–";
+  const before = figure(alert.metric, alert.baseline_value, rate);
+  const after = figure(alert.metric, alert.value, rate);
+  return alert.kind === "firing" ? `from ${before} to ${after}` : `windows no longer differ: ${before} and ${after}`;
+}
+
 const changeText = (comparison: "above" | "below") => (comparison === "above" ? "a rise" : "a fall");
 
 /** Monitors over recent metrics, and the alerts they raised. */
@@ -105,6 +118,16 @@ export function Alerts() {
     );
   };
 
+  const toggleMuted = (monitor: Monitor) => {
+    updateMonitor(monitor.id, { muted: !monitor.muted }).then(
+      (updated) => {
+        setMonitors((current) => (current ?? []).map((m) => (m.id === updated.id ? updated : m)));
+        setActionError(null);
+      },
+      (reason: unknown) => setActionError(String(reason)),
+    );
+  };
+
   const remove = (monitor: Monitor) => {
     const firing = monitor.state.state === "FIRING" ? " It is firing, so a resolved alert is sent." : "";
     if (!window.confirm(`Delete the monitor "${monitor.name}"? The alerts it raised stay.${firing}`)) return;
@@ -126,7 +149,8 @@ export function Alerts() {
         one off. A firing monitor resolves once its value has stayed on the good side for its cooldown; evaluations with
         too few samples do not count toward that. A drift monitor instead compares the window with the one directly
         before it, once an hour, and fires when the change holds for six evaluations in a row: it reports a change, not
-        a level, so it recovers once the new level fills both windows. A client collects alerts by polling the API:
+        a level, so it resolves once the new level fills both windows, whatever that level is. Trial one muted first: a
+        muted monitor runs as usual, but no client is sent its alerts. A client collects alerts by polling the API:
         agentwatch sends nothing itself.
       </p>
       {loadError && <p className="error">{loadError}</p>}
@@ -156,7 +180,7 @@ export function Alerts() {
             </thead>
             <tbody>
               {monitors.map((m) => (
-                <MonitorRow key={m.id} monitor={m} onToggle={() => toggle(m)} onRemove={() => remove(m)} />
+                <MonitorRow key={m.id} monitor={m} onToggle={() => toggle(m)} onToggleMuted={() => toggleMuted(m)} onRemove={() => remove(m)} />
               ))}
             </tbody>
           </table>
@@ -189,19 +213,18 @@ export function Alerts() {
                     </td>
                     <td>
                       <span className={`badge ${a.kind === "firing" ? "bad" : "ok"}`}>{a.kind}</span>
+                      {a.muted && <span className="badge neutral">muted</span>}
                       {a.reason && <div className="muted small">monitor {a.reason}</div>}
                     </td>
                     <td className="num">
-                      {a.mode === "drift" && a.value !== null
-                        ? `from ${figure(a.metric, a.baseline_value, rate)} to ${figure(a.metric, a.value, rate)}`
-                        : figure(a.metric, a.value, rate)}
+                      {a.mode === "drift" ? driftAlertText(a, rate) : figure(a.metric, a.value, rate)}
                     </td>
                     <td>
                       {a.mode === "drift"
                         ? `${changeText(a.comparison)} of at least ${figure(a.metric, a.threshold, rate)}`
                         : `${a.comparison} ${figure(a.metric, a.threshold, rate)}`}
                     </td>
-                    <td className="muted">{a.delivered_ns === null ? "not yet" : timestamp(a.delivered_ns)}</td>
+                    <td className="muted">{a.muted ? "never (muted)" : a.delivered_ns === null ? "not yet" : timestamp(a.delivered_ns)}</td>
                   </tr>
                 );
               })}
@@ -216,10 +239,12 @@ export function Alerts() {
 function MonitorRow({
   monitor,
   onToggle,
+  onToggleMuted,
   onRemove,
 }: {
   monitor: Monitor;
   onToggle: () => void;
+  onToggleMuted: () => void;
   onRemove: () => void;
 }) {
   const s = monitor.state;
@@ -228,7 +253,7 @@ function MonitorRow({
   return (
     <tr>
       <td>
-        {monitor.name}
+        {monitor.name} {monitor.muted && <span className="badge neutral">muted</span>}
         <div className="muted small">
           {metricLabel(monitor.metric)}
           {monitor.score_name ? ` · ${monitor.score_name}` : ""}
@@ -264,11 +289,14 @@ function MonitorRow({
           ? `from ${figure(monitor.metric, s.baseline_value, rate)} to ${figure(monitor.metric, s.value, rate)}`
           : figure(monitor.metric, s.value, rate)}
       </td>
-      <td className="num">{s.bound === null ? "–" : figure(monitor.metric, s.bound, drift ? rate : true)}</td>
+      <td className="num">{s.bound === null ? "–" : drift ? boundText(monitor.metric, s.bound, rate) : figure(monitor.metric, s.bound, true)}</td>
       <td className="num">{monitor.metric === "trace_count" ? "–" : count(s.samples)}</td>
       <td>
         <button type="button" className="link" onClick={onToggle}>
           {monitor.enabled ? "Disable" : "Enable"}
+        </button>{" "}
+        <button type="button" className="link" onClick={onToggleMuted}>
+          {monitor.muted ? "Unmute" : "Mute"}
         </button>{" "}
         <button type="button" className="link" onClick={onRemove} aria-label={`Delete monitor ${monitor.name}`}>
           Delete
@@ -298,7 +326,9 @@ function MonitorForm({
   const [threshold, setThreshold] = useState("");
   // Blank takes the server's default for the metric.
   const [minSamples, setMinSamples] = useState("");
-  const [cooldown, setCooldown] = useState("60");
+  // Blank takes the server's default: 60 minutes, or a drift monitor's window.
+  const [cooldown, setCooldown] = useState("");
+  const [muted, setMuted] = useState(false);
   const [service, setService] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -323,7 +353,7 @@ function MonitorForm({
     if (drift && baselineMinutes.trim() !== "" && (!Number.isInteger(baseline) || baseline < 1)) return onError("The baseline must be a whole number of minutes.");
     if (drift && limit < 0) return onError("The smallest change must be 0 or more.");
     if (!drift && minSamples.trim() !== "" && (!Number.isInteger(samples) || samples < 1)) return onError("Min samples must be a whole number of at least 1.");
-    if (cooldown.trim() === "" || !Number.isInteger(cooldownMinutes) || cooldownMinutes < 0) return onError("The cooldown must be a whole number of minutes, or 0.");
+    if (cooldown.trim() !== "" && (!Number.isInteger(cooldownMinutes) || cooldownMinutes < 0)) return onError("The cooldown must be a whole number of minutes, or 0.");
     setSaving(true);
     createMonitor({
       name: name.trim(),
@@ -333,8 +363,9 @@ function MonitorForm({
       window_minutes: minutes,
       comparison,
       threshold: limit,
-      cooldown_minutes: cooldownMinutes,
+      ...(cooldown.trim() === "" ? {} : { cooldown_minutes: cooldownMinutes }),
       mode,
+      muted,
       ...(drift && baselineMinutes.trim() !== "" ? { baseline_minutes: baseline } : {}),
       ...(drift || minSamples.trim() === "" || !usesMinSamples(metric) ? {} : { min_samples: samples }),
     }).then(
@@ -402,7 +433,10 @@ function MonitorForm({
         </label>
       )}
       <label>
-        Cooldown (minutes) <input value={cooldown} onChange={(e) => setCooldown(e.target.value)} inputMode="numeric" size={6} />
+        Cooldown (minutes) <input value={cooldown} onChange={(e) => setCooldown(e.target.value)} inputMode="numeric" size={6} placeholder={drift ? "the window" : "60"} />
+      </label>
+      <label>
+        Muted <input type="checkbox" checked={muted} onChange={(e) => setMuted(e.target.checked)} />
       </label>
       <label>
         Service <input value={service} onChange={(e) => setService(e.target.value)} placeholder="all" size={12} />

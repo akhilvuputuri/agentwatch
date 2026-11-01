@@ -17,7 +17,11 @@ A drift monitor asks a different question: did the metric move, between the trai
 the window directly before it? See `drift` for the comparison. It tests overlapping windows over
 and over, so it has guards of its own: it evaluates at most once an hour, uses a 99.5% interval,
 and fires only on six breaches in a row. It reports a change, not a level: once a shift has been
-in place for a whole baseline window, the two windows agree again and the monitor recovers.
+in place for a whole baseline window, the two windows agree again and the monitor resolves, whatever
+the level is. Simulated traffic with ordinary overdispersion still fires falsely, so trial one muted.
+
+A muted monitor runs as usual, but its alerts are written as already delivered, so a polling
+client never sees them. Toggling it changes nothing about its state.
 
 Alerts carry only names and numbers. Delivery is a client polling for undelivered alerts, so
 agentwatch stores no URL or secret and calls nothing.
@@ -89,6 +93,8 @@ DRIFT_INTERVAL_NS = 60 * MINUTE_NS
 DRIFT_CONFIDENCE = 0.995
 DRIFT_BREACHES = 6
 DRIFT_RESAMPLES = 2000
+# A longer gap means the breaches so far were about windows unrelated to the next one.
+DRIFT_MAX_GAP_NS = 3 * DRIFT_INTERVAL_NS
 
 
 class MonitorError(ValueError):
@@ -124,6 +130,8 @@ class Monitor:
     mode: str = THRESHOLD
     # The length of that window; None in threshold mode.
     baseline_minutes: int | None = None
+    # Evaluates as usual, but its alerts are written as already delivered.
+    muted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,8 +175,12 @@ class Alert:
     # CHANGED or REMOVED when an edit resolved it; otherwise None.
     reason: str | None = None
     mode: str = THRESHOLD
-    # Drift only: the value this moved from, to `value`. `bound` is then a difference.
+    # Drift only: the two windows' values and the baseline's length. `bound` is then a difference.
+    # A resolved alert means these windows no longer differ, not that the level has come back.
     baseline_value: float | None = None
+    baseline_minutes: int | None = None
+    # Its monitor was muted, so it was written as already delivered.
+    muted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +197,7 @@ class Reading:
 
 _COLUMNS = (
     "id, name, metric, score_name, service, window_minutes, comparison, threshold, min_samples, "
-    "cooldown_minutes, enabled, created_ns, mode, baseline_minutes"
+    "cooldown_minutes, enabled, created_ns, mode, baseline_minutes, muted"
 )
 _STATE_COLUMNS = (
     "monitor_id, state, value, bound, samples, evaluated_ns, since_ns, insufficient, "
@@ -193,7 +205,8 @@ _STATE_COLUMNS = (
 )
 _ALERT_COLUMNS = (
     "id, monitor_id, monitor_name, kind, metric, comparison, threshold, value, bound, samples, "
-    "window_minutes, created_ns, delivered_ns, reason, mode, baseline_value"
+    "window_minutes, created_ns, delivered_ns, reason, mode, baseline_value, "
+    "baseline_minutes, muted"
 )
 _FIELDS = (
     "name",
@@ -208,6 +221,7 @@ _FIELDS = (
     "enabled",
     "mode",
     "baseline_minutes",
+    "muted",
 )
 # What the state's meaning depends on: a change to any of these starts the monitor again. A name
 # or a cooldown changes nothing about what was measured.
@@ -234,7 +248,10 @@ def create_monitor(store: Store, body: Any, *, now_ns: int | None = None) -> Mon
         "min_samples": (
             RATE_MIN_SAMPLES if data.get("metric") in ERROR_RATES else DEFAULT_MIN_SAMPLES
         ),
-        "cooldown_minutes": DEFAULT_COOLDOWN_MINUTES,
+        # Long enough that a drift monitor cannot resolve and re-fire on one shift.
+        "cooldown_minutes": (
+            data.get("window_minutes") if data.get("mode") == DRIFT else DEFAULT_COOLDOWN_MINUTES
+        ),
         "enabled": True,
     }
     created = time.time_ns() if now_ns is None else now_ns
@@ -242,7 +259,7 @@ def create_monitor(store: Store, body: Any, *, now_ns: int | None = None) -> Mon
     with store.transaction() as db:
         _check_name_free(db, monitor.name)
         db.execute(
-            f"INSERT INTO monitors ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO monitors ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 monitor.id,
                 monitor.name,
@@ -258,6 +275,7 @@ def create_monitor(store: Store, body: Any, *, now_ns: int | None = None) -> Mon
                 monitor.created_ns,
                 monitor.mode,
                 monitor.baseline_minutes,
+                monitor.muted,
             ],
         )
     return monitor
@@ -283,7 +301,7 @@ def update_monitor(
         db.execute(
             "UPDATE monitors SET metric = ?, score_name = ?, service = ?, window_minutes = ?, "
             "comparison = ?, threshold = ?, min_samples = ?, cooldown_minutes = ?, enabled = ?, "
-            "mode = ?, baseline_minutes = ? WHERE id = ?",
+            "mode = ?, baseline_minutes = ?, muted = ? WHERE id = ?",
             [
                 monitor.metric,
                 monitor.score_name,
@@ -296,6 +314,7 @@ def update_monitor(
                 monitor.enabled,
                 monitor.mode,
                 monitor.baseline_minutes,
+                monitor.muted,
                 monitor.id,
             ],
         )
@@ -408,6 +427,9 @@ def _validated(fields: dict[str, Any], *, monitor_id: str, created_ns: int) -> M
     threshold = _threshold(fields.get("threshold"), metric)
     if mode == DRIFT and threshold < 0:
         raise MonitorError("a drift monitor's threshold is the smallest change, so at least 0")
+    muted = fields.get("muted", False)
+    if not isinstance(muted, bool):
+        raise MonitorError("muted must be true or false")
     return Monitor(
         id=monitor_id,
         name=name,
@@ -425,6 +447,7 @@ def _validated(fields: dict[str, Any], *, monitor_id: str, created_ns: int) -> M
         created_ns=created_ns,
         mode=mode,
         baseline_minutes=baseline,
+        muted=muted,
     )
 
 
@@ -648,13 +671,16 @@ def next_drift_state(
 ) -> tuple[str, int, int | None]:
     """The state, breaches in a row and good-since time after a drift evaluation.
 
-    An underpowered evaluation is no evidence either way, so it changes none of them, except to
-    move good-since forward so that the time it covers does not count toward the cooldown.
+    An underpowered evaluation is no evidence either way, so it neither fires nor recovers: it
+    moves good-since forward, so that its time does not count toward the cooldown, and ends a run
+    of breaches, as does a gap of over DRIFT_MAX_GAP_NS, since "in a row" needs related windows.
     """
+    if last_evaluated is not None and now_ns - last_evaluated > DRIFT_MAX_GAP_NS and state == OK:
+        breaches = 0
     if result.verdict == drift.UNDERPOWERED:
         if good_since is not None and last_evaluated is not None:
             good_since += max(0, now_ns - last_evaluated)
-        return state, breaches, good_since
+        return state, 0 if state == OK else breaches, good_since
     breaching = drift_breach(monitor, result)
     if state == OK:
         breaches = breaches + 1 if breaching else 0
@@ -758,7 +784,7 @@ def _write_alert(
 ) -> None:
     db.execute(
         f"INSERT INTO alerts ({_ALERT_COLUMNS}) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             uuid.uuid4().hex,
             monitor.id,
@@ -772,9 +798,12 @@ def _write_alert(
             samples,
             monitor.window_minutes,
             now_ns,
+            now_ns if monitor.muted else None,
             reason,
             monitor.mode,
             baseline_value,
+            monitor.baseline_minutes,
+            monitor.muted,
         ],
     )
 

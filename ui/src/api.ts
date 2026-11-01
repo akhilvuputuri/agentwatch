@@ -667,11 +667,13 @@ export interface Monitor {
   mode: MonitorMode;
   /** The window compared with, directly before the trailing one; null in threshold mode. */
   baseline_minutes: number | null;
+  /** Evaluates as usual, but its alerts are written as already delivered. */
+  muted: boolean;
   state: MonitorState;
 }
 
-export type NewMonitor = Pick<Monitor, "name" | "metric" | "score_name" | "service" | "window_minutes" | "comparison" | "threshold" | "cooldown_minutes"> &
-  Partial<Pick<Monitor, "min_samples" | "mode" | "baseline_minutes">>;
+export type NewMonitor = Pick<Monitor, "name" | "metric" | "score_name" | "service" | "window_minutes" | "comparison" | "threshold"> &
+  Partial<Pick<Monitor, "cooldown_minutes" | "min_samples" | "mode" | "baseline_minutes" | "muted">>;
 
 export interface Alert {
   id: string;
@@ -690,8 +692,11 @@ export interface Alert {
   delivered_ns: string | null;
   reason: "changed" | "removed" | null;
   mode: MonitorMode;
-  /** Drift only: the value this moved from, to `value`. */
+  /** Drift only: the baseline window's value and length. A resolved alert means the windows no longer differ, not that the level recovered. */
   baseline_value: number | null;
+  baseline_minutes: number | null;
+  /** Its monitor was muted, so it was written as already delivered. */
+  muted: boolean;
 }
 
 export async function listMonitors(signal?: AbortSignal): Promise<Monitor[]> {
@@ -727,7 +732,7 @@ export interface DriftComparison {
   current_samples: number;
   direction: "higher" | "lower" | "none";
   verdict: "changed" | "no detectable difference" | "underpowered";
-  /** The interval's half-width: the smallest change this data could have shown. */
+  /** The change this data would usually have shown (80% power); null when it cannot say. */
   detectable: number | null;
   truncated: boolean;
   proportion: boolean;
@@ -735,8 +740,10 @@ export interface DriftComparison {
 }
 
 export interface DriftSummary {
-  days: number;
+  days: number | null;
   end_ns: string;
+  /** The level of every interval, corrected for how many are compared. */
+  confidence: number;
   comparisons: DriftComparison[];
 }
 
@@ -760,10 +767,10 @@ export interface DriftWindows {
   current_to: string;
 }
 
-export async function getDrift(metric: DriftMetric, windows: DriftWindows, service: string, signal?: AbortSignal): Promise<DriftComparison> {
-  const params = new URLSearchParams({ metric, ...windows });
+export async function getDriftAround(windows: DriftWindows, service: string, signal?: AbortSignal): Promise<DriftSummary> {
+  const params = new URLSearchParams({ ...windows });
   if (service) params.set("service", service);
-  return (await getJson<{ comparison: DriftComparison }>(`api/drift?${params}`, signal)).comparison;
+  return getJson<DriftSummary>(`api/drift/summary?${params}`, signal);
 }
 
 export async function listChanges(service: string, signal?: AbortSignal): Promise<DetectedChange[]> {

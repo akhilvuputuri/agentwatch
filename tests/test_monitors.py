@@ -846,6 +846,8 @@ def test_alerts_order_and_delivery(client: TestClient, db: Store, traces: Traces
         "reason",
         "mode",
         "baseline_value",
+        "baseline_minutes",
+        "muted",
     }
     oldest = client.get("/api/alerts?undelivered=1").json()["alerts"]
     assert [a["kind"] for a in oldest] == ["firing", "resolved"]
@@ -943,3 +945,36 @@ def test_migration_from_schema_8(tmp_path: Path) -> None:
     assert len(monitors.list_monitors(upgraded)) == 1
     assert monitors.list_alerts(upgraded) == []
     upgraded.close()
+
+
+def test_a_muted_monitor_records_alerts_no_client_is_sent(db: Store, traces: Traces) -> None:
+    monitor = make(db, muted=True)
+    assert monitor.muted
+    fire_and_resolve(db, traces)
+    fired, resolved = alerts(db)
+    assert (fired.kind, resolved.kind) == ("firing", "resolved")
+    assert fired.muted
+    assert resolved.muted
+    assert fired.delivered_ns == fired.created_ns
+    assert resolved.delivered_ns == resolved.created_ns
+    assert monitors.list_alerts(db, undelivered=True) == []
+
+
+def test_toggling_mute_changes_no_state_and_makes_no_alert(db: Store, traces: Traces) -> None:
+    traces.calls(MODEL, failed=20, total=20)
+    monitor = make(db)
+    monitors.evaluate(db, monitor, NOW)
+    before = monitors.get_state(db, monitor.id)
+    assert before.state == FIRING
+    muted = monitors.update_monitor(db, monitor.id, {"muted": True}, now_ns=NOW + 1)
+    assert muted.muted
+    assert monitors.get_state(db, monitor.id) == before
+    assert len(alerts(db)) == 1
+    # What was already written stays as it was: still waiting for delivery.
+    assert len(monitors.list_alerts(db, undelivered=True)) == 1
+    # An edit that resolves a muted monitor is muted too.
+    monitors.delete_monitor(db, monitor.id, now_ns=NOW + 2)
+    assert alerts(db)[-1].muted
+    assert len(monitors.list_alerts(db, undelivered=True)) == 1
+    with pytest.raises(monitors.MonitorError, match="muted"):
+        make(db, name="bad", muted="yes")

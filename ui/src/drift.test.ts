@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { beforeAfter } from "./Drift";
+import { boundText, driftAlertText } from "./Alerts";
+import type { Alert, DetectedChange } from "./api";
+import { beforeAfter, changeService } from "./Drift";
 
 const DAY = 24n * 3600n * 1_000_000_000n;
 
@@ -23,5 +25,32 @@ describe("beforeAfter", () => {
   });
   it("has nothing to compare for a change not yet past", () => {
     expect(beforeAfter(String(at), 7, at)).toBeNull();
+  });
+});
+
+describe("changeService", () => {
+  const change = (service: string | null): DetectedChange => ({ kind: "version", name: "2", service, first_seen_ns: "1" });
+  it("uses the change's own service, or the page's when it has none", () => {
+    expect(changeService(change("api"), "other")).toBe("api");
+    expect(changeService(change(null), "other")).toBe("other");
+  });
+});
+
+describe("a falling drift monitor", () => {
+  it("shows a negative bound with its sign and unit", () => {
+    expect(boundText("cost_per_trace", -0.5, false)).toBe("−$0.500");
+    expect(boundText("model_p95_ms", -250, false)).toBe("−250 ms");
+    expect(boundText("model_error_rate", -0.125, true)).toBe("−12.5%");
+    expect(boundText("model_error_rate", 0.125, true)).toBe("+12.5%");
+  });
+});
+
+describe("a drift alert", () => {
+  const alert = (fields: Partial<Alert>): Alert =>
+    ({ kind: "firing", metric: "model_error_rate", mode: "drift", value: 0.4, baseline_value: 0.1, ...fields }) as Alert;
+  it("says what moved when firing, and that the windows agree when resolved", () => {
+    expect(driftAlertText(alert({}), true)).toBe("from 10% to 40%");
+    expect(driftAlertText(alert({ kind: "resolved", value: 0.4, baseline_value: 0.39 }), true)).toBe("windows no longer differ: 39% and 40%");
+    expect(driftAlertText(alert({ kind: "resolved", value: null, baseline_value: null }), true)).toBe("–");
   });
 });

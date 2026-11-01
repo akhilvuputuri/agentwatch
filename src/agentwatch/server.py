@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from importlib import resources
 from pathlib import Path
@@ -64,6 +65,9 @@ MAX_ITEMS_PER_REQUEST = 1000
 # Traces returned with one session.
 SESSION_TRACES = 500
 MAX_CHANGES = 200
+DRIFT_RETRY_AFTER_S = 5
+DRIFT_CACHE_S = 30.0
+DRIFT_CACHE_ENTRIES = 64
 
 
 def create_app(
@@ -479,50 +483,88 @@ def create_app(
             lambda: {"alert": _alert_json(monitors.mark_delivered(store, alert_id))}
         )
 
+    # One comparison at a time: a bootstrap is CPU in Python, so several would starve ingest.
+    drift_gate = threading.Lock()
+    drift_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+
+    async def gated_drift(key: tuple[Any, ...], work: Callable[[], dict[str, Any]]) -> Response:
+        """The cached result of the same request if it is recent; otherwise runs it, or 429."""
+        cached = drift_cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            return JSONResponse(cached[1])
+        if not drift_gate.acquire(blocking=False):
+            return PlainTextResponse(
+                "another comparison is running; try again shortly",
+                status_code=429,
+                headers={"retry-after": str(DRIFT_RETRY_AFTER_S)},
+            )
+        try:
+            result = await run_in_threadpool(work)
+        except drift.DriftError as error:
+            return PlainTextResponse(str(error), status_code=400)
+        finally:
+            drift_gate.release()
+        if len(drift_cache) >= DRIFT_CACHE_ENTRIES:
+            drift_cache.clear()
+        drift_cache[key] = (time.monotonic() + DRIFT_CACHE_S, result)
+        return JSONResponse(result)
+
     async def drift_view(request: Request) -> Response:
         """One metric over two windows, which must not overlap."""
         query = request.query_params
-        names = ("baseline_from", "baseline_to", "current_from", "current_to")
-        raw = [query.get(name, "") for name in names]
-        if not all(v.isascii() and v.isdigit() and len(v) <= 19 for v in raw):
-            return PlainTextResponse(f"{', '.join(names)} must be Unix nanoseconds", 400)
-        start, split_before, split_after, end = (int(v) for v in raw)
-        if not 0 <= start < split_before <= split_after < end <= otlp.MAX_TIME_NS:
-            return PlainTextResponse(
-                "need baseline_from < baseline_to <= current_from < current_to", status_code=400
-            )
-        return await _drift_call(
+        windows = _drift_windows(query)
+        if isinstance(windows, Response):
+            return windows
+        if windows is None:
+            return PlainTextResponse(f"{', '.join(_WINDOW_PARAMS)} are required", status_code=400)
+        baseline, current = windows
+        metric, service = query.get("metric", ""), query.get("service") or None
+        model, score_name = query.get("model") or None, query.get("score_name") or None
+        return await gated_drift(
+            ("one", metric, baseline, current, service, model, score_name),
             lambda: {
                 "comparison": asdict(
                     drift.compare(
                         store,
-                        query.get("metric", ""),
-                        baseline=(start, split_before),
-                        current=(split_after, end),
-                        service=query.get("service") or None,
-                        model=query.get("model") or None,
-                        score_name=query.get("score_name") or None,
+                        metric,
+                        baseline=baseline,
+                        current=current,
+                        service=service,
+                        model=model,
+                        score_name=score_name,
                     )
                 )
-            }
+            },
         )
 
     async def drift_summary(request: Request) -> Response:
+        """Every metric over the last `days` days and those before, or over two given windows."""
         query = request.query_params
-        days = _days(query.get("days", "7"), 365)
-        if days is None:
-            return PlainTextResponse("days must be a whole number from 1 to 365", status_code=400)
-        now = time.time_ns()
         service = query.get("service") or None
-        return await _drift_call(
-            lambda: {
-                "days": days,
-                "end_ns": str(now),
-                "comparisons": [
-                    asdict(c) for c in drift.summary(store, service=service, days=days, now_ns=now)
-                ],
+        windows = _drift_windows(query)
+        if isinstance(windows, Response):
+            return windows
+        days = _days(query.get("days", "7"), 365)
+        if windows is None and days is None:
+            return PlainTextResponse("days must be a whole number from 1 to 365", status_code=400)
+
+        def work() -> dict[str, Any]:
+            if windows is not None:
+                found = drift.summary_between(
+                    store, service=service, baseline=windows[0], current=windows[1]
+                )
+                end = windows[1][1]
+            else:
+                end = time.time_ns()
+                found = drift.summary(store, service=service, days=days or 7, now_ns=end)
+            return {
+                "days": None if windows is not None else days,
+                "end_ns": str(end),
+                "confidence": found[0].confidence,
+                "comparisons": [asdict(c) for c in found],
             }
-        )
+
+        return await gated_drift(("summary", service, days if windows is None else windows), work)
 
     async def changes_view(request: Request) -> Response:
         query = request.query_params
@@ -880,12 +922,24 @@ async def _monitor_call(work: Callable[[], Any], *, status: int = 200) -> Respon
     return JSONResponse(result, status_code=status)
 
 
-async def _drift_call(work: Callable[[], Any]) -> Response:
-    """Run a drift comparison in the threadpool: the bootstrap must not block the event loop."""
-    try:
-        return JSONResponse(await run_in_threadpool(work))
-    except drift.DriftError as error:
-        return PlainTextResponse(str(error), status_code=400)
+_WINDOW_PARAMS = ("baseline_from", "baseline_to", "current_from", "current_to")
+
+
+def _drift_windows(
+    query: Mapping[str, str],
+) -> tuple[tuple[int, int], tuple[int, int]] | Response | None:
+    """The two windows of a comparison; None when none of their parameters is given."""
+    raw = [query.get(name, "") for name in _WINDOW_PARAMS]
+    if not any(raw):
+        return None
+    if not all(v.isascii() and v.isdigit() and len(v) <= 19 for v in raw):
+        return PlainTextResponse(f"{', '.join(_WINDOW_PARAMS)} must be Unix nanoseconds", 400)
+    start, split_before, split_after, end = (int(v) for v in raw)
+    if not 0 <= start < split_before <= split_after < end <= otlp.MAX_TIME_NS:
+        return PlainTextResponse(
+            "need baseline_from < baseline_to <= current_from < current_to", status_code=400
+        )
+    return (start, split_before), (split_after, end)
 
 
 def _days(value: str, maximum: int) -> int | None:

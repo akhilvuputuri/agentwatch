@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,15 @@ from agentwatch.drift import Records, TraceRecord
 from agentwatch.monitors import FIRING, OK, MonitorRunner
 from agentwatch.scores import API, BOOLEAN, NUMERIC, Score
 from agentwatch.spans import STATUS_ERROR, Attributes, Span
-from agentwatch.stats import CHANGED, NO_DIFFERENCE, UNDERPOWERED
+from agentwatch.stats import (
+    CHANGED,
+    NO_DIFFERENCE,
+    UNDERPOWERED,
+    Z_80,
+    Z_95,
+    Z_POWER,
+    z_for,
+)
 from agentwatch.store import Store
 from tests import drift_simulation
 
@@ -272,9 +281,13 @@ def test_no_difference_says_what_it_could_have_shown() -> None:
     result = result_of(same, same)
     assert (result.verdict, result.direction) == (NO_DIFFERENCE, "none")
     assert result.interval is not None
-    assert result.detectable == pytest.approx((result.interval[1] - result.interval[0]) / 2)
-    assert result.detectable is not None
-    assert result.detectable > 0
+    half = (result.interval[1] - result.interval[0]) / 2
+    # A true change of the half-width clears the interval only half the time; 80% power takes more.
+    assert result.detectable == pytest.approx(half * Z_POWER / Z_95)
+    wider = result_of(same, same, confidence=0.99)
+    assert wider.interval is not None
+    half = (wider.interval[1] - wider.interval[0]) / 2
+    assert wider.detectable == pytest.approx(half * (z_for(0.99) + Z_80) / z_for(0.99))
 
 
 def test_two_clean_windows_do_not_claim_certainty() -> None:
@@ -284,6 +297,23 @@ def test_two_clean_windows_do_not_claim_certainty() -> None:
     assert result.verdict == NO_DIFFERENCE
     assert result.detectable is not None
     assert result.detectable > 0.1
+
+
+@pytest.mark.parametrize("metric", [drift.COST_PER_TRACE, drift.MODEL_MEAN_MS])
+def test_no_spread_cannot_say_what_would_show(metric: str) -> None:
+    alike = Records(tuple(TraceRecord(f"{n:032x}", 2.0, 1) for n in range(12)))
+    varied = Records(tuple(TraceRecord(f"{n:032x}", float(n), 1) for n in range(12)))
+    for baseline, current in ((alike, alike), (alike, varied), (varied, alike)):
+        result = drift.compare_records(metric, baseline, current)
+        assert result.detectable is None
+    assert drift.compare_records(metric, varied, varied).detectable is not None
+
+
+def test_no_spread_in_a_percentile_cannot_say() -> None:
+    alike = Records(tuple(TraceRecord(f"{n:032x}", 0.0, 2, (5.0, 5.0)) for n in range(12)))
+    result = drift.compare_records(drift.MODEL_P95_MS, alike, alike)
+    assert result.verdict == NO_DIFFERENCE
+    assert result.detectable is None
 
 
 def test_one_trace_of_many_failures_is_not_a_change() -> None:
@@ -401,6 +431,99 @@ def time_now_minus_days(days: int) -> int:
     return time.time_ns() - days * DAY
 
 
+def test_the_single_metric_api_stays_at_95(client: TestClient, traces: Traces) -> None:
+    traces.many(12, BEFORE, ok=2)
+    traces.many(12, AFTER, failed=2)
+    assert client.get("/api/drift", params=query()).json()["comparison"]["confidence"] == 0.95
+
+
+def test_the_summary_corrects_for_how_many_it_compares(db: Store, traces: Traces) -> None:
+    traces.score("first", 1.0, at=NOW - DAY)
+    traces.score("second", 1.0, at=NOW - DAY)
+    found = drift.summary(db, service=None, days=7, now_ns=NOW)
+    assert len(found) == 7
+    assert all(c.confidence == pytest.approx(1 - 0.05 / 7) for c in found)
+
+
+def test_the_summary_takes_two_windows_with_scores_and_service(
+    client: TestClient, traces: Traces
+) -> None:
+    traces.add(AFTER, ok=1, service="other")
+    traces.score("helpful", 1.0, at=AFTER)
+    window = {k: v for k, v in query().items() if k != "metric"}
+    body = client.get("/api/drift/summary", params=window).json()
+    assert body["days"] is None
+    assert body["confidence"] == pytest.approx(1 - 0.05 / 6)
+    assert [c["metric"] for c in body["comparisons"]][-1] == drift.SCORE_MEAN
+    other = client.get("/api/drift/summary", params=window | {"service": "other"}).json()
+    # A trace of the other service, and the score is not on one.
+    assert [c["metric"] for c in other["comparisons"]] == list(drift.CALL_METRICS)
+    assert client.get("/api/drift/summary", params=window | {"current_to": "x"}).status_code == 400
+
+
+def test_one_comparison_runs_at_a_time(
+    client: TestClient, traces: Traces, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    traces.add(AFTER, ok=1)
+    started, finish = threading.Event(), threading.Event()
+    real = drift.compare
+    replies: list[int] = []
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        finish.wait(10)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(drift, "compare", slow)
+
+    def first() -> None:
+        replies.append(client.get("/api/drift", params=query()).status_code)
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    assert started.wait(10)
+    for path, params in (
+        ("/api/drift", query(metric=drift.MODEL_MEAN_MS)),
+        ("/api/drift/summary", {"days": 7}),
+    ):
+        busy = client.get(path, params=params)
+        assert busy.status_code == 429
+        assert busy.headers["retry-after"] == str(server.DRIFT_RETRY_AFTER_S)
+    finish.set()
+    thread.join(10)
+    assert replies == [200]
+    # Free again, and a refused request was not remembered.
+    assert client.get("/api/drift", params=query(metric=drift.MODEL_MEAN_MS)).status_code == 200
+
+
+def test_a_recent_identical_request_is_served_from_the_cache(
+    client: TestClient, traces: Traces, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    traces.add(AFTER, ok=1)
+    calls: list[str] = []
+    real = drift.compare
+
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        calls.append(args[1])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(drift, "compare", counted)
+    first = client.get("/api/drift", params=query())
+    # The same request, with an empty filter that means no filter.
+    again = client.get("/api/drift", params=query(service=""))
+    assert first.json() == again.json()
+    assert len(calls) == 1
+    client.get("/api/drift", params=query(service="other"))
+    assert len(calls) == 2
+    # An error is not kept, and costs the gate nothing.
+    assert client.get("/api/drift", params=query(metric="x")).status_code == 400
+    assert client.get("/api/drift", params=query()).status_code == 200
+    monkeypatch.setattr(server, "DRIFT_CACHE_S", -1.0)
+    client.get("/api/drift", params=query(model="m"))
+    client.get("/api/drift", params=query(model="m"))
+    assert len(calls) == 5
+
+
 def test_summary_compares_the_last_days_with_those_before(db: Store, traces: Traces) -> None:
     traces.many(12, NOW - 10 * DAY, ok=2)
     traces.many(12, NOW - 2 * DAY, failed=2)
@@ -479,6 +602,24 @@ def comparison(
     )
 
 
+def test_a_drift_monitors_cooldown_defaults_to_its_window(db: Store) -> None:
+    body = {
+        "name": "defaults",
+        "mode": "drift",
+        "metric": drift.MODEL_ERROR_RATE,
+        "window_minutes": 500,
+        "comparison": "above",
+        "threshold": 0.1,
+    }
+    assert monitors.create_monitor(db, body).cooldown_minutes == 500
+    given = monitors.create_monitor(db, body | {"name": "given", "cooldown_minutes": 7})
+    assert given.cooldown_minutes == 7
+    level = monitors.create_monitor(db, body | {"name": "level", "mode": "threshold"})
+    assert level.cooldown_minutes == monitors.DEFAULT_COOLDOWN_MINUTES
+    with pytest.raises(monitors.MonitorError, match="window_minutes"):
+        monitors.create_monitor(db, {k: v for k, v in body.items() if k != "window_minutes"})
+
+
 def test_a_drift_monitor_defaults_and_refusals(db: Store) -> None:
     monitor = make(db)
     assert monitor.baseline_minutes == monitor.window_minutes
@@ -536,11 +677,22 @@ def test_it_fires_only_on_consecutive_breaches(db: Store) -> None:
     assert step(monitor, comparison(), OK, breaches)[:2] == (FIRING, monitors.DRIFT_BREACHES)
 
 
+def test_a_long_gap_ends_a_run_of_breaches(db: Store) -> None:
+    monitor = make(db)
+    limit = monitors.DRIFT_MAX_GAP_NS
+    almost = monitors.DRIFT_BREACHES - 1
+    assert step(monitor, comparison(), OK, almost, None, NOW - limit)[:2] == (
+        FIRING,
+        monitors.DRIFT_BREACHES,
+    )
+    assert step(monitor, comparison(), OK, almost, None, NOW - limit - 1)[:2] == (OK, 1)
+
+
 def test_underpowered_neither_fires_nor_recovers(db: Store) -> None:
     monitor = make(db)
     thin = comparison(UNDERPOWERED, "none")
-    # It keeps the count, and does not add to it.
-    assert step(monitor, thin, OK, 5) == (OK, 5, None)
+    # It does not fire, and it ends a run, or breaches either side of it could combine.
+    assert step(monitor, thin, OK, 5) == (OK, 0, None)
     # While firing it adds no good time: good-since moves along with the clock.
     assert step(monitor, thin, FIRING, 6, NOW - 10, NOW - HOUR) == (
         FIRING,
@@ -593,6 +745,40 @@ def test_hourly_cadence_and_the_alert(db: Store, traces: Traces) -> None:
     assert alert.bound is not None
     assert 0 < alert.bound < 1
     assert alert.samples == 30
+    assert alert.baseline_minutes == monitor.baseline_minutes
+    assert alert.muted is False
+
+
+def test_a_resolved_drift_alert_shows_the_windows_agree_at_the_new_level(
+    db: Store, traces: Traces
+) -> None:
+    monitor = make(db, cooldown_minutes=0)
+    traces.many(15, NOW - 2 * DAY - 12 * HOUR, ok=2)
+    traces.many(15, NOW - 2 * DAY + 10 * HOUR, failed=2)
+    for hours in range(monitors.DRIFT_BREACHES):
+        monitors.evaluate(db, monitor, NOW - DAY + hours * HOUR)
+    assert monitors.get_state(db, monitor.id).state == FIRING
+    # A day on, the same high failure rate fills both windows.
+    traces.many(15, NOW - HOUR, failed=2)
+    monitors.evaluate(db, monitor, NOW)
+    [resolved, fired] = monitors.list_alerts(db)
+    assert (fired.baseline_value, fired.value) == (0.0, 1.0)
+    assert resolved.kind == "resolved"
+    assert resolved.reason is None
+    # The level did not recover: both windows are bad, and a client can see that.
+    assert (resolved.baseline_value, resolved.value) == (1.0, 1.0)
+    assert resolved.baseline_minutes == monitor.baseline_minutes
+
+
+def test_a_muted_drift_monitor_is_delivered_at_once(db: Store, traces: Traces) -> None:
+    shifted(traces)
+    monitor = make(db, muted=True)
+    for hours in range(monitors.DRIFT_BREACHES):
+        monitors.evaluate(db, monitor, NOW + hours * HOUR)
+    [alert] = monitors.list_alerts(db)
+    assert alert.muted
+    assert alert.delivered_ns == alert.created_ns
+    assert monitors.list_alerts(db, undelivered=True) == []
 
 
 def test_underpowered_evaluation_is_recorded_as_insufficient(db: Store, traces: Traces) -> None:
@@ -662,7 +848,9 @@ def test_threshold_monitors_are_unchanged(db: Store, traces: Traces) -> None:
     # Evaluated again at once: threshold monitors have no hourly limit.
     assert monitors.evaluate(db, monitor, NOW + 1) is not None
     [alert] = monitors.list_alerts(db)
-    assert (alert.mode, alert.baseline_value) == ("threshold", None)
+    assert (alert.mode, alert.baseline_value, alert.baseline_minutes) == ("threshold", None, None)
+    assert alert.muted is False
+    assert alert.delivered_ns is None
     assert (alert.value, alert.samples) == (1.0, 20)
     assert alert.bound is not None
     assert alert.bound > 0.8
@@ -676,10 +864,13 @@ def test_migration_from_schema_9(tmp_path: Path) -> None:
     for table, column in (
         ("monitors", "mode"),
         ("monitors", "baseline_minutes"),
+        ("monitors", "muted"),
         ("monitor_states", "baseline_value"),
         ("monitor_states", "breaches"),
         ("alerts", "mode"),
         ("alerts", "baseline_value"),
+        ("alerts", "baseline_minutes"),
+        ("alerts", "muted"),
     ):
         conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
     conn.execute(
@@ -703,11 +894,12 @@ def test_migration_from_schema_9(tmp_path: Path) -> None:
     assert upgraded.query_one("SELECT value FROM meta WHERE key = 'schema'")[0] == "10"
     assert store.SCHEMA_VERSION == 10
     [monitor] = monitors.list_monitors(upgraded)
-    assert (monitor.mode, monitor.baseline_minutes) == ("threshold", None)
+    assert (monitor.mode, monitor.baseline_minutes, monitor.muted) == ("threshold", None, False)
     state = monitors.get_state(upgraded, "m")
     assert (state.state, state.baseline_value, state.breaches) == (FIRING, None, 0)
     [alert] = monitors.list_alerts(upgraded)
-    assert (alert.mode, alert.baseline_value) == ("threshold", None)
+    assert (alert.mode, alert.baseline_value, alert.baseline_minutes) == ("threshold", None, None)
+    assert alert.muted is False
     upgraded.close()
 
 
@@ -715,12 +907,33 @@ def test_migration_from_schema_9(tmp_path: Path) -> None:
 
 
 def test_no_real_change_rarely_fires() -> None:
-    """A regression pin on one seeded month each way; docs/design.md has the larger run."""
-    fired = sum(drift_simulation.false_alarms(seed, 3, False) for seed in (0, 1))
+    """A regression pin on seeded months of the easiest traffic. It is not a rate: harder traffic
+    fires far more often, and docs/design.md has the larger runs of each model."""
+    fired = sum(
+        drift_simulation.false_alarms(seed, 3, drift_simulation.INDEPENDENT) for seed in (0, 1)
+    )
     assert fired <= 1
 
 
 def test_a_real_shift_fires_within_days() -> None:
-    delay = drift_simulation.detection_delay(1000, 3, False)
+    delay = drift_simulation.detection_delay(1000, 3, drift_simulation.INDEPENDENT)
     assert delay is not None
     assert delay <= 96
+
+
+@pytest.mark.parametrize("model", drift_simulation.MODELS)
+def test_each_traffic_model_keeps_about_the_same_base_rate(model: str) -> None:
+    traffic = drift_simulation.Traffic(seed=3, days=400, model=model)
+    _, found = drift_simulation.generate(traffic)
+    failures = sum(r.numerator for r in found)
+    calls = sum(r.denominator for r in found)
+    # Incidents add to the base rate by design; everything else averages out to it.
+    expected = (0.08, 0.2) if model == drift_simulation.INCIDENTS else (0.08, 0.125)
+    assert expected[0] < failures / calls < expected[1]
+    assert 5 * 400 <= len(found) <= 20 * 400
+
+
+def test_one_shift_fires_once_with_the_window_as_cooldown() -> None:
+    traffic = drift_simulation.Traffic(seed=1000, days=7 + 6, shifted_rate=0.6, shift_day=7)
+    fired = drift_simulation.firings(traffic, drift_simulation.monitor(3), first_day=7)
+    assert len(fired) == 1
