@@ -21,7 +21,8 @@ in place for a whole baseline window, the two windows agree again and the monito
 the level is. Simulated traffic with ordinary overdispersion still fires falsely, so trial one muted.
 
 A muted monitor runs as usual, but its alerts are written as already delivered, so a polling
-client never sees them. Toggling it changes nothing about its state.
+client never sees them. Toggling it changes nothing about its state, and a resolved alert goes the
+way its firing alert went, so a client hears both or neither.
 
 Alerts carry only names and numbers. Delivery is a client polling for undelivered alerts, so
 agentwatch stores no URL or secret and calls nothing.
@@ -290,6 +291,9 @@ def update_monitor(
     data = _known(body)
     with store.transaction() as db:
         current = _get(db, monitor_id)
+        if data.get("mode") == DRIFT and current.mode != DRIFT and "cooldown_minutes" not in data:
+            # As for a new drift monitor: long enough that one shift cannot fire twice.
+            data["cooldown_minutes"] = data.get("window_minutes", current.window_minutes)
         monitor = _validated(
             asdict(current) | data, monitor_id=current.id, created_ns=current.created_ns
         )
@@ -673,10 +677,14 @@ def next_drift_state(
 
     An underpowered evaluation is no evidence either way, so it neither fires nor recovers: it
     moves good-since forward, so that its time does not count toward the cooldown, and ends a run
-    of breaches, as does a gap of over DRIFT_MAX_GAP_NS, since "in a row" needs related windows.
+    of breaches. A gap of over DRIFT_MAX_GAP_NS does the same, since "in a row" needs related
+    windows and nothing was measured during it.
     """
-    if last_evaluated is not None and now_ns - last_evaluated > DRIFT_MAX_GAP_NS and state == OK:
-        breaches = 0
+    if last_evaluated is not None and now_ns - last_evaluated > DRIFT_MAX_GAP_NS:
+        if state == OK:
+            breaches = 0
+        elif good_since is not None:
+            good_since += now_ns - last_evaluated
     if result.verdict == drift.UNDERPOWERED:
         if good_since is not None and last_evaluated is not None:
             good_since += max(0, now_ns - last_evaluated)
@@ -782,6 +790,16 @@ def _write_alert(
     reason: str | None = None,
     baseline_value: float | None = None,
 ) -> None:
+    muted = monitor.muted
+    if kind == RESOLVED:
+        # Goes the way its firing alert went: toggling mid-incident must not leave a client with
+        # a "firing" that never ends, or a "resolved" of something it never heard about.
+        fired = db.execute(
+            "SELECT muted FROM alerts WHERE monitor_id = ? AND kind = ? "
+            "ORDER BY created_ns DESC LIMIT 1",
+            [monitor.id, FIRED],
+        ).fetchone()
+        muted = monitor.muted if fired is None else bool(fired[0])
     db.execute(
         f"INSERT INTO alerts ({_ALERT_COLUMNS}) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -798,12 +816,12 @@ def _write_alert(
             samples,
             monitor.window_minutes,
             now_ns,
-            now_ns if monitor.muted else None,
+            now_ns if muted else None,
             reason,
             monitor.mode,
             baseline_value,
             monitor.baseline_minutes,
-            monitor.muted,
+            muted,
         ],
     )
 

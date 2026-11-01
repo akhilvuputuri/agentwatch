@@ -10,7 +10,7 @@ The verdict says only what the data can support:
 - `underpowered`: a window has fewer than MIN_TRACES traces, so nothing is claimed;
 - `changed`: the interval excludes zero;
 - `no detectable difference`: it does not. `detectable` is the size of change this data would
-  usually have shown (about 80% of the time), so this is not read as "no change".
+  usually have shown (about 60 to 80% of the time), so this is not read as "no change".
 
 It never says better or worse, since only the caller knows which way is bad, and it does not say
 why: a window can differ from the one before for reasons no deploy caused, such as the day of the
@@ -78,8 +78,10 @@ MAX_QUANTILE_SAMPLES = 20_000
 RESAMPLES = 1000
 SEED = 7
 MAX_SCORE_NAMES = 50
-# The chance of a false "changed" across a whole page, shared out among what it compares. The
-# interval's tails then shrink, so the resamples grow to leave a few draws beyond each end.
+# The target for a false "changed" anywhere on a page, shared out among what it compares. Intervals
+# run hot, so simulated pages of 5 reach 8.5 to 12.8% (docs/design.md). The tails shrink with the
+# share, so the resamples grow to leave a few draws beyond each end, up to about 10 comparisons;
+# past the cap an interval's ends rest on fewer draws.
 PAGE_ALPHA = 0.05
 RESAMPLES_PER_COMPARISON = 200
 MAX_PAGE_RESAMPLES = 2000
@@ -128,7 +130,7 @@ class Comparison:
     # Which way it moved, when it did: "none" unless the verdict is "changed".
     direction: str
     verdict: str
-    # The change this data would usually have shown (80% power). None when it cannot say: a
+    # The change this data would usually have shown (60 to 80% power). None when it cannot say: a
     # window with no spread at all gives the bootstrap nothing to go on.
     detectable: float | None
     truncated: bool

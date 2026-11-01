@@ -53,7 +53,7 @@ async function waitingTurn<T>(work: () => Promise<T>, signal: AbortSignal): Prom
     try {
       return await work();
     } catch (reason) {
-      if (attempt >= RETRIES || signal.aborted || !String(reason).includes("429")) throw reason;
+      if (attempt >= RETRIES || signal.aborted || !(reason instanceof Error && reason.message.startsWith("429 "))) throw reason;
       await new Promise((resolve) => window.setTimeout(resolve, RETRY_MS));
     }
   }

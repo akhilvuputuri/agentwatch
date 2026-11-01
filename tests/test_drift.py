@@ -937,3 +937,72 @@ def test_one_shift_fires_once_with_the_window_as_cooldown() -> None:
     traffic = drift_simulation.Traffic(seed=1000, days=7 + 6, shifted_rate=0.6, shift_day=7)
     fired = drift_simulation.firings(traffic, drift_simulation.monitor(3), first_day=7)
     assert len(fired) == 1
+
+
+def test_time_without_evaluations_does_not_count_toward_the_cooldown() -> None:
+    monitor = monitors.Monitor(
+        id="m",
+        name="m",
+        metric=drift.TOOL_ERROR_RATE,
+        score_name=None,
+        service=None,
+        window_minutes=7 * 24 * 60,
+        comparison=monitors.ABOVE,
+        threshold=0.0,
+        min_samples=1,
+        cooldown_minutes=7 * 24 * 60,
+        enabled=True,
+        created_ns=0,
+        mode=monitors.DRIFT,
+        baseline_minutes=7 * 24 * 60,
+    )
+    good = _no_change()
+    hour = monitors.DRIFT_INTERVAL_NS
+    start = 1_000 * hour
+    # Good for an hour, then down for 8 days: one good reading afterwards must not resolve it.
+    state, _, good_since = monitors.next_drift_state(
+        monitor, good, monitors.FIRING, 0, start, start, start + hour
+    )
+    later = start + hour + 8 * 24 * hour
+    state, _, good_since = monitors.next_drift_state(
+        monitor, good, state, 0, good_since, start + hour, later
+    )
+    assert state == monitors.FIRING
+    assert good_since == later - hour
+
+
+def _no_change() -> drift.Comparison:
+    return drift.Comparison(
+        metric=drift.TOOL_ERROR_RATE,
+        score_name=None,
+        baseline_value=0.1,
+        current_value=0.1,
+        difference=0.0,
+        interval=(-0.1, 0.1),
+        baseline_traces=50,
+        current_traces=50,
+        baseline_samples=50,
+        current_samples=50,
+        direction="none",
+        verdict=drift.NO_DIFFERENCE,
+        detectable=0.14,
+        truncated=False,
+        proportion=True,
+        confidence=0.995,
+    )
+
+
+def test_switching_a_monitor_to_drift_takes_the_longer_cooldown(db: Store) -> None:
+    monitor = monitors.create_monitor(
+        db,
+        {
+            "name": "m",
+            "metric": drift.TOOL_ERROR_RATE,
+            "window_minutes": 10_080,
+            "comparison": monitors.ABOVE,
+            "threshold": 0.1,
+        },
+    )
+    assert monitor.cooldown_minutes == monitors.DEFAULT_COOLDOWN_MINUTES
+    changed = monitors.update_monitor(db, monitor.id, {"mode": monitors.DRIFT, "threshold": 0})
+    assert changed.cooldown_minutes == 10_080

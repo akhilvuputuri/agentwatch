@@ -481,7 +481,9 @@ metric: a count has no traces to resample.
 given, no interval and no claim. `changed` when the interval excludes zero. `no detectable
 difference` otherwise, with `detectable`, a change this size would usually show, so it is not read
 as "no change". A true change equal to the interval's half-width clears it under half the time, so
-`detectable` is the half-width scaled to about 80% power, by (z + 0.84) / z at the interval's level.
+`detectable` is the half-width scaled by (z + 0.84) / z at the interval's level, which aims at 80%
+power. Measured, a true change of that size showed 57 to 77% of the time (300 runs at rates of 0.02,
+0.1 and 0.4 with 15 and 30 traces a side, about 3 points of noise), so read it as about 60 to 80%.
 It is null, shown as "can't say", when a window has no spread at all (every trace alike), since the
 bootstrap then has nothing to measure; a proportion at 0 or 1 still has its Wilson width. `direction`
 is `higher` or `lower` only for `changed`. It never says better or worse, since only the caller knows which way is bad, and it does
@@ -507,7 +509,11 @@ compares one metric at 95%; the times are required, as Unix nanoseconds, and the
 overlap. `GET /api/drift/summary?service=&days=7` compares the call metrics and up to 50 score names
 for the last N days (1 to 365) with the N before, or over two windows given as above. It tests k
 comparisons at once, so its intervals are Bonferroni-corrected to 1 - 0.05/k (with up to 2,000
-resamples to keep draws in the tails); the response gives that `confidence` and the page says so.
+resamples, which keeps a few draws in the tails up to about 10 comparisons; at the limit of 55 there
+is about one, so those ends are rough); the response gives that `confidence` and the page says so.
+That targets 5% across a page but does not reach it, because the intervals run hot: simulated pages
+of 5 metrics with no true difference showed a false "changed" 12.8% of the time at 10 traces a side,
+11.6% at 20 and 8.5% at 30, against roughly 30% uncorrected.
 
 Each of these two endpoints runs one comparison at a time across both, and answers 429 with
 `Retry-After` when busy, while the same normalised request is answered from a 30-second cache. The
@@ -537,8 +543,9 @@ simply filled the two windows. Threshold monitors otherwise behave as before.
 
 **Muted monitors.** A monitor of either mode with `muted` evaluates and records alerts as usual, but
 they are written as already delivered and flagged `muted`, so a polling client never sees them.
-Toggling it changes no state and no earlier alert: a monitor unmuted while firing is not announced
-until it next changes state, when the client may first hear "resolved". This is how a drift monitor
+Toggling it changes no state and no earlier alert. A resolved alert goes the way its firing alert
+went, whatever the monitor is now: muting mid-incident still sends the resolve of what the client was
+told, and unmuting mid-incident sends nothing until the next firing. This is how a drift monitor
 should be trialled on real traffic, given the results below, before it can reach a phone.
 
 **Load, measured in process on a laptop.** The bootstrap holds no store lock, but it is pure Python.

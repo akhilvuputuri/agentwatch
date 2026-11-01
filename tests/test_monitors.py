@@ -972,9 +972,21 @@ def test_toggling_mute_changes_no_state_and_makes_no_alert(db: Store, traces: Tr
     assert len(alerts(db)) == 1
     # What was already written stays as it was: still waiting for delivery.
     assert len(monitors.list_alerts(db, undelivered=True)) == 1
-    # An edit that resolves a muted monitor is muted too.
+    # The client was told it fired, so it is told it ended, muted or not.
     monitors.delete_monitor(db, monitor.id, now_ns=NOW + 2)
-    assert alerts(db)[-1].muted
-    assert len(monitors.list_alerts(db, undelivered=True)) == 1
+    assert not alerts(db)[-1].muted
+    assert len(monitors.list_alerts(db, undelivered=True)) == 2
     with pytest.raises(monitors.MonitorError, match="muted"):
         make(db, name="bad", muted="yes")
+
+
+def test_unmuting_mid_incident_sends_no_resolve_of_what_was_never_sent(
+    db: Store, traces: Traces
+) -> None:
+    traces.calls(MODEL, failed=20, total=20)
+    monitor = make(db, muted=True)
+    monitors.evaluate(db, monitor, NOW)
+    monitors.update_monitor(db, monitor.id, {"muted": False}, now_ns=NOW + 1)
+    monitors.delete_monitor(db, monitor.id, now_ns=NOW + 2)
+    assert [a.muted for a in alerts(db)] == [True, True]
+    assert monitors.list_alerts(db, undelivered=True) == []
