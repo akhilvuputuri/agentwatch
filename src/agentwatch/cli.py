@@ -12,6 +12,7 @@ from pathlib import Path
 
 from agentwatch.judges import JudgePolicy, judge_endpoint
 
+GIL_SWITCH_S = 0.0005
 DEFAULT_DB = Path(
     os.environ.get("AGENTWATCH_DB", Path.home() / ".agentwatch" / "agentwatch.duckdb")
 )
@@ -158,6 +159,9 @@ def _serve(
     print(
         f"agentwatch on http://{host}:{port} ({where}); OTLP endpoint http://{host}:{port}/v1/traces"
     )
+    # A drift bootstrap is pure Python. At the default 5 ms each step of an ingest request waits
+    # that long for the interpreter while one runs, which took ingest from 13 ms to 450 ms.
+    sys.setswitchinterval(GIL_SWITCH_S)
     # Judges are disabled until switched on, so the runner makes no model call until then.
     runner = JudgeRunner(store, policy=judge_policy or JudgePolicy())
     runner.start()

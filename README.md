@@ -7,8 +7,8 @@ cache share and cost per trace, a span waterfall for each trace, sessions (trace
 conversation) and users, scores (from an API, OTel `gen_ai.evaluation.result` events, or added by
 hand), datasets (items written by hand, through the API, or made from any trace), experiment runs
 over datasets, LLM judges that score a sample of new traces, a dashboard of cost, tokens, cache
-share and latency over time and by model, tool and agent, and monitors that raise alerts when a
-recent metric crosses a threshold.
+share and latency over time and by model, tool and agent, monitors that raise alerts when a recent
+metric crosses a threshold, and drift detection that compares a metric between two time windows.
 
 It runs on one machine for one person. There is no authentication, so it binds to `127.0.0.1` by
 default and refuses requests addressed to any other host name, which blocks DNS-rebinding and
@@ -17,7 +17,7 @@ address clients will use with `--allow-host`.
 
 > Status: early development, following the plan in
 > [chief-agent#323](https://github.com/akhilvuputuri/chief-agent/issues/323). Tracing, dashboards,
-> scores, datasets, experiments with paired statistics, LLM judges, and monitors with alerts work.
+> scores, datasets, experiments with paired statistics, LLM judges, monitors with alerts, and drift detection work.
 > Not yet published to PyPI.
 
 ## Run it
@@ -136,6 +136,16 @@ threshold, so a few unlucky calls cannot set one off, and a firing monitor resol
 value has stayed good for a cooldown (60 minutes by default). agentwatch sends nothing itself: a client
 polls `GET /api/alerts?undelivered=1` and confirms each alert with
 `POST /api/alerts/<id>/delivered`. See [the design notes](docs/design.md#monitors-and-alerts).
+
+## Drift
+
+The Drift page compares each metric over the last 1, 7 or 30 days with the same length before, and
+lists when each model and `service.version` first appeared, so you can compare before and after
+one. A comparison resamples whole traces, and says a metric changed only if its interval excludes
+zero; with fewer than 10 traces on a side it says there is too little data. A monitor in `drift`
+mode alerts on such a change. Simulated traffic with ordinary overdispersion fires falsely about
+once a month, so trial one with `muted`, which records alerts without sending them to any client.
+See [the design notes](docs/design.md#drift-detection).
 
 ## Develop
 

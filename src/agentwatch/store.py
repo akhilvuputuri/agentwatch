@@ -19,7 +19,7 @@ from agentwatch import genai
 from agentwatch.scores import Score, ScoreConflict, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
 # database and an upgraded one end up identical.
@@ -212,6 +212,18 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             delivered_ns BIGINT,
             reason VARCHAR
         )""",
+    ),
+    10: (
+        "ALTER TABLE monitors ADD COLUMN mode VARCHAR NOT NULL DEFAULT 'threshold'",
+        "ALTER TABLE monitors ADD COLUMN baseline_minutes INTEGER",
+        "ALTER TABLE monitors ADD COLUMN muted BOOLEAN NOT NULL DEFAULT false",
+        "ALTER TABLE monitor_states ADD COLUMN baseline_value DOUBLE",
+        "ALTER TABLE monitor_states ADD COLUMN breaches INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE monitor_states ADD COLUMN alert_muted BOOLEAN NOT NULL DEFAULT false",
+        "ALTER TABLE alerts ADD COLUMN mode VARCHAR NOT NULL DEFAULT 'threshold'",
+        "ALTER TABLE alerts ADD COLUMN baseline_value DOUBLE",
+        "ALTER TABLE alerts ADD COLUMN baseline_minutes INTEGER",
+        "ALTER TABLE alerts ADD COLUMN muted BOOLEAN NOT NULL DEFAULT false",
     ),
 }
 REPORTED = "reported"

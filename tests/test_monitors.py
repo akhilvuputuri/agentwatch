@@ -775,6 +775,9 @@ def test_api_crud(client: TestClient, db: Store, traces: Traces) -> None:
         "since_ns": None,
         "insufficient": False,
         "good_since_ns": None,
+        "baseline_value": None,
+        "breaches": 0,
+        "alert_muted": False,
     }
     path = f"/api/monitors/{monitor['id']}"
     assert client.get(path).json()["monitor"] == monitor
@@ -842,6 +845,10 @@ def test_alerts_order_and_delivery(client: TestClient, db: Store, traces: Traces
         "created_ns",
         "delivered_ns",
         "reason",
+        "mode",
+        "baseline_value",
+        "baseline_minutes",
+        "muted",
     }
     oldest = client.get("/api/alerts?undelivered=1").json()["alerts"]
     assert [a["kind"] for a in oldest] == ["firing", "resolved"]
@@ -933,9 +940,69 @@ def test_migration_from_schema_8(tmp_path: Path) -> None:
     assert upgraded.query_one("SELECT value FROM meta WHERE key = 'schema'")[0] == str(
         store.SCHEMA_VERSION
     )
-    assert store.SCHEMA_VERSION == 9
+    assert store.SCHEMA_VERSION == 10
     assert upgraded.span_count() == 1
     make(upgraded)
     assert len(monitors.list_monitors(upgraded)) == 1
     assert monitors.list_alerts(upgraded) == []
     upgraded.close()
+
+
+def test_a_muted_monitor_records_alerts_no_client_is_sent(db: Store, traces: Traces) -> None:
+    monitor = make(db, muted=True)
+    assert monitor.muted
+    fire_and_resolve(db, traces)
+    fired, resolved = alerts(db)
+    assert (fired.kind, resolved.kind) == ("firing", "resolved")
+    assert fired.muted
+    assert resolved.muted
+    assert fired.delivered_ns == fired.created_ns
+    assert resolved.delivered_ns == resolved.created_ns
+    assert monitors.list_alerts(db, undelivered=True) == []
+
+
+def test_toggling_mute_changes_no_state_and_makes_no_alert(db: Store, traces: Traces) -> None:
+    traces.calls(MODEL, failed=20, total=20)
+    monitor = make(db)
+    monitors.evaluate(db, monitor, NOW)
+    before = monitors.get_state(db, monitor.id)
+    assert before.state == FIRING
+    muted = monitors.update_monitor(db, monitor.id, {"muted": True}, now_ns=NOW + 1)
+    assert muted.muted
+    assert monitors.get_state(db, monitor.id) == before
+    assert len(alerts(db)) == 1
+    # What was already written stays as it was: still waiting for delivery.
+    assert len(monitors.list_alerts(db, undelivered=True)) == 1
+    # The client was told it fired, so it is told it ended, muted or not.
+    monitors.delete_monitor(db, monitor.id, now_ns=NOW + 2)
+    assert not alerts(db)[-1].muted
+    assert len(monitors.list_alerts(db, undelivered=True)) == 2
+    with pytest.raises(monitors.MonitorError, match="muted"):
+        make(db, name="bad", muted="yes")
+
+
+def test_unmuting_mid_incident_sends_no_resolve_of_what_was_never_sent(
+    db: Store, traces: Traces
+) -> None:
+    traces.calls(MODEL, failed=20, total=20)
+    monitor = make(db, muted=True)
+    monitors.evaluate(db, monitor, NOW)
+    monitors.update_monitor(db, monitor.id, {"muted": False}, now_ns=NOW + 1)
+    monitors.delete_monitor(db, monitor.id, now_ns=NOW + 2)
+    assert [a.muted for a in alerts(db)] == [True, True]
+    assert monitors.list_alerts(db, undelivered=True) == []
+
+
+@pytest.mark.parametrize("fired_muted", [True, False])
+def test_a_resolve_follows_its_firing_alert_after_that_alert_is_pruned(
+    db: Store, traces: Traces, fired_muted: bool
+) -> None:
+    traces.calls(MODEL, failed=20, total=20)
+    monitor = make(db, muted=fired_muted)
+    monitors.evaluate(db, monitor, NOW)
+    with db.transaction() as connection:
+        connection.execute("DELETE FROM alerts")
+    monitors.update_monitor(db, monitor.id, {"muted": not fired_muted}, now_ns=NOW + 1)
+    monitors.delete_monitor(db, monitor.id, now_ns=NOW + 2)
+    resolved = alerts(db)[-1]
+    assert (resolved.kind, resolved.muted) == ("resolved", fired_muted)

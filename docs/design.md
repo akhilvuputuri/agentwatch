@@ -379,6 +379,9 @@ may not contain control, format or bidi characters (Unicode Cc and Cf, such as a
 or line separators, since it is shown wherever an alert is delivered. The background runner
 evaluates every enabled monitor each minute; a monitor that fails is logged, and the others go on.
 
+This section describes `threshold` mode; [drift mode](#drift-detection) compares with an earlier
+window instead.
+
 **Metrics.** Windows are half-open and end now. Populations follow the dashboard's: spans that
 started in the window, limited to traces whose root service matches.
 
@@ -450,6 +453,151 @@ API: `GET/POST /api/monitors`, `GET/PATCH/DELETE /api/monitors/<id>` (each with 
 `application/json` as every write does). The UI's Alerts page adds monitors, lists them with their
 state, and lists recent alerts. Whether these thresholds and windows suit real traffic has not
 been measured.
+
+## Drift detection
+
+Did a metric move between two time windows? (`drift.py`.) It is a different question from a
+threshold's, and from a comparison of runs.
+
+**Why unpaired and clustered.** Experiment runs pair up on dataset items; two windows hold
+different traffic, so nothing pairs and `stats`' paired tests do not apply. Calls in one trace are
+not independent either: a retry loop can fail fifty times for one reason. So a comparison reduces
+each window to per-trace records and takes a seeded percentile bootstrap of (current - baseline),
+resampling whole traces, independently in each window (1,000 resamples). In a test, 100 failures
+in one trace among 20 are not a change, though the same failures as independent calls are. The same
+seed and data give the same result.
+
+**Metrics.** Scope and service filter follow the dashboard's. `model_error_rate` and
+`tool_error_rate` pool failures / calls, for calls that started in the window; `model_mean_ms` and
+`model_p95_ms` use the same calls (the percentile interpolated as DuckDB's `quantile_cont`, so it
+matches the dashboard); `cost_per_trace` covers traces whose root started in the window and have a
+known cost; `score_mean` the named BOOLEAN or NUMERIC scores recorded in the window. `model` narrows
+every metric but `tool_error_rate` and `score_mean`, where it would mean nothing and is refused.
+Each window keeps its most recent 20,000 traces (for a percentile, 5,000 traces, 20,000 calls and
+200 calls a trace), and says `truncated` when more were left out. `trace_count` is not a drift
+metric: a count has no traces to resample.
+
+**What the verdict says.** `underpowered` when either window has fewer than 10 traces: values are
+given, no interval and no claim. `changed` when the interval excludes zero. `no detectable
+difference` otherwise, with `detectable`, a change this size would usually show, so it is not read
+as "no change". A true change equal to the interval's half-width clears it under half the time, so
+`detectable` is the half-width scaled by (z + 0.84) / z at the interval's level, which aims at 80%
+power. Measured, a true change of that size showed 57 to 77% of the time (200 to 300 runs at rates of
+0.02, 0.1 and 0.4 with 15 and 30 traces a side, about 3 points of noise), so read it as about 60 to 80%.
+It is null, shown as "can't say", when a window has no spread at all (every trace alike), since the
+bootstrap then has nothing to measure; a proportion at 0 or 1 still has its Wilson width. `direction`
+is `higher` or `lower` only for `changed`. It never says better or worse, since only the caller knows which way is bad, and it does
+not say why. When a proportion's window is exactly 0 or 1, every resample of it is the same, and the
+bootstrap would see no uncertainty on that side; the interval then also covers a Newcombe difference
+of Wilson intervals, counting each trace as one observation.
+
+**Calibration, simulated.** Two alike windows of n traces each, 4,000 repeats, at a nominal 5%:
+
+| False "changed" | n=10 | n=20 | n=30 | n=100 |
+| --- | --- | --- | --- | --- |
+| Error rate, independent failures | 6.6% | 6.5% | 6.6% | 5.2% |
+| Error rate, failures bunched in traces | 4.5% | 7.6% | 7.2% | 5.5% |
+| Mean latency, lognormal | 8.8% | 7.1% | 7.8% | 6.1% |
+| p95 latency, lognormal | 4.3% | 4.3% | 4.2% | 3.6% |
+
+So intervals run hot at small n, as percentile bootstraps do. `MIN_TRACES` is a floor below which
+nothing is claimed, not a calibrated claim above it. These windows are alike by construction: real
+windows differ in ways this does not model (below), which makes the true rate higher.
+
+**Comparing around a change.** `GET /api/drift?metric=&score_name=&service=&model=&baseline_from=&baseline_to=&current_from=&current_to=`
+compares one metric at 95%; the times are required, as Unix nanoseconds, and the windows may not
+overlap. `GET /api/drift/summary?service=&days=7` compares the call metrics and up to 50 score names
+for the last N days (1 to 365) with the N before, or over two windows given as above. It tests k
+comparisons at once, so its intervals are Bonferroni-corrected to 1 - 0.05/k (with up to 2,000
+resamples, which keeps a few draws in the tails up to about 10 comparisons; at the limit of 55 there
+is about one, so those ends are rough); the response gives that `confidence` and the page says so.
+That targets 5% across a page but does not reach it, because the intervals run hot: simulated pages
+of 5 metrics with no true difference showed a false "changed" 12.8% of the time at 10 traces a side,
+11.6% at 20 and 8.5% at 30, against roughly 30% uncorrected.
+
+Each of these two endpoints runs one comparison at a time across both, and answers 429 with
+`Retry-After` when busy, while the same normalised request is answered from a 30-second cache. The
+page waits and retries. `GET /api/changes?service=&days=` lists when each model
+and `service.version` resource attribute first appeared, newest first (up to 200); first means
+across all stored data, by the exporter's span times, and `days` only limits which are listed. The
+Drift page shows the summary and, for a change it lists, the same summary, with scores, for the same
+length either side, shortened if the change is recent. It uses the change's own service when it has
+one, and all that service's traffic, because a model's own traffic has no "before".
+
+**Drift monitors.** A monitor with `mode` `drift` (schema version 10; existing monitors are
+`threshold`) compares its trailing window with the `baseline_minutes` (default the window's length)
+directly before. `comparison` names the bad direction, `threshold` is the smallest change that
+matters (absolute, at least 0, and at most 1 for error rates), `min_samples` is unused, and
+`cooldown_minutes` defaults to the window, since at 60 minutes one shift could fire twice. An
+evaluation breaches when the verdict is `changed`, in the bad direction, and the difference is at
+least the threshold. Underpowered evaluations neither fire nor recover and are recorded as
+`insufficient`, and their time does not count toward the cooldown. A run of breaches ends at an
+underpowered evaluation or a gap of over 3 hours since the last evaluation, so that breaches on
+unrelated windows cannot combine.
+
+Alerts add `mode`, `baseline_value` and `baseline_minutes` (null for threshold monitors); `value` is
+the current value and `bound` the interval's edge on the threshold's side, so a difference, which
+can be negative. A resolved drift alert means the two windows no longer differ, not that the level
+recovered: its `value` and `baseline_value` are both there to read, and both are high if a shift
+simply filled the two windows. Threshold monitors otherwise behave as before.
+
+**Muted monitors.** A monitor of either mode with `muted` evaluates and records alerts as usual, but
+they are written as already delivered and flagged `muted`, so a polling client never sees them.
+Toggling it changes no state and no earlier alert. A resolved alert goes the way its firing alert
+went, whatever the monitor is now: muting mid-incident still sends the resolve of what the client was
+told, and unmuting mid-incident sends nothing until the next firing. The monitor's state records how
+the firing alert went, so this holds if retention has removed that alert. This is how a drift monitor
+should be trialled on real traffic, given the results below, before it can reach a phone.
+
+**Load, measured in process on a laptop.** The bootstrap holds no store lock, but it is pure Python.
+Timings on 200,000 spans: a summary about 9 to 21 s, `GET /api/changes` about 0.05 s, and a percentile
+at a monitor's settings about 10 s at the row limit. At the default 5 ms interpreter switch interval
+each step of an ingest request waited that long, so `serve` sets 0.5 ms. Ingest p50 with 8 clients
+asking for the summary, through the ASGI app rather than a socket, was 21 ms with no clients, 21 ms
+(p95 88 ms) when the cache answered them, and 65 ms (p95 143 ms) with the cache off, so that a
+comparison was always running.
+
+**Repeated-testing guards.** A monitor re-tests overlapping windows every hour, so a 95% interval
+would be wrong far more than 5% of the time. It evaluates at most once an hour, uses a 99.5%
+interval (2,000 resamples) and fires only on 6 breaches in a row, then recovers by the cooldown.
+The first rule tried, a 99% interval and 2 breaches, fired 0.33 to 1.33 times a month falsely on the
+two easiest traffic models, so it was tightened after a sweep of both settings. Consecutive hourly
+windows share nearly all their traces, so even 6 in a row are not independent evidence, and longer
+runs missed real shifts at short windows, which pass through in a few days.
+
+**Simulated results, not measurements of real traffic.** From `tests/drift_simulation.py`: the
+monitor's own rule over made-up traces, 5 to 20 a day, 1 to 8 calls each, base error rate 10%,
+threshold 0.05, cooldown one window, evaluated hourly. No lasting change in the false-firing columns,
+over 60 simulated 30-day months for 3-day windows and 40 for 7-day; a shift from 10% to 40% in the
+detection columns, in 20 runs for 3-day windows and 10 for 7-day (20 for independent), watched for
+two window lengths.
+
+| Traffic | False firings a month, 7-day / 3-day | Shift detected, 7-day / 3-day | Median delay, 7-day / 3-day |
+| --- | --- | --- | --- |
+| Independent failures | 0.07 / 0.17 | 20 of 20 / 20 of 20 | 51 h / 30 h |
+| Bunched in traces (1 in 5 at four times the rate, the rest at a quarter) | 0.20 / 0.15 | 10 of 10 / 9 of 20 | 80 h / 71 h |
+| Shared within sessions of 1 to 7 traces | 0.75 / 1.83 | 10 of 10 / 16 of 20 | 64 h / 41 h |
+| Daily rate lognormal, sigma 0.5 | 0.50 / 1.12 | 10 of 10 / 20 of 20 | 46 h / 34 h |
+| Weekdays 8%, weekends 15% | 0.07 / 0.97 | 10 of 10 / 20 of 20 | 54 h / 22 h |
+| A 6-hour incident at 60% about once a fortnight | 0.23 / 0.28 | 10 of 10 / 20 of 20 | 50 h / 33 h |
+
+The easy rows are not what to expect. Real traffic has overdispersion: failures shared across
+sessions and days, which a bootstrap at the level of traces only partly captures, because it treats
+traces as independent. On such traffic this rule fires falsely about once a month or more, and more
+with several monitors. Trial a drift monitor muted first, and read what it would have sent. A weekly
+pattern hurts a 3-day window far more than a 7-day one, which always holds one of each day. A short
+window can also miss a real shift among bunched failures. The rule was not tightened further for
+these models: detection is already slow, and no setting tried removes the cause. Reproduce one row
+with `uv run python -m tests.drift_simulation 7 sessions 40 10`, and the calibration with
+`uv run python -m tests.drift_simulation calibration 4000`.
+
+**Limits.** A difference between windows is not a cause. Weekly seasonality is the obvious false
+cause: a window shorter than a week compares different days, so a weekday against a weekend reads as
+a change. Prefer whole weeks where traffic has a weekly shape. A monitor reports a change, not a
+level: once a shift has filled both windows, they agree again and it resolves while the metric stays
+bad, which is what a threshold monitor is for. A slow drift can stay under the interval for ever. A
+trace with calls on both sides of the split counts in both windows, which the bootstrap treats as
+independent. Truncation favours the most recent traces of a window.
 
 ## Retention and the server image
 
