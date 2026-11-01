@@ -62,15 +62,17 @@ export function boundText(metric: MonitorMetric, bound: number, rate: boolean): 
   return `${bound < 0 ? "−" : "+"}${figure(metric, Math.abs(bound), rate)}`;
 }
 
-/** What a drift alert says. A resolved one says the windows agree, not that the level came back. */
+/** What a drift alert says. A resolved one says the bad change has gone, not that the level came back. */
 export function driftAlertText(alert: Alert, rate: boolean): string {
   if (alert.value === null) return "–";
   const before = figure(alert.metric, alert.baseline_value, rate);
   const after = figure(alert.metric, alert.value, rate);
-  return alert.kind === "firing" ? `from ${before} to ${after}` : `windows no longer differ: ${before} and ${after}`;
+  return alert.kind === "firing" ? `from ${before} to ${after}` : `no clear ${alert.comparison === "above" ? "rise" : "fall"}${alert.threshold > 0 ? ` of at least ${figure(alert.metric, alert.threshold, rate)}` : ""}: before ${before}, now ${after}`;
 }
 
-const changeText = (comparison: "above" | "below") => (comparison === "above" ? "a rise" : "a fall");
+function changeText(comparison: "above" | "below") {
+  return comparison === "above" ? "a rise" : "a fall";
+}
 
 /** Monitors over recent metrics, and the alerts they raised. */
 export function Alerts() {
@@ -149,7 +151,7 @@ export function Alerts() {
         one off. A firing monitor resolves once its value has stayed on the good side for its cooldown; evaluations with
         too few samples do not count toward that. A drift monitor instead compares the window with the one directly
         before it, once an hour, and fires when the change holds for six evaluations in a row: it reports a change, not
-        a level, so it resolves once the new level fills both windows, whatever that level is. Trial one muted first: a
+        a level, so it resolves once that change is gone, as when the new level fills both windows, whatever that level is. Trial one muted first: a
         muted monitor runs as usual, but no client is sent its alerts. A client collects alerts by polling the API:
         agentwatch sends nothing itself.
       </p>

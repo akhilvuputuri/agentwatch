@@ -692,7 +692,7 @@ export interface Alert {
   delivered_ns: string | null;
   reason: "changed" | "removed" | null;
   mode: MonitorMode;
-  /** Drift only: the baseline window's value and length. A resolved alert means the windows no longer differ, not that the level recovered. */
+  /** Drift only: the baseline window's value and length. A resolved alert means no clear change of at least the threshold, not that the level recovered. */
   baseline_value: number | null;
   baseline_minutes: number | null;
   /** Its monitor was muted, so it was written as already delivered. */
