@@ -67,7 +67,7 @@ export function driftAlertText(alert: Alert, rate: boolean): string {
   if (alert.value === null) return "–";
   const before = figure(alert.metric, alert.baseline_value, rate);
   const after = figure(alert.metric, alert.value, rate);
-  return alert.kind === "firing" ? `from ${before} to ${after}` : `no longer ${changeText(alert.comparison)}${alert.threshold > 0 ? ` of at least ${figure(alert.metric, alert.threshold, rate)}` : ""}: before ${before}, now ${after}`;
+  return alert.kind === "firing" ? `from ${before} to ${after}` : `no clear ${alert.comparison === "above" ? "rise" : "fall"}${alert.threshold > 0 ? ` of at least ${figure(alert.metric, alert.threshold, rate)}` : ""}: before ${before}, now ${after}`;
 }
 
 function changeText(comparison: "above" | "below") {
