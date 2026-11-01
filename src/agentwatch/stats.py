@@ -19,11 +19,14 @@ import math
 import random
 from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass
+from statistics import NormalDist
 
 BETTER = "better"
 WORSE = "worse"
 NO_DIFFERENCE = "no detectable difference"
 UNDERPOWERED = "underpowered"
+# Two windows of different traffic: moved, without saying which way is good.
+CHANGED = "changed"
 
 ALPHA = 0.05
 # Below this many pairs, a non-significant result is always reported as underpowered: a
@@ -158,6 +161,67 @@ def cluster_interval[T](
         return interval
     n = len({cluster(x) for x in items})
     return wilson(round(value * n), n)
+
+
+def unpaired_cluster_bootstrap[T](
+    baseline: Sequence[T],
+    current: Sequence[T],
+    statistic: Callable[[Sequence[T]], float | None],
+    *,
+    resamples: int = 1000,
+    seed: int = 7,
+    confidence: float = 0.95,
+) -> tuple[float, float] | None:
+    """Percentile interval of statistic(current) - statistic(baseline) for two unrelated groups.
+
+    `baseline` and `current` hold one item per cluster (a trace, say), and each is resampled by
+    itself. A resample whose statistic is undefined is skipped. None for an empty group.
+    """
+    if not baseline or not current:
+        return None
+    rng = random.Random(seed)
+    draws: list[float] = []
+    for _ in range(resamples):
+        before = statistic(rng.choices(baseline, k=len(baseline)))
+        after = statistic(rng.choices(current, k=len(current)))
+        if before is not None and after is not None:
+            draws.append(after - before)
+    if not draws:
+        return None
+    draws.sort()
+    tail = (1 - confidence) / 2
+    upper = min(len(draws) - 1, math.ceil((1 - tail) * len(draws)) - 1)
+    return (draws[int(tail * len(draws))], draws[upper])
+
+
+def newcombe(
+    successes_a: int, total_a: int, successes_b: int, total_b: int, z: float = Z_95
+) -> tuple[float, float]:
+    """Newcombe's interval for rate B minus rate A, from each rate's Wilson interval."""
+    a, b = wilson(successes_a, total_a, z), wilson(successes_b, total_b, z)
+    if a is None or b is None:
+        raise ValueError("newcombe needs at least one trial on each side")
+    p, q = successes_a / total_a, successes_b / total_b
+    difference = q - p
+    return (
+        difference - math.hypot(p - a[1], b[0] - q),
+        difference + math.hypot(a[0] - p, b[1] - q),
+    )
+
+
+def z_for(confidence: float) -> float:
+    """The normal quantile for a two-sided interval at this confidence."""
+    return NormalDist().inv_cdf(1 - (1 - confidence) / 2)
+
+
+def quantile(ordered: Sequence[float], share: float) -> float | None:
+    """Interpolated quantile of sorted values, as DuckDB's quantile_cont; None for no values."""
+    if not ordered:
+        return None
+    position = (len(ordered) - 1) * share
+    below = int(position)
+    above = min(below + 1, len(ordered) - 1)
+    return ordered[below] + (ordered[above] - ordered[below]) * (position - below)
 
 
 def mean(values: Sequence[float]) -> float:

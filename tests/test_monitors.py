@@ -775,6 +775,8 @@ def test_api_crud(client: TestClient, db: Store, traces: Traces) -> None:
         "since_ns": None,
         "insufficient": False,
         "good_since_ns": None,
+        "baseline_value": None,
+        "breaches": 0,
     }
     path = f"/api/monitors/{monitor['id']}"
     assert client.get(path).json()["monitor"] == monitor
@@ -842,6 +844,8 @@ def test_alerts_order_and_delivery(client: TestClient, db: Store, traces: Traces
         "created_ns",
         "delivered_ns",
         "reason",
+        "mode",
+        "baseline_value",
     }
     oldest = client.get("/api/alerts?undelivered=1").json()["alerts"]
     assert [a["kind"] for a in oldest] == ["firing", "resolved"]
@@ -933,7 +937,7 @@ def test_migration_from_schema_8(tmp_path: Path) -> None:
     assert upgraded.query_one("SELECT value FROM meta WHERE key = 'schema'")[0] == str(
         store.SCHEMA_VERSION
     )
-    assert store.SCHEMA_VERSION == 9
+    assert store.SCHEMA_VERSION == 10
     assert upgraded.span_count() == 1
     make(upgraded)
     assert len(monitors.list_monitors(upgraded)) == 1

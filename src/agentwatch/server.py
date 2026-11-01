@@ -31,6 +31,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from agentwatch import (
     comparisons,
     datasets,
+    drift,
     experiments,
     judges,
     metrics,
@@ -62,6 +63,7 @@ MAX_JSON_WRITE_BYTES = 16 * 1024 * 1024
 MAX_ITEMS_PER_REQUEST = 1000
 # Traces returned with one session.
 SESSION_TRACES = 500
+MAX_CHANGES = 200
 
 
 def create_app(
@@ -477,6 +479,66 @@ def create_app(
             lambda: {"alert": _alert_json(monitors.mark_delivered(store, alert_id))}
         )
 
+    async def drift_view(request: Request) -> Response:
+        """One metric over two windows, which must not overlap."""
+        query = request.query_params
+        names = ("baseline_from", "baseline_to", "current_from", "current_to")
+        raw = [query.get(name, "") for name in names]
+        if not all(v.isascii() and v.isdigit() and len(v) <= 19 for v in raw):
+            return PlainTextResponse(f"{', '.join(names)} must be Unix nanoseconds", 400)
+        start, split_before, split_after, end = (int(v) for v in raw)
+        if not 0 <= start < split_before <= split_after < end <= otlp.MAX_TIME_NS:
+            return PlainTextResponse(
+                "need baseline_from < baseline_to <= current_from < current_to", status_code=400
+            )
+        return await _drift_call(
+            lambda: {
+                "comparison": asdict(
+                    drift.compare(
+                        store,
+                        query.get("metric", ""),
+                        baseline=(start, split_before),
+                        current=(split_after, end),
+                        service=query.get("service") or None,
+                        model=query.get("model") or None,
+                        score_name=query.get("score_name") or None,
+                    )
+                )
+            }
+        )
+
+    async def drift_summary(request: Request) -> Response:
+        query = request.query_params
+        days = _days(query.get("days", "7"), 365)
+        if days is None:
+            return PlainTextResponse("days must be a whole number from 1 to 365", status_code=400)
+        now = time.time_ns()
+        service = query.get("service") or None
+        return await _drift_call(
+            lambda: {
+                "days": days,
+                "end_ns": str(now),
+                "comparisons": [
+                    asdict(c) for c in drift.summary(store, service=service, days=days, now_ns=now)
+                ],
+            }
+        )
+
+    async def changes_view(request: Request) -> Response:
+        query = request.query_params
+        days = None
+        if query.get("days"):
+            days = _days(query["days"], 36500)
+            if days is None:
+                return PlainTextResponse("days must be a whole number of days", status_code=400)
+        since = None if days is None else max(0, time.time_ns() - days * DAY_NS)
+        found = await run_in_threadpool(
+            metrics.changes, store, query.get("service") or None, since_ns=since, limit=MAX_CHANGES
+        )
+        return JSONResponse(
+            {"changes": [c | {"first_seen_ns": str(c["first_seen_ns"])} for c in found]}
+        )
+
     async def delete_price(request: Request) -> Response:
         removed = await run_in_threadpool(store.delete_price, str(request.path_params["price_id"]))
         return (
@@ -621,6 +683,9 @@ def create_app(
         Route("/api/monitors/{monitor_id}", monitor_detail, methods=["GET", "PATCH", "DELETE"]),
         Route("/api/alerts", alerts_index, methods=["GET"]),
         Route("/api/alerts/{alert_id}/delivered", alert_delivered, methods=["POST"]),
+        Route("/api/drift", drift_view, methods=["GET"]),
+        Route("/api/drift/summary", drift_summary, methods=["GET"]),
+        Route("/api/changes", changes_view, methods=["GET"]),
         Route("/api/prices", list_prices, methods=["GET"]),
         Route("/api/prices", post_price, methods=["POST"]),
         Route("/api/prices/{price_id}", delete_price, methods=["DELETE"]),
@@ -813,6 +878,21 @@ async def _monitor_call(work: Callable[[], Any], *, status: int = 200) -> Respon
     if status == 204:
         return Response(status_code=204)
     return JSONResponse(result, status_code=status)
+
+
+async def _drift_call(work: Callable[[], Any]) -> Response:
+    """Run a drift comparison in the threadpool: the bootstrap must not block the event loop."""
+    try:
+        return JSONResponse(await run_in_threadpool(work))
+    except drift.DriftError as error:
+        return PlainTextResponse(str(error), status_code=400)
+
+
+def _days(value: str, maximum: int) -> int | None:
+    """A whole number of days from 1 to `maximum`, or None."""
+    if not value.isascii() or not value.isdigit() or len(value) > 6:
+        return None
+    return int(value) if 1 <= int(value) <= maximum else None
 
 
 def _state_json(state: monitors.MonitorState) -> dict[str, Any]:

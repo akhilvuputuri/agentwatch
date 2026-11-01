@@ -3,6 +3,7 @@ import { Alerts } from "./Alerts";
 import { CompareView } from "./Compare";
 import { Dashboard } from "./Dashboard";
 import { DatasetList, DatasetView } from "./Datasets";
+import { Drift } from "./Drift";
 import { Judges } from "./Judges";
 import { Prices } from "./Prices";
 import { RunView } from "./Runs";
@@ -16,6 +17,7 @@ export type Route =
   | { page: "prices" }
   | { page: "judges" }
   | { page: "alerts" }
+  | { page: "drift" }
   | { page: "datasets" }
   | { page: "dataset"; datasetId: string }
   | { page: "run"; runId: string }
@@ -30,6 +32,7 @@ export function route(hash: string): Route {
   if (hash === "#/prices") return { page: "prices" };
   if (hash === "#/judges") return { page: "judges" };
   if (hash === "#/alerts") return { page: "alerts" };
+  if (hash === "#/drift") return { page: "drift" };
   if (hash === "#/datasets") return { page: "datasets" };
   const compare = /^#\/compare\/([^/]+)\/([^/]+)$/.exec(hash);
   if (compare) {
@@ -90,7 +93,7 @@ export function App() {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
   const section =
-    current.page === "dashboard" || current.page === "prices" || current.page === "judges" || current.page === "alerts"
+    current.page === "dashboard" || current.page === "prices" || current.page === "judges" || current.page === "alerts" || current.page === "drift"
       ? current.page
       : current.page === "sessions" || current.page === "session"
         ? "sessions"
@@ -122,6 +125,9 @@ export function App() {
           <a href="#/judges" aria-current={section === "judges" ? "page" : undefined}>
             Judges
           </a>
+          <a href="#/drift" aria-current={section === "drift" ? "page" : undefined}>
+            Drift
+          </a>
           <a href="#/alerts" aria-current={section === "alerts" ? "page" : undefined}>
             Alerts
           </a>
@@ -139,6 +145,8 @@ export function App() {
           <Judges />
         ) : current.page === "alerts" ? (
           <Alerts />
+        ) : current.page === "drift" ? (
+          <Drift />
         ) : current.page === "datasets" ? (
           <DatasetList />
         ) : current.page === "dataset" ? (

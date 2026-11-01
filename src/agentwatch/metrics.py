@@ -364,6 +364,134 @@ _SCORE_FIGURES = f"""
 """
 
 
+# Durations kept per trace for a percentile: its most recent calls.
+MAX_CALLS_PER_TRACE = 200
+_MODEL_NAME = "coalesce(response_model, request_model, '(unknown)')"
+# Parameters 5 and 6: the model, twice. Parameter 7: the row limit.
+_MODEL_MATCHES = f"(CAST(?5 AS VARCHAR) IS NULL OR {_MODEL_NAME} = ?6)"
+
+
+def call_rows(
+    store: Store,
+    window: Window,
+    *,
+    tools: bool,
+    model: str | None,
+    limit: int,
+    durations: bool = False,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Model or tool calls that started in the window, by trace, most recent traces first, and
+    whether older ones were left out."""
+    calls = "operation = 'execute_tool'" if tools else f"is_model_call AND {_MODEL_MATCHES}"
+    listed = (
+        f", list_slice(list({_DURATION_MS} ORDER BY start_ns DESC), 1, {MAX_CALLS_PER_TRACE}) "
+        "AS durations"
+        if durations
+        else ""
+    )
+    # A tool query leaves the model parameters unused, which DuckDB refuses, so it omits them.
+    params = [*_params(window), *(() if tools else (model, model))]
+    query = f"""
+        WITH {_SCOPE}
+        SELECT trace_id, count(*) AS calls,
+               count(*) FILTER (WHERE status_code = {STATUS_ERROR}) AS failures,
+               sum({_DURATION_MS}) AS total_ms {listed}
+        FROM windowed WHERE {calls}
+        GROUP BY trace_id
+        ORDER BY max(start_ns) DESC, trace_id
+        LIMIT {int(limit) + 1}
+    """
+    return _limited(store.query(query, params, with_names=True), limit)
+
+
+def cost_rows(
+    store: Store, window: Window, *, model: str | None, limit: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """Traces whose root started in the window, with all their spans' cost, those with one only
+    (as the dashboard's cost per trace). With a model, only the cost of that model's calls."""
+    query = f"""
+        WITH {_SCOPE}
+        SELECT trace_id, sum(s.cost_usd) FILTER (
+                   WHERE s.counts_toward_totals
+                     AND (CAST(?5 AS VARCHAR) IS NULL OR (s.is_model_call AND {_MODEL_NAME} = ?6))
+               ) AS cost_usd
+        FROM spans s JOIN started USING (trace_id)
+        GROUP BY trace_id
+        HAVING cost_usd IS NOT NULL
+        ORDER BY any_value(root_start_ns) DESC, trace_id
+        LIMIT {int(limit) + 1}
+    """
+    rows = store.query(query, [*_params(window), model, model], with_names=True)
+    return _limited(rows, limit)
+
+
+def score_rows(
+    store: Store, window: Window, name: str, *, limit: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """One score name recorded in the window, by trace, on the traces _SCORE_FIGURES counts."""
+    query = f"""
+        WITH {_SCOPE}
+        SELECT trace_id, sum(value) AS total, count(*) AS samples,
+               bool_and(data_type = '{BOOLEAN}') AS booleans
+        FROM scores
+        WHERE name = ?5 AND data_type IN ('{BOOLEAN}', '{NUMERIC}') AND value IS NOT NULL
+          AND created_ns >= ?3 AND created_ns < ?4 AND trace_id IN (SELECT trace_id FROM traces)
+        GROUP BY trace_id
+        ORDER BY max(created_ns) DESC, trace_id
+        LIMIT {int(limit) + 1}
+    """
+    return _limited(store.query(query, [*_params(window), name], with_names=True), limit)
+
+
+def score_names(store: Store, window: Window, *, limit: int) -> list[str]:
+    """Names of the scores a mean can be taken of, the most recorded first."""
+    query = f"""
+        WITH {_SCOPE}
+        SELECT name FROM scores
+        WHERE data_type IN ('{BOOLEAN}', '{NUMERIC}') AND value IS NOT NULL
+          AND created_ns >= ?3 AND created_ns < ?4 AND trace_id IN (SELECT trace_id FROM traces)
+        GROUP BY name
+        ORDER BY count(*) DESC, name
+        LIMIT {int(limit)}
+    """
+    return [row[0] for row in store.query(query, _params(window))]
+
+
+def changes(
+    store: Store, service: str | None, *, since_ns: int | None, limit: int
+) -> list[dict[str, Any]]:
+    """When each model and each service.version was first seen, newest first. First seen means
+    across all stored data in scope; `since_ns` then limits which are listed."""
+    query = f"""
+        WITH {ROOTS_SQL}, {_TRACES},
+        scoped AS (
+            SELECT is_model_call, response_model, request_model, service_name, start_ns,
+                   json_extract_string(resource, '$."service.version"') AS version
+            FROM spans WHERE trace_id IN (SELECT trace_id FROM traces)
+        ),
+        found AS (
+            SELECT 'model' AS kind, coalesce(response_model, request_model) AS name,
+                   NULL::VARCHAR AS service, min(start_ns) AS first_seen_ns
+            FROM scoped
+            WHERE is_model_call AND coalesce(response_model, request_model) IS NOT NULL
+            GROUP BY 2
+            UNION ALL
+            SELECT 'version', version, service_name, min(start_ns)
+            FROM scoped WHERE version IS NOT NULL
+            GROUP BY 2, 3
+        )
+        SELECT kind, name, service, first_seen_ns FROM found
+        WHERE first_seen_ns >= ?3
+        ORDER BY first_seen_ns DESC, kind, name, service
+        LIMIT {int(limit)}
+    """
+    return store.query(query, [service, service, since_ns or 0], with_names=True)
+
+
+def _limited(rows: list[dict[str, Any]], limit: int) -> tuple[list[dict[str, Any]], bool]:
+    return rows[:limit], len(rows) > limit
+
+
 def monitor_figures(store: Store, window: Window) -> dict[str, Any]:
     [row] = store.query(_MONITOR_FIGURES, _params(window), with_names=True)
     return {key: _clean(value) for key, value in row.items()}

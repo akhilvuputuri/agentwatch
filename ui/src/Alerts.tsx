@@ -8,6 +8,7 @@ import {
   type Alert,
   type Monitor,
   type MonitorMetric,
+  type MonitorMode,
   type NewMonitor,
 } from "./api";
 import { count, duration, timestamp, usd } from "./format";
@@ -21,14 +22,23 @@ const METRICS: { value: MonitorMetric; label: string }[] = [
   { value: "score_mean", label: "Score mean" },
 ];
 
-const metricLabel = (metric: MonitorMetric) => METRICS.find((m) => m.value === metric)?.label ?? metric;
+const DRIFT_METRICS: { value: MonitorMetric; label: string }[] = [
+  { value: "model_error_rate", label: "Model error rate" },
+  { value: "tool_error_rate", label: "Tool error rate" },
+  { value: "model_mean_ms", label: "Model mean latency (ms)" },
+  { value: "model_p95_ms", label: "Model p95 latency (ms)" },
+  { value: "cost_per_trace", label: "Cost per trace (USD)" },
+  { value: "score_mean", label: "Score mean" },
+];
+
+const metricLabel = (metric: MonitorMetric) => [...METRICS, ...DRIFT_METRICS].find((m) => m.value === metric)?.label ?? metric;
 
 /** A figure in the metric's unit. `rate` is decided by the caller: a score's mean is a rate only sometimes. */
 function figure(metric: MonitorMetric, value: number | null, rate: boolean): string {
   if (value === null) return "–";
   if (rate) return `${Math.round(value * 1000) / 10}%`;
-  if (metric === "cost_usd") return usd(value);
-  if (metric === "model_p95_ms") return duration(value * 1e6);
+  if (metric === "cost_usd" || metric === "cost_per_trace") return usd(value);
+  if (metric === "model_p95_ms" || metric === "model_mean_ms") return duration(value * 1e6);
   if (metric === "trace_count") return count(value);
   return String(Math.round(value * 1000) / 1000);
 }
@@ -42,6 +52,12 @@ function windowText(minutes: number): string {
 }
 
 const usesMinSamples = (metric: MonitorMetric) => metric !== "cost_usd" && metric !== "trace_count";
+
+/** Whether to show a figure as a percentage. In a drift monitor the bound is a difference, so it says nothing. */
+const isRate = (metric: MonitorMetric, mode: MonitorMode, bound: number | null) =>
+  isErrorRate(metric) || (mode === "threshold" && bound !== null);
+
+const changeText = (comparison: "above" | "below") => (comparison === "above" ? "a rise" : "a fall");
 
 /** Monitors over recent metrics, and the alerts they raised. */
 export function Alerts() {
@@ -108,8 +124,10 @@ export function Alerts() {
         A monitor compares a metric over a trailing window with a threshold, every minute. Rates fire only when the
         statistical bound (95% Wilson) clears the threshold, not on the value alone, so a few unlucky calls cannot set
         one off. A firing monitor resolves once its value has stayed on the good side for its cooldown; evaluations with
-        too few samples do not count toward that. A client collects alerts by polling the API: agentwatch sends nothing
-        itself.
+        too few samples do not count toward that. A drift monitor instead compares the window with the one directly
+        before it, once an hour, and fires when the change holds for six evaluations in a row: it reports a change, not
+        a level, so it recovers once the new level fills both windows. A client collects alerts by polling the API:
+        agentwatch sends nothing itself.
       </p>
       {loadError && <p className="error">{loadError}</p>}
       {actionError && <p className="error">{actionError}</p>}
@@ -161,7 +179,7 @@ export function Alerts() {
             </thead>
             <tbody>
               {alerts.map((a) => {
-                const rate = isErrorRate(a.metric) || a.bound !== null;
+                const rate = isRate(a.metric, a.mode, a.bound);
                 return (
                   <tr key={a.id}>
                     <td className="muted">{timestamp(a.created_ns)}</td>
@@ -173,9 +191,15 @@ export function Alerts() {
                       <span className={`badge ${a.kind === "firing" ? "bad" : "ok"}`}>{a.kind}</span>
                       {a.reason && <div className="muted small">monitor {a.reason}</div>}
                     </td>
-                    <td className="num">{figure(a.metric, a.value, rate)}</td>
+                    <td className="num">
+                      {a.mode === "drift" && a.value !== null
+                        ? `from ${figure(a.metric, a.baseline_value, rate)} to ${figure(a.metric, a.value, rate)}`
+                        : figure(a.metric, a.value, rate)}
+                    </td>
                     <td>
-                      {a.comparison} {figure(a.metric, a.threshold, rate)}
+                      {a.mode === "drift"
+                        ? `${changeText(a.comparison)} of at least ${figure(a.metric, a.threshold, rate)}`
+                        : `${a.comparison} ${figure(a.metric, a.threshold, rate)}`}
                     </td>
                     <td className="muted">{a.delivered_ns === null ? "not yet" : timestamp(a.delivered_ns)}</td>
                   </tr>
@@ -199,7 +223,8 @@ function MonitorRow({
   onRemove: () => void;
 }) {
   const s = monitor.state;
-  const rate = isErrorRate(monitor.metric) || s.bound !== null;
+  const drift = monitor.mode === "drift";
+  const rate = isRate(monitor.metric, monitor.mode, s.bound);
   return (
     <tr>
       <td>
@@ -211,10 +236,15 @@ function MonitorRow({
         </div>
       </td>
       <td>
-        {monitor.comparison} {figure(monitor.metric, monitor.threshold, rate)}
+        {drift ? `${changeText(monitor.comparison)} of at least ` : `${monitor.comparison} `}
+        {figure(monitor.metric, monitor.threshold, rate)}
         <div className="muted small">
           over {windowText(monitor.window_minutes)}
-          {usesMinSamples(monitor.metric) ? ` · at least ${count(monitor.min_samples)} samples` : ""}
+          {drift
+            ? ` against the ${windowText(monitor.baseline_minutes ?? monitor.window_minutes)} before`
+            : usesMinSamples(monitor.metric)
+              ? ` · at least ${count(monitor.min_samples)} samples`
+              : ""}
           {monitor.cooldown_minutes === 0 ? " · no cooldown" : ` · cooldown ${windowText(monitor.cooldown_minutes)}`}
         </div>
       </td>
@@ -224,13 +254,17 @@ function MonitorRow({
         ) : (
           <span className="badge neutral">off</span>
         )}
-        {monitor.enabled && s.insufficient && <div className="muted small">too few samples</div>}
+        {monitor.enabled && s.insufficient && <div className="muted small">{drift ? "too few traces" : "too few samples"}</div>}
         {monitor.enabled && s.state === "FIRING" && s.good_since_ns !== null && (
           <div className="muted small">recovering since {timestamp(s.good_since_ns)}</div>
         )}
       </td>
-      <td className="num">{figure(monitor.metric, s.value, rate)}</td>
-      <td className="num">{s.bound === null ? "–" : figure(monitor.metric, s.bound, true)}</td>
+      <td className="num">
+        {drift && s.value !== null
+          ? `from ${figure(monitor.metric, s.baseline_value, rate)} to ${figure(monitor.metric, s.value, rate)}`
+          : figure(monitor.metric, s.value, rate)}
+      </td>
+      <td className="num">{s.bound === null ? "–" : figure(monitor.metric, s.bound, drift ? rate : true)}</td>
       <td className="num">{monitor.metric === "trace_count" ? "–" : count(s.samples)}</td>
       <td>
         <button type="button" className="link" onClick={onToggle}>
@@ -254,7 +288,10 @@ function MonitorForm({
   onEdit: () => void;
 }) {
   const [name, setName] = useState("");
+  const [mode, setMode] = useState<MonitorMode>("threshold");
   const [metric, setMetric] = useState<MonitorMetric>("model_error_rate");
+  // Blank compares with a window of the same length.
+  const [baselineMinutes, setBaselineMinutes] = useState("");
   const [scoreName, setScoreName] = useState("");
   const [windowMinutes, setWindowMinutes] = useState("60");
   const [comparison, setComparison] = useState<NewMonitor["comparison"]>("above");
@@ -265,15 +302,27 @@ function MonitorForm({
   const [service, setService] = useState("");
   const [saving, setSaving] = useState(false);
 
+  const drift = mode === "drift";
+  const metrics = drift ? DRIFT_METRICS : METRICS;
+
+  const changeMode = (next: MonitorMode) => {
+    setMode(next);
+    // Each mode has metrics the other lacks.
+    if (!(next === "drift" ? DRIFT_METRICS : METRICS).some((m) => m.value === metric)) setMetric("model_error_rate");
+  };
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
     const minutes = Number(windowMinutes);
+    const baseline = Number(baselineMinutes);
     const limit = Number(threshold);
     const samples = Number(minSamples);
     const cooldownMinutes = Number(cooldown);
     if (!Number.isInteger(minutes) || minutes < 1) return onError("The window must be a whole number of minutes.");
     if (threshold.trim() === "" || !Number.isFinite(limit)) return onError("The threshold must be a number.");
-    if (minSamples.trim() !== "" && (!Number.isInteger(samples) || samples < 1)) return onError("Min samples must be a whole number of at least 1.");
+    if (drift && baselineMinutes.trim() !== "" && (!Number.isInteger(baseline) || baseline < 1)) return onError("The baseline must be a whole number of minutes.");
+    if (drift && limit < 0) return onError("The smallest change must be 0 or more.");
+    if (!drift && minSamples.trim() !== "" && (!Number.isInteger(samples) || samples < 1)) return onError("Min samples must be a whole number of at least 1.");
     if (cooldown.trim() === "" || !Number.isInteger(cooldownMinutes) || cooldownMinutes < 0) return onError("The cooldown must be a whole number of minutes, or 0.");
     setSaving(true);
     createMonitor({
@@ -285,7 +334,9 @@ function MonitorForm({
       comparison,
       threshold: limit,
       cooldown_minutes: cooldownMinutes,
-      ...(minSamples.trim() === "" || !usesMinSamples(metric) ? {} : { min_samples: samples }),
+      mode,
+      ...(drift && baselineMinutes.trim() !== "" ? { baseline_minutes: baseline } : {}),
+      ...(drift || minSamples.trim() === "" || !usesMinSamples(metric) ? {} : { min_samples: samples }),
     }).then(
       (monitor) => {
         setSaving(false);
@@ -305,9 +356,16 @@ function MonitorForm({
         Name <input value={name} onChange={(e) => setName(e.target.value)} placeholder="model errors" required maxLength={200} />
       </label>
       <label>
+        Mode
+        <select value={mode} onChange={(e) => changeMode(e.target.value as MonitorMode)}>
+          <option value="threshold">threshold</option>
+          <option value="drift">drift</option>
+        </select>
+      </label>
+      <label>
         Metric
         <select value={metric} onChange={(e) => setMetric(e.target.value as MonitorMetric)}>
-          {METRICS.map((m) => (
+          {metrics.map((m) => (
             <option key={m.value} value={m.value}>
               {m.label}
             </option>
@@ -322,17 +380,23 @@ function MonitorForm({
       <label>
         Window (minutes) <input value={windowMinutes} onChange={(e) => setWindowMinutes(e.target.value)} inputMode="numeric" size={6} />
       </label>
+      {drift && (
+        <label>
+          Baseline (minutes) <input value={baselineMinutes} onChange={(e) => setBaselineMinutes(e.target.value)} inputMode="numeric" size={6} placeholder="same" />
+        </label>
+      )}
       <label>
         Fires when
         <select value={comparison} onChange={(e) => setComparison(e.target.value as NewMonitor["comparison"])}>
-          <option value="above">above</option>
-          <option value="below">below</option>
+          <option value="above">{drift ? "rising" : "above"}</option>
+          <option value="below">{drift ? "falling" : "below"}</option>
         </select>
       </label>
       <label>
-        Threshold{isErrorRate(metric) ? " (0.2 is 20%)" : ""} <input value={threshold} onChange={(e) => setThreshold(e.target.value)} inputMode="decimal" size={8} required />
+        {drift ? "Smallest change" : "Threshold"}
+        {isErrorRate(metric) ? " (0.2 is 20%)" : ""} <input value={threshold} onChange={(e) => setThreshold(e.target.value)} inputMode="decimal" size={8} required />
       </label>
-      {usesMinSamples(metric) && (
+      {!drift && usesMinSamples(metric) && (
         <label>
           Min samples <input value={minSamples} onChange={(e) => setMinSamples(e.target.value)} inputMode="numeric" size={6} placeholder={isErrorRate(metric) ? "3" : "10"} />
         </label>

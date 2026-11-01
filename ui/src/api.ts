@@ -628,7 +628,11 @@ export async function listJudgements(id: string, signal?: AbortSignal): Promise<
   return (await getJson<{ judgements: Judgement[] }>(`api/judges/${encodeURIComponent(id)}/judgements`, signal)).judgements;
 }
 
-export type MonitorMetric = "model_error_rate" | "tool_error_rate" | "cost_usd" | "model_p95_ms" | "trace_count" | "score_mean";
+export type DriftMetric = "model_error_rate" | "tool_error_rate" | "model_mean_ms" | "model_p95_ms" | "cost_per_trace" | "score_mean";
+
+export type MonitorMetric = DriftMetric | "cost_usd" | "trace_count";
+
+export type MonitorMode = "threshold" | "drift";
 
 export interface MonitorState {
   state: "OK" | "FIRING";
@@ -642,6 +646,9 @@ export interface MonitorState {
   insufficient: boolean;
   /** While firing: since when the value has been on the good side. */
   good_since_ns: string | null;
+  /** Drift only: the baseline window's value. `bound` is then a difference. */
+  baseline_value: number | null;
+  breaches: number;
 }
 
 export interface Monitor {
@@ -657,11 +664,14 @@ export interface Monitor {
   cooldown_minutes: number;
   enabled: boolean;
   created_ns: string;
+  mode: MonitorMode;
+  /** The window compared with, directly before the trailing one; null in threshold mode. */
+  baseline_minutes: number | null;
   state: MonitorState;
 }
 
 export type NewMonitor = Pick<Monitor, "name" | "metric" | "score_name" | "service" | "window_minutes" | "comparison" | "threshold" | "cooldown_minutes"> &
-  Partial<Pick<Monitor, "min_samples">>;
+  Partial<Pick<Monitor, "min_samples" | "mode" | "baseline_minutes">>;
 
 export interface Alert {
   id: string;
@@ -679,6 +689,9 @@ export interface Alert {
   created_ns: string;
   delivered_ns: string | null;
   reason: "changed" | "removed" | null;
+  mode: MonitorMode;
+  /** Drift only: the value this moved from, to `value`. */
+  baseline_value: number | null;
 }
 
 export async function listMonitors(signal?: AbortSignal): Promise<Monitor[]> {
@@ -699,4 +712,62 @@ export async function deleteMonitor(id: string): Promise<void> {
 
 export async function listAlerts(signal?: AbortSignal): Promise<Alert[]> {
   return (await getJson<{ alerts: Alert[] }>("api/alerts", signal)).alerts;
+}
+
+export interface DriftComparison {
+  metric: DriftMetric;
+  score_name: string | null;
+  baseline_value: number | null;
+  current_value: number | null;
+  difference: number | null;
+  interval: [number, number] | null;
+  baseline_traces: number;
+  current_traces: number;
+  baseline_samples: number;
+  current_samples: number;
+  direction: "higher" | "lower" | "none";
+  verdict: "changed" | "no detectable difference" | "underpowered";
+  /** The interval's half-width: the smallest change this data could have shown. */
+  detectable: number | null;
+  truncated: boolean;
+  proportion: boolean;
+  confidence: number;
+}
+
+export interface DriftSummary {
+  days: number;
+  end_ns: string;
+  comparisons: DriftComparison[];
+}
+
+export interface DetectedChange {
+  kind: "model" | "version";
+  name: string;
+  service: string | null;
+  first_seen_ns: string;
+}
+
+export async function getDriftSummary(days: number, service: string, signal?: AbortSignal): Promise<DriftSummary> {
+  const params = new URLSearchParams({ days: String(days) });
+  if (service) params.set("service", service);
+  return getJson<DriftSummary>(`api/drift/summary?${params}`, signal);
+}
+
+export interface DriftWindows {
+  baseline_from: string;
+  baseline_to: string;
+  current_from: string;
+  current_to: string;
+}
+
+export async function getDrift(metric: DriftMetric, windows: DriftWindows, service: string, signal?: AbortSignal): Promise<DriftComparison> {
+  const params = new URLSearchParams({ metric, ...windows });
+  if (service) params.set("service", service);
+  return (await getJson<{ comparison: DriftComparison }>(`api/drift?${params}`, signal)).comparison;
+}
+
+export async function listChanges(service: string, signal?: AbortSignal): Promise<DetectedChange[]> {
+  const params = new URLSearchParams();
+  if (service) params.set("service", service);
+  return (await getJson<{ changes: DetectedChange[] }>(`api/changes?${params}`, signal)).changes;
 }

@@ -13,6 +13,12 @@ A firing monitor resolves only once its point value has stayed on the good side 
 for a cooldown, with no bound to clear. Without one, a value that sits at the threshold (a trace
 count that moves between 2 and 3 at a threshold of 3) would write an alert every other minute.
 
+A drift monitor asks a different question: did the metric move, between the trailing window and
+the window directly before it? See `drift` for the comparison. It tests overlapping windows over
+and over, so it has guards of its own: it evaluates at most once an hour, uses a 99.5% interval,
+and fires only on six breaches in a row. It reports a change, not a level: once a shift has been
+in place for a whole baseline window, the two windows agree again and the monitor recovers.
+
 Alerts carry only names and numbers. Delivery is a client polling for undelivered alerts, so
 agentwatch stores no URL or secret and calls nothing.
 """
@@ -31,6 +37,7 @@ from typing import Any
 
 import duckdb
 
+from agentwatch import drift
 from agentwatch.metrics import Window, monitor_figures, score_figures
 from agentwatch.stats import wilson
 from agentwatch.store import Store
@@ -44,6 +51,10 @@ MODEL_P95_MS = "model_p95_ms"
 TRACE_COUNT = "trace_count"
 SCORE_MEAN = "score_mean"
 METRICS = (MODEL_ERROR_RATE, TOOL_ERROR_RATE, COST_USD, MODEL_P95_MS, TRACE_COUNT, SCORE_MEAN)
+
+THRESHOLD = "threshold"
+DRIFT = "drift"
+MODES = (THRESHOLD, DRIFT)
 
 ABOVE = "above"
 BELOW = "below"
@@ -71,6 +82,13 @@ DEFAULT_COOLDOWN_MINUTES = 60
 # Controls, format and bidi characters, and line breaks: a name is shown wherever an alert is
 # delivered, and must not be able to fake a new line or reorder what is around it.
 _REFUSED_IN_NAME = ("Cc", "Cf", "Cs", "Zl", "Zp")
+# Guards against re-testing overlapping windows: see the module's docstring. A 99% interval and
+# two breaches fired about once a month on simulated traffic with no change; docs/design.md has
+# the figures. The resamples leave five draws beyond each end of the interval.
+DRIFT_INTERVAL_NS = 60 * MINUTE_NS
+DRIFT_CONFIDENCE = 0.995
+DRIFT_BREACHES = 6
+DRIFT_RESAMPLES = 2000
 
 
 class MonitorError(ValueError):
@@ -102,6 +120,10 @@ class Monitor:
     cooldown_minutes: int
     enabled: bool
     created_ns: int
+    # THRESHOLD compares with a level; DRIFT with the window directly before.
+    mode: str = THRESHOLD
+    # The length of that window; None in threshold mode.
+    baseline_minutes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +142,9 @@ class MonitorState:
     insufficient: bool = False
     # While firing: since when the value has been on the good side. Any bad evaluation clears it.
     good_since_ns: int | None = None
+    # Drift only: the baseline window's value, and how many evaluations in a row have breached.
+    baseline_value: float | None = None
+    breaches: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +166,9 @@ class Alert:
     delivered_ns: int | None
     # CHANGED or REMOVED when an edit resolved it; otherwise None.
     reason: str | None = None
+    mode: str = THRESHOLD
+    # Drift only: the value this moved from, to `value`. `bound` is then a difference.
+    baseline_value: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,14 +185,15 @@ class Reading:
 
 _COLUMNS = (
     "id, name, metric, score_name, service, window_minutes, comparison, threshold, min_samples, "
-    "cooldown_minutes, enabled, created_ns"
+    "cooldown_minutes, enabled, created_ns, mode, baseline_minutes"
 )
 _STATE_COLUMNS = (
-    "monitor_id, state, value, bound, samples, evaluated_ns, since_ns, insufficient, good_since_ns"
+    "monitor_id, state, value, bound, samples, evaluated_ns, since_ns, insufficient, "
+    "good_since_ns, baseline_value, breaches"
 )
 _ALERT_COLUMNS = (
     "id, monitor_id, monitor_name, kind, metric, comparison, threshold, value, bound, samples, "
-    "window_minutes, created_ns, delivered_ns, reason"
+    "window_minutes, created_ns, delivered_ns, reason, mode, baseline_value"
 )
 _FIELDS = (
     "name",
@@ -177,6 +206,8 @@ _FIELDS = (
     "min_samples",
     "cooldown_minutes",
     "enabled",
+    "mode",
+    "baseline_minutes",
 )
 # What the state's meaning depends on: a change to any of these starts the monitor again. A name
 # or a cooldown changes nothing about what was measured.
@@ -189,6 +220,8 @@ _RULE_FIELDS = (
     "threshold",
     "min_samples",
     "enabled",
+    "mode",
+    "baseline_minutes",
 )
 
 
@@ -209,7 +242,7 @@ def create_monitor(store: Store, body: Any, *, now_ns: int | None = None) -> Mon
     with store.transaction() as db:
         _check_name_free(db, monitor.name)
         db.execute(
-            f"INSERT INTO monitors ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO monitors ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 monitor.id,
                 monitor.name,
@@ -223,6 +256,8 @@ def create_monitor(store: Store, body: Any, *, now_ns: int | None = None) -> Mon
                 monitor.cooldown_minutes,
                 monitor.enabled,
                 monitor.created_ns,
+                monitor.mode,
+                monitor.baseline_minutes,
             ],
         )
     return monitor
@@ -247,8 +282,8 @@ def update_monitor(
             db.execute("UPDATE monitors SET name = ? WHERE id = ?", [monitor.name, monitor.id])
         db.execute(
             "UPDATE monitors SET metric = ?, score_name = ?, service = ?, window_minutes = ?, "
-            "comparison = ?, threshold = ?, min_samples = ?, cooldown_minutes = ?, enabled = ? "
-            "WHERE id = ?",
+            "comparison = ?, threshold = ?, min_samples = ?, cooldown_minutes = ?, enabled = ?, "
+            "mode = ?, baseline_minutes = ? WHERE id = ?",
             [
                 monitor.metric,
                 monitor.score_name,
@@ -259,6 +294,8 @@ def update_monitor(
                 monitor.min_samples,
                 monitor.cooldown_minutes,
                 monitor.enabled,
+                monitor.mode,
+                monitor.baseline_minutes,
                 monitor.id,
             ],
         )
@@ -342,9 +379,13 @@ def _known(body: Any) -> dict[str, Any]:
 def _validated(fields: dict[str, Any], *, monitor_id: str, created_ns: int) -> Monitor:
     """A monitor from untrusted field values, or MonitorError naming the first bad one."""
     name = _name(fields.get("name"))
+    mode = fields.get("mode", THRESHOLD)
+    if mode not in MODES:
+        raise MonitorError(f"mode must be one of {', '.join(MODES)}")
     metric = fields.get("metric")
-    if metric not in METRICS:
-        raise MonitorError(f"metric must be one of {', '.join(METRICS)}")
+    allowed = drift.METRICS if mode == DRIFT else METRICS
+    if not isinstance(metric, str) or metric not in allowed:
+        raise MonitorError(f"metric must be one of {', '.join(allowed)}")
     score_name = None
     if metric == SCORE_MEAN:
         if fields.get("score_name") in (None, ""):
@@ -357,21 +398,33 @@ def _validated(fields: dict[str, Any], *, monitor_id: str, created_ns: int) -> M
     if not isinstance(enabled, bool):
         raise MonitorError("enabled must be true or false")
     service = fields.get("service")
+    window = _whole(fields.get("window_minutes"), MAX_WINDOW_MINUTES, "window_minutes")
+    baseline = None
+    if mode == DRIFT:
+        given = fields.get("baseline_minutes")
+        baseline = _whole(
+            window if given is None else given, MAX_WINDOW_MINUTES, "baseline_minutes"
+        )
+    threshold = _threshold(fields.get("threshold"), metric)
+    if mode == DRIFT and threshold < 0:
+        raise MonitorError("a drift monitor's threshold is the smallest change, so at least 0")
     return Monitor(
         id=monitor_id,
         name=name,
         metric=metric,
         score_name=score_name,
         service=None if service in (None, "") else _text(service, "service"),
-        window_minutes=_whole(fields.get("window_minutes"), MAX_WINDOW_MINUTES, "window_minutes"),
+        window_minutes=window,
         comparison=comparison,
-        threshold=_threshold(fields.get("threshold"), metric),
+        threshold=threshold,
         min_samples=_whole(fields.get("min_samples"), MAX_MIN_SAMPLES, "min_samples"),
         cooldown_minutes=_whole(
             fields.get("cooldown_minutes"), MAX_WINDOW_MINUTES, "cooldown_minutes", minimum=0
         ),
         enabled=enabled,
         created_ns=created_ns,
+        mode=mode,
+        baseline_minutes=baseline,
     )
 
 
@@ -501,6 +554,8 @@ def evaluate(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None
     state and its alert, so a monitor over a long window does not hold up ingest any longer
     than its query does.
     """
+    if monitor.mode == DRIFT:
+        return _evaluate_drift(store, monitor, now_ns)
     reading = read(store, monitor, now_ns)
     with store.transaction() as db:
         row = db.execute(f"SELECT {_COLUMNS} FROM monitors WHERE id = ?", [monitor.id]).fetchone()
@@ -547,22 +602,146 @@ def evaluate(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None
             insufficient=insufficient,
             good_since_ns=good_since,
         )
-        db.execute(
-            f"INSERT OR REPLACE INTO monitor_states ({_STATE_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                result.monitor_id,
-                result.state,
-                result.value,
-                result.bound,
-                result.samples,
-                result.evaluated_ns,
-                result.since_ns,
-                result.insufficient,
-                result.good_since_ns,
-            ],
-        )
+        _write_state(db, result)
     return result
+
+
+def _write_state(db: duckdb.DuckDBPyConnection, state: MonitorState) -> None:
+    db.execute(
+        f"INSERT OR REPLACE INTO monitor_states ({_STATE_COLUMNS}) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            state.monitor_id,
+            state.state,
+            state.value,
+            state.bound,
+            state.samples,
+            state.evaluated_ns,
+            state.since_ns,
+            state.insufficient,
+            state.good_since_ns,
+            state.baseline_value,
+            state.breaches,
+        ],
+    )
+
+
+def drift_breach(monitor: Monitor, result: drift.Comparison) -> bool:
+    """A change, in the bad direction, of at least the smallest change that matters."""
+    bad = drift.HIGHER if monitor.comparison == ABOVE else drift.LOWER
+    return (
+        result.verdict == drift.CHANGED
+        and result.direction == bad
+        and result.difference is not None
+        and abs(result.difference) >= monitor.threshold
+    )
+
+
+def next_drift_state(
+    monitor: Monitor,
+    result: drift.Comparison,
+    state: str,
+    breaches: int,
+    good_since: int | None,
+    last_evaluated: int | None,
+    now_ns: int,
+) -> tuple[str, int, int | None]:
+    """The state, breaches in a row and good-since time after a drift evaluation.
+
+    An underpowered evaluation is no evidence either way, so it changes none of them, except to
+    move good-since forward so that the time it covers does not count toward the cooldown.
+    """
+    if result.verdict == drift.UNDERPOWERED:
+        if good_since is not None and last_evaluated is not None:
+            good_since += max(0, now_ns - last_evaluated)
+        return state, breaches, good_since
+    breaching = drift_breach(monitor, result)
+    if state == OK:
+        breaches = breaches + 1 if breaching else 0
+        return (FIRING if breaches >= DRIFT_BREACHES else OK), breaches, None
+    if breaching:
+        return FIRING, breaches, None
+    good_since = now_ns if good_since is None else good_since
+    if now_ns - good_since >= monitor.cooldown_minutes * MINUTE_NS:
+        return OK, 0, None
+    return FIRING, breaches, good_since
+
+
+def _near_edge(monitor: Monitor, result: drift.Comparison) -> float | None:
+    """The end of the difference's interval nearest no change, on the bad side."""
+    if result.interval is None:
+        return None
+    return result.interval[0] if monitor.comparison == ABOVE else result.interval[1]
+
+
+def _evaluate_drift(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None:
+    """As `evaluate`, and None too when the last evaluation is under an hour old. The queries
+    each hold the store's lock for themselves, and the bootstrap holds it not at all."""
+    last = get_state(store, monitor.id).evaluated_ns
+    if last is not None and now_ns - last < DRIFT_INTERVAL_NS:
+        return None
+    split = now_ns - monitor.window_minutes * MINUTE_NS
+    length = (
+        monitor.window_minutes if monitor.baseline_minutes is None else monitor.baseline_minutes
+    )
+    result = drift.compare(
+        store,
+        monitor.metric,
+        baseline=(split - length * MINUTE_NS, split),
+        current=(split, now_ns),
+        service=monitor.service,
+        score_name=monitor.score_name,
+        confidence=DRIFT_CONFIDENCE,
+        resamples=DRIFT_RESAMPLES,
+    )
+    with store.transaction() as db:
+        row = db.execute(f"SELECT {_COLUMNS} FROM monitors WHERE id = ?", [monitor.id]).fetchone()
+        if row is None or Monitor(*row) != monitor:
+            return None
+        stored = db.execute(
+            "SELECT state, since_ns, good_since_ns, evaluated_ns, breaches FROM monitor_states "
+            "WHERE monitor_id = ?",
+            [monitor.id],
+        ).fetchone()
+        state: str = OK if stored is None else stored[0]
+        since: int = now_ns if stored is None else stored[1]
+        following, breaches, good_since = next_drift_state(
+            monitor,
+            result,
+            state,
+            0 if stored is None else stored[4],
+            None if stored is None else stored[2],
+            None if stored is None else stored[3],
+            now_ns,
+        )
+        bound = _near_edge(monitor, result)
+        if following != state:
+            since = now_ns
+            _write_alert(
+                db,
+                monitor,
+                FIRED if following == FIRING else RESOLVED,
+                now_ns,
+                value=result.current_value,
+                bound=bound,
+                samples=result.current_samples,
+                baseline_value=result.baseline_value,
+            )
+        written = MonitorState(
+            monitor_id=monitor.id,
+            state=following,
+            value=result.current_value,
+            bound=bound,
+            samples=result.current_samples,
+            evaluated_ns=now_ns,
+            since_ns=since,
+            insufficient=result.verdict == drift.UNDERPOWERED,
+            good_since_ns=good_since,
+            baseline_value=result.baseline_value,
+            breaches=breaches,
+        )
+        _write_state(db, written)
+    return written
 
 
 def _write_alert(
@@ -575,10 +754,11 @@ def _write_alert(
     bound: float | None = None,
     samples: int = 0,
     reason: str | None = None,
+    baseline_value: float | None = None,
 ) -> None:
     db.execute(
         f"INSERT INTO alerts ({_ALERT_COLUMNS}) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
         [
             uuid.uuid4().hex,
             monitor.id,
@@ -593,6 +773,8 @@ def _write_alert(
             monitor.window_minutes,
             now_ns,
             reason,
+            monitor.mode,
+            baseline_value,
         ],
     )
 
@@ -633,15 +815,16 @@ class MonitorRunner:
         return self._thread is not None and self._thread.is_alive()
 
     def run_once(self) -> int:
-        """One pass over every enabled monitor; returns how many were evaluated."""
+        """One pass over every enabled monitor; returns how many were evaluated. A drift monitor
+        not yet due is not, nor is one changed during its evaluation."""
         evaluated = 0
         for monitor in list_monitors(self.store):
             if not monitor.enabled or self._stop.is_set():
                 continue
             try:
-                evaluate(self.store, monitor, self.clock())
+                state = evaluate(self.store, monitor, self.clock())
             except Exception:  # one bad monitor must not stop the others
                 log.exception("monitor %s failed", monitor.id)
             else:
-                evaluated += 1
+                evaluated += 0 if state is None else 1
         return evaluated
