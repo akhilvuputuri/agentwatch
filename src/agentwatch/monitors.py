@@ -18,7 +18,7 @@ the window directly before it? See `drift` for the comparison. It tests overlapp
 and over, so it has guards of its own: it evaluates at most once an hour, uses a 99.5% interval,
 and fires only on six breaches in a row. It reports a change, not a level: once a shift has been
 in place for a whole baseline window, the two windows agree again and the monitor resolves, whatever
-the level is. Simulated traffic with ordinary overdispersion still fires falsely, so trial one muted.
+the level is. It also resolves on a move the other way, as when a brief incident enters the baseline. Simulated traffic with ordinary overdispersion still fires falsely, so trial one muted.
 
 A muted monitor runs as usual, but its alerts are written as already delivered, so a polling
 client never sees them. Toggling it changes nothing about its state, and a resolved alert goes the
@@ -180,7 +180,7 @@ class Alert:
     reason: str | None = None
     mode: str = THRESHOLD
     # Drift only: the two windows' values and the baseline's length. `bound` is then a difference.
-    # A resolved alert means these windows no longer differ, not that the level has come back.
+    # A resolved alert means no change in the bad direction now, not that the level has come back.
     baseline_value: float | None = None
     baseline_minutes: int | None = None
     # Its monitor was muted, so it was written as already delivered.

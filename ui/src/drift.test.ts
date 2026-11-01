@@ -47,10 +47,10 @@ describe("a falling drift monitor", () => {
 
 describe("a drift alert", () => {
   const alert = (fields: Partial<Alert>): Alert =>
-    ({ kind: "firing", metric: "model_error_rate", mode: "drift", value: 0.4, baseline_value: 0.1, ...fields }) as Alert;
+    ({ kind: "firing", metric: "model_error_rate", mode: "drift", comparison: "above", value: 0.4, baseline_value: 0.1, ...fields }) as Alert;
   it("says what moved when firing, and that the windows agree when resolved", () => {
     expect(driftAlertText(alert({}), true)).toBe("from 10% to 40%");
-    expect(driftAlertText(alert({ kind: "resolved", value: 0.4, baseline_value: 0.39 }), true)).toBe("windows no longer differ: 39% and 40%");
+    expect(driftAlertText(alert({ kind: "resolved", value: 0.4, baseline_value: 0.39 }), true)).toBe("no longer a rise: 39% and 40%");
     expect(driftAlertText(alert({ kind: "resolved", value: null, baseline_value: null }), true)).toBe("–");
   });
 });
