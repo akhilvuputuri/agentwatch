@@ -27,8 +27,9 @@ import base64
 import binascii
 import json
 import math
+import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 from agentwatch import genai
@@ -199,6 +200,20 @@ def write(db: Any, spans: Iterable[Span], received_ns: int) -> None:
             [value for key in chunk for value in key],
         )
     rows = [row for span in spans for row in from_span(span, received_ns)]
+    # A deleted item stays deleted: records from before its deletion are not recorded again.
+    if rows:
+        gone = {
+            (str(store_id), str(record_id)): int(deleted)
+            for store_id, record_id, deleted in db.execute(
+                "SELECT store_id, record_id, deleted_ns FROM memory_deleted"
+            ).fetchall()
+        }
+        if gone:
+            rows = [
+                r
+                for r in rows
+                if r.record_id is None or r.time_ns > gone.get((r.store_id, r.record_id), -1)
+            ]
     for start in range(0, len(rows), 200):
         chunk = rows[start : start + 200]
         marks = ", ".join("(" + ", ".join("?" * 12) + ")" for _ in chunk)
@@ -317,14 +332,73 @@ def items(
     return [_item(row) for row in rows]
 
 
-def delete_item(store: Store, store_id: str, record_id: str) -> bool:
-    """Deletes every record of an item, its content with it. True when there were any."""
+def delete_item(store: Store, store_id: str, record_id: str, *, now_ns: int | None = None) -> bool:
+    """Deletes an item's history: its records, and its records inside the stored memory spans,
+    which are rewritten without them. The deletion is remembered, so re-reading or re-sending
+    those spans cannot bring it back; a later change to the item is recorded as usual. Its text
+    can still be in captured prompts and tool results until their traces are pruned. True
+    when the item had any records."""
+    now_ns = time.time_ns() if now_ns is None else now_ns
     with store.transaction() as db:
-        found = db.execute(
-            "DELETE FROM memory_records WHERE store_id = ? AND record_id = ? RETURNING 1",
+        spans = db.execute(
+            "SELECT DISTINCT m.trace_id, m.span_id, s.attributes FROM memory_records m "
+            "JOIN spans s USING (trace_id, span_id) WHERE m.store_id = ? AND m.record_id = ?",
             [store_id, record_id],
         ).fetchall()
-    return bool(found)
+        found = db.execute(
+            "DELETE FROM memory_records WHERE store_id = ? AND record_id = ? RETURNING time_ns",
+            [store_id, record_id],
+        ).fetchall()
+        if not found:
+            return False
+        latest = max(int(row[0]) for row in found)
+        db.execute(
+            "INSERT OR REPLACE INTO memory_deleted VALUES (?, ?, ?, ?)",
+            [store_id, record_id, max(latest, now_ns), now_ns],
+        )
+        for trace_id, span_id, attributes in spans:
+            db.execute(
+                "UPDATE spans SET attributes = ? WHERE trace_id = ? AND span_id = ?",
+                [json.dumps(_without(json.loads(attributes), record_id)), trace_id, span_id],
+            )
+    return True
+
+
+def without_deleted(db: Any, spans: list[Span]) -> list[Span]:
+    """Spans as they may be stored: memory spans lose the records of items deleted after them,
+    so re-sending a span cannot bring a deleted item's text back."""
+    if not any(genai.read(s).operation in OPERATIONS for s in spans):
+        return spans
+    gone = {
+        (str(store_id), str(record_id)): int(deleted)
+        for store_id, record_id, deleted in db.execute(
+            "SELECT store_id, record_id, deleted_ns FROM memory_deleted"
+        ).fetchall()
+    }
+    if not gone:
+        return spans
+    kept: list[Span] = []
+    for span in spans:
+        store = span.attributes.get(STORE_ID)
+        store_id = store[:MAX_ID] if isinstance(store, str) else ""
+        attributes: dict[str, Any] = dict(span.attributes)
+        for (deleted_store, record_id), deleted_ns in gone.items():
+            if deleted_store == store_id and span.end_ns <= deleted_ns:
+                attributes = _without(attributes, record_id)
+        kept.append(span if attributes == span.attributes else replace(span, attributes=attributes))
+    return kept
+
+
+def _without(attributes: dict[str, Any], record_id: str) -> dict[str, Any]:
+    """A memory span's attributes without one item's records."""
+    kept = dict(attributes)
+    records = _records(kept.get(RECORDS))
+    if records is not None:
+        remaining = [r for r in records if _id(r.get("id")) != record_id]
+        kept[RECORDS] = json.dumps(remaining) if isinstance(kept[RECORDS], str) else remaining
+    if _id(kept.get(RECORD_ID)) == record_id:
+        del kept[RECORD_ID]
+    return kept
 
 
 def stores(store: Store) -> list[str]:

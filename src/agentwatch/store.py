@@ -242,6 +242,14 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             PRIMARY KEY (trace_id, span_id, position)
         )""",
         "CREATE INDEX memory_records_item ON memory_records (store_id, record_id)",
+        # Items whose history was deleted: records up to deleted_ns are not recorded again.
+        """CREATE TABLE memory_deleted (
+            store_id VARCHAR NOT NULL,
+            record_id VARCHAR NOT NULL,
+            deleted_ns BIGINT NOT NULL,
+            requested_ns BIGINT NOT NULL,
+            PRIMARY KEY (store_id, record_id)
+        )""",
     ),
 }
 REPORTED = "reported"
@@ -662,6 +670,7 @@ class Store:
             return
         names = ", ".join(f"'{name}'" for name in sorted(memory.OPERATIONS))
         received = _BASE_COLUMNS.index("received_ns")
+        log.info("re-reading stored memory spans for memory rules version %s", current)
         self._db.execute("BEGIN")
         try:
             # A chunk at a time, in key order, so memory stays proportional to a chunk.
@@ -703,7 +712,7 @@ class Store:
     def write_spans(self, spans: Iterable[Span], received_ns: int) -> int:
         """insert() without its own transaction: call only inside `with store.transaction()`."""
         latest: dict[tuple[str, str], Span] = {}
-        for span in spans:
+        for span in memory.without_deleted(self._db, list(spans)):
             latest[(span.trace_id, span.span_id)] = span
         rows = [_row(span, received_ns) for span in latest.values()]
         if not rows:

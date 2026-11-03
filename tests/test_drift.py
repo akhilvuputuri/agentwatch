@@ -863,6 +863,7 @@ def test_migration_from_schema_9(tmp_path: Path) -> None:
     # Back to how version 9 left it, with rows in each table.
     conn = duckdb.connect(str(path))
     conn.execute("DROP TABLE memory_records")
+    conn.execute("DROP TABLE memory_deleted")
     for table, column in (
         ("monitors", "mode"),
         ("monitors", "baseline_minutes"),

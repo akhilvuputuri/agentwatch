@@ -274,8 +274,9 @@ export function MemoryItemView({ store, id }: { store: string; id: string }) {
       )}
       <h2>Delete</h2>
       <p className="muted small">
-        agentwatch keeps memory history when traces are pruned. Deleting removes everything it recorded about this item,
-        its content included; the agent's own memory is not changed.
+        agentwatch keeps memory history when traces are pruned. Deleting removes this item's history and its records in
+        the stored memory spans, and it stays deleted if those spans arrive again. Its text can still be in captured
+        prompts and tool results until those traces are pruned. The agent's own memory is not changed.
       </p>
       <DeleteItem store={store} id={id} />
     </section>
@@ -285,7 +286,7 @@ export function MemoryItemView({ store, id }: { store: string; id: string }) {
 function DeleteItem({ store, id }: { store: string; id: string }) {
   const [error, setError] = useState<string | null>(null);
   const remove = () => {
-    if (!window.confirm(`Delete everything agentwatch recorded about ${id}?`)) return;
+    if (!window.confirm(`Delete the history agentwatch recorded for ${id}?`)) return;
     deleteMemoryItem(store, id).then(
       () => {
         window.location.hash = "#/memory";

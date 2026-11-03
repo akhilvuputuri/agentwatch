@@ -931,7 +931,7 @@ def test_migration_from_schema_8(tmp_path: Path) -> None:
     old.close()
     # Back to how version 8 left it: without the tables version 9 adds.
     conn = duckdb.connect(str(path))
-    for table in ("monitors", "monitor_states", "alerts", "memory_records"):
+    for table in ("monitors", "monitor_states", "alerts", "memory_records", "memory_deleted"):
         conn.execute(f"DROP TABLE {table}")
     conn.execute("UPDATE meta SET value = '8' WHERE key = 'schema'")
     conn.close()

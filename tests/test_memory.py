@@ -369,6 +369,7 @@ def test_migration_from_schema_10(tmp_path: Path) -> None:
     Store(path).close()
     conn = duckdb.connect(str(path))
     conn.execute("DROP TABLE memory_records")
+    conn.execute("DROP TABLE memory_deleted")
     conn.execute("DELETE FROM meta WHERE key = 'memory_derivation'")
     conn.execute("UPDATE meta SET value = '10' WHERE key = 'schema'")
     conn.close()
@@ -479,3 +480,56 @@ def test_a_rule_change_reads_stored_spans_again_in_chunks(tmp_path: Path) -> Non
         == memory.derivation()
     )
     reopened.close()
+
+
+def test_a_deleted_item_stays_gone_from_spans_rebuilds_and_resends(tmp_path: Path) -> None:
+    path = tmp_path / "db.duckdb"
+    store = Store(path)
+    secret = span(
+        "1" * 16,
+        None,
+        "create_memory",
+        0,
+        1,
+        **{
+            memory.RECORDS: records(
+                {"id": "secret", "content": "my diagnosis"}, {"id": "tz", "content": "UTC+2"}
+            )
+        },
+    )
+    store.insert([secret], received_ns=START)
+    assert memory.delete_item(store, "", "secret", now_ns=START + 5 * MS)
+    assert [i["record_id"] for i in memory.items(store)] == ["tz"]
+    # The span no longer holds it, and the other item in it is untouched.
+    assert store.query(
+        "SELECT count(*) FROM spans WHERE contains(attributes::VARCHAR, 'diagnosis')"
+    ) == [(0,)]
+    # Re-sending the span, or re-reading stored spans, does not bring it back.
+    store.insert([secret], received_ns=START + 1)
+    assert store.query(
+        "SELECT count(*) FROM spans WHERE contains(attributes::VARCHAR, 'diagnosis')"
+    ) == [(0,)]
+    with store.transaction() as db:
+        db.execute("UPDATE meta SET value = 'old' WHERE key = 'memory_derivation'")
+    store.close()
+    store = Store(path)
+    assert [i["record_id"] for i in memory.items(store)] == ["tz"]
+    # A later change to the item is recorded as usual.
+    store.insert(
+        [
+            span(
+                "2" * 16,
+                None,
+                "create_memory",
+                10,
+                11,
+                **{memory.RECORDS: records({"id": "secret", "content": "new"})},
+            )
+        ],
+        received_ns=START + 2,
+    )
+    assert {i["record_id"]: i["content"] for i in memory.items(store)} == {
+        "secret": "new",
+        "tz": "UTC+2",
+    }
+    store.close()
