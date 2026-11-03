@@ -15,11 +15,11 @@ from typing import Any
 
 import duckdb
 
-from agentwatch import genai
+from agentwatch import genai, memory
 from agentwatch.scores import Score, ScoreConflict, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
 # database and an upgraded one end up identical.
@@ -224,6 +224,24 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE alerts ADD COLUMN baseline_value DOUBLE",
         "ALTER TABLE alerts ADD COLUMN baseline_minutes INTEGER",
         "ALTER TABLE alerts ADD COLUMN muted BOOLEAN NOT NULL DEFAULT false",
+    ),
+    11: (
+        """CREATE TABLE memory_records (
+            trace_id VARCHAR NOT NULL,
+            span_id VARCHAR NOT NULL,
+            position INTEGER NOT NULL,
+            operation VARCHAR NOT NULL,
+            store_id VARCHAR NOT NULL,
+            record_id VARCHAR,
+            content JSON,
+            metadata JSON,
+            score DOUBLE,
+            service_name VARCHAR NOT NULL,
+            time_ns BIGINT NOT NULL,
+            received_ns BIGINT NOT NULL,
+            PRIMARY KEY (trace_id, span_id, position)
+        )""",
+        "CREATE INDEX memory_records_item ON memory_records (store_id, record_id)",
     ),
 }
 REPORTED = "reported"
@@ -545,6 +563,7 @@ class Store:
         with self._lock:
             self._migrate()
             self._rederive()
+            self._derive_memory()
 
     def _meta(self, key: str) -> str | None:
         row = self._db.execute("SELECT value FROM meta WHERE key = ?", [key]).fetchone()
@@ -634,6 +653,29 @@ class Store:
                     self._db.execute("ROLLBACK")
                 raise
 
+    def _derive_memory(self) -> None:
+        """Read memory records again from the stored memory spans when the rules have changed,
+        or after the upgrade that added them. Records whose spans were pruned are kept as they
+        are."""
+        current = str(memory.DERIVATION_VERSION)
+        if self._meta("memory_derivation") == current:
+            return
+        names = ", ".join(f"'{name}'" for name in sorted(memory.OPERATIONS))
+        self._db.execute("BEGIN")
+        try:
+            received = _BASE_COLUMNS.index("received_ns")
+            rows = self._db.execute(
+                f"SELECT {_COLUMNS} FROM spans WHERE operation IN ({names})"
+            ).fetchall()
+            for row in rows:
+                memory.write(self._db, [_stored(row).span], int(row[received]))
+            self._set_meta("memory_derivation", current)
+            self._db.execute("COMMIT")
+        except BaseException:
+            with contextlib.suppress(duckdb.Error):
+                self._db.execute("ROLLBACK")
+            raise
+
     def close(self) -> None:
         with self._lock:
             self._db.close()
@@ -664,6 +706,7 @@ class Store:
                 [value for row in chunk for value in row],
             )
         self._write_scores(self._without_conflicts(event_scores))
+        memory.write(self._db, latest.values(), received_ns)
         self._apply_prices(sorted({span.trace_id for span in latest.values()}))
         return len(rows)
 
@@ -698,7 +741,8 @@ class Store:
         a wrong clock (or microseconds sent as nanoseconds) cannot get a new trace deleted.
         Traces and scores of experiment runs are kept, since their runs still show them.
         Scores and judgements older than the cutoff whose trace is gone (or never arrived) go
-        too. Returns the number of traces deleted.
+        too. Memory records stay: an item's history outlasts its traces. Returns the number of
+        traces deleted.
         """
         with self.transaction() as db:
             db.execute(

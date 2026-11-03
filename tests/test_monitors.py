@@ -931,7 +931,7 @@ def test_migration_from_schema_8(tmp_path: Path) -> None:
     old.close()
     # Back to how version 8 left it: without the tables version 9 adds.
     conn = duckdb.connect(str(path))
-    for table in ("monitors", "monitor_states", "alerts"):
+    for table in ("monitors", "monitor_states", "alerts", "memory_records"):
         conn.execute(f"DROP TABLE {table}")
     conn.execute("UPDATE meta SET value = '8' WHERE key = 'schema'")
     conn.close()
@@ -940,7 +940,7 @@ def test_migration_from_schema_8(tmp_path: Path) -> None:
     assert upgraded.query_one("SELECT value FROM meta WHERE key = 'schema'")[0] == str(
         store.SCHEMA_VERSION
     )
-    assert store.SCHEMA_VERSION == 10
+    assert store.SCHEMA_VERSION == 11
     assert upgraded.span_count() == 1
     make(upgraded)
     assert len(monitors.list_monitors(upgraded)) == 1

@@ -1,18 +1,34 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { getTrace, links, STATUS_ERROR, type Score, type TraceDetail } from "./api";
+import {
+  getTrace,
+  type InContext,
+  links,
+  STATUS_ERROR,
+  type Score,
+  type TraceDetail,
+} from "./api";
 import { count, duration, timestamp, usd } from "./format";
 import { AddToDataset } from "./AddToDataset";
 import { ScorePanel } from "./ScorePanel";
+import { approxTokens, contentText } from "./Memory";
 import { layout, type Row } from "./tree";
 
-export function TraceView({ traceId }: { traceId: string }) {
+export function TraceView({
+  traceId,
+  spanId,
+}: {
+  traceId: string;
+  spanId?: string;
+}) {
   const [detail, setDetail] = useState<TraceDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(spanId ?? null);
   const spans = detail?.spans ?? null;
   const setScores = useCallback(
     (update: (scores: Score[]) => Score[]) =>
-      setDetail((current) => (current ? { ...current, scores: update(current.scores) } : current)),
+      setDetail((current) =>
+        current ? { ...current, scores: update(current.scores) } : current,
+      ),
     [],
   );
 
@@ -23,17 +39,18 @@ export function TraceView({ traceId }: { traceId: string }) {
     getTrace(traceId, controller.signal).then(
       (result) => {
         setDetail(result);
-        setSelected(null);
+        setSelected(spanId ?? null);
       },
       (reason: unknown) => {
         if (!controller.signal.aborted) setError(String(reason));
       },
     );
     return () => controller.abort();
-  }, [traceId]);
+  }, [traceId, spanId]);
 
   const view = useMemo(() => layout(spans ?? []), [spans]);
-  const chosen = view.rows.find((row) => row.span.span_id === selected) ?? view.rows[0];
+  const chosen =
+    view.rows.find((row) => row.span.span_id === selected) ?? view.rows[0];
 
   if (error) return <p className="error">Could not load trace: {error}</p>;
   if (!detail || !spans) return <p className="muted">Loading…</p>;
@@ -49,8 +66,8 @@ export function TraceView({ traceId }: { traceId: string }) {
       </p>
       <h1>{root?.name ?? traceId}</h1>
       <p className="muted small">
-        {root && timestamp(root.start_ns)} · {duration(view.totalNs)} · {spans.length} spans ·{" "}
-        <code>{traceId}</code>
+        {root && timestamp(root.start_ns)} · {duration(view.totalNs)} ·{" "}
+        {spans.length} spans · <code>{traceId}</code>
         {sessionId && (
           <>
             {" · "}
@@ -64,7 +81,12 @@ export function TraceView({ traceId }: { traceId: string }) {
           </>
         )}
       </p>
-      <AddToDataset key={traceId} traceId={traceId} spanId={chosen?.span.span_id ?? null} spanName={chosen?.span.name ?? null} />
+      <AddToDataset
+        key={traceId}
+        traceId={traceId}
+        spanId={chosen?.span.span_id ?? null}
+        spanName={chosen?.span.name ?? null}
+      />
       <ScorePanel
         traceId={traceId}
         spanId={chosen?.span.span_id ?? null}
@@ -84,7 +106,12 @@ export function TraceView({ traceId }: { traceId: string }) {
             />
           ))}
         </div>
-        {chosen && <SpanDetail row={chosen} />}
+        {chosen && (
+          <SpanDetail
+            row={chosen}
+            inContext={detail.in_context[chosen.span.span_id] ?? []}
+          />
+        )}
       </div>
     </section>
   );
@@ -104,7 +131,8 @@ function SpanRow({
   const { span } = row;
   const g = span.genai;
   const left = totalNs > 0 ? (row.offsetNs / totalNs) * 100 : 0;
-  const width = totalNs > 0 ? Math.max((row.durationNs / totalNs) * 100, 0.3) : 100;
+  const width =
+    totalNs > 0 ? Math.max((row.durationNs / totalNs) * 100, 0.3) : 100;
   const kind = g.operation ?? "span";
   return (
     <button
@@ -117,8 +145,12 @@ function SpanRow({
     >
       <span className="label" style={{ paddingLeft: `${row.depth * 14}px` }}>
         <span className={`op op-${kind.replace(/[^a-z_]/g, "")}`}>{kind}</span>
-        <span className="name">{g.tool_name ?? g.agent_name ?? g.model ?? span.name}</span>
-        {span.status_code === STATUS_ERROR && <span className="badge bad">error</span>}
+        <span className="name">
+          {g.tool_name ?? g.agent_name ?? g.model ?? span.name}
+        </span>
+        {span.status_code === STATUS_ERROR && (
+          <span className="badge bad">error</span>
+        )}
         {row.orphan && <span className="badge warn">parent missing</span>}
       </span>
       <span className="track">
@@ -132,21 +164,30 @@ function SpanRow({
   );
 }
 
-function SpanDetail({ row }: { row: Row }) {
+function SpanDetail({ row, inContext }: { row: Row; inContext: InContext[] }) {
   const { span } = row;
   const g = span.genai;
   const facts: [string, string][] = [];
   if (g.operation) facts.push(["Operation", g.operation]);
   if (g.provider) facts.push(["Provider", g.provider]);
   if (g.model) facts.push(["Model", g.model]);
-  if (g.input_tokens !== null) facts.push(["Input tokens", count(g.input_tokens)]);
-  if (g.cache_read_tokens !== null) facts.push(["Cache read", count(g.cache_read_tokens)]);
-  if (g.cache_write_tokens !== null) facts.push(["Cache write", count(g.cache_write_tokens)]);
-  if (g.output_tokens !== null) facts.push(["Output tokens", count(g.output_tokens)]);
-  if (g.reasoning_tokens !== null) facts.push(["Reasoning", count(g.reasoning_tokens)]);
+  if (g.input_tokens !== null)
+    facts.push(["Input tokens", count(g.input_tokens)]);
+  if (g.cache_read_tokens !== null)
+    facts.push(["Cache read", count(g.cache_read_tokens)]);
+  if (g.cache_write_tokens !== null)
+    facts.push(["Cache write", count(g.cache_write_tokens)]);
+  if (g.output_tokens !== null)
+    facts.push(["Output tokens", count(g.output_tokens)]);
+  if (g.reasoning_tokens !== null)
+    facts.push(["Reasoning", count(g.reasoning_tokens)]);
   if (g.cost_usd !== null)
-    facts.push(["Cost", `${usd(g.cost_usd)}${g.cost_source === "calculated" ? " (from model price)" : ""}`]);
-  if (g.finish_reasons.length) facts.push(["Finish", g.finish_reasons.join(", ")]);
+    facts.push([
+      "Cost",
+      `${usd(g.cost_usd)}${g.cost_source === "calculated" ? " (from model price)" : ""}`,
+    ]);
+  if (g.finish_reasons.length)
+    facts.push(["Finish", g.finish_reasons.join(", ")]);
   if (g.error_type) facts.push(["Error type", g.error_type]);
   facts.push(["Duration", duration(row.durationNs)]);
   facts.push(["Offset", duration(row.offsetNs)]);
@@ -162,6 +203,7 @@ function SpanDetail({ row }: { row: Row }) {
           </div>
         ))}
       </dl>
+      {inContext.length > 0 && <MemoryInContext entries={inContext} />}
       <h3>Attributes</h3>
       <Attributes values={span.attributes} />
       {span.events.length > 0 && (
@@ -170,7 +212,8 @@ function SpanDetail({ row }: { row: Row }) {
           <ul className="events">
             {span.events.map((event, index) => (
               <li key={index}>
-                <strong>{event.name}</strong> <span className="muted">{timestamp(event.time_ns)}</span>
+                <strong>{event.name}</strong>{" "}
+                <span className="muted">{timestamp(event.time_ns)}</span>
                 <Attributes values={event.attributes} />
               </li>
             ))}
@@ -206,5 +249,62 @@ function Attributes({ values }: { values: Record<string, unknown> }) {
         ))}
       </tbody>
     </table>
+  );
+}
+
+/** The memory records this model call had in its prompt, as the instrumentation reported them. */
+function MemoryInContext({ entries }: { entries: InContext[] }) {
+  const sized = entries.filter((entry) => entry.characters !== null);
+  const characters = sized.reduce(
+    (total, entry) => total + (entry.characters ?? 0),
+    0,
+  );
+  return (
+    <>
+      <h3>Memory in context</h3>
+      <p className="muted small" data-testid="memory-in-context">
+        {entries.length} item{entries.length === 1 ? "" : "s"} read into this
+        call's prompt
+        {sized.length > 0 && (
+          <>
+            {" "}
+            · {count(characters)} characters
+            {sized.length < entries.length ? " (of those with a size)" : ""},
+            about {count(approxTokens(characters))} tokens
+          </>
+        )}
+        . Being in context does not mean the model used an item.
+      </p>
+      <table className="attrs">
+        <tbody>
+          {entries.map((entry, index) => {
+            const text = contentText(entry.content);
+            return (
+              <tr key={`${entry.search_span_id}:${index}`}>
+                <th>
+                  {entry.record_id ? (
+                    <a href={links.memoryItem(entry.store_id, entry.record_id)}>
+                      {entry.record_id}
+                    </a>
+                  ) : (
+                    <span className="muted">no ID</span>
+                  )}
+                  <div className="muted small">{entry.search_span_name}</div>
+                </th>
+                <td>
+                  {text ?? <span className="muted">content not captured</span>}
+                  {entry.characters !== null && (
+                    <div className="muted small">
+                      {count(entry.characters)} characters, about{" "}
+                      {count(approxTokens(entry.characters))} tokens
+                    </div>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </>
   );
 }

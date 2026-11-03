@@ -5,6 +5,7 @@ import { Dashboard } from "./Dashboard";
 import { DatasetList, DatasetView } from "./Datasets";
 import { Drift } from "./Drift";
 import { Judges } from "./Judges";
+import { MemoryItemView, MemoryList } from "./Memory";
 import { Prices } from "./Prices";
 import { RunView } from "./Runs";
 import { SessionList, SessionView } from "./Sessions";
@@ -18,13 +19,15 @@ export type Route =
   | { page: "judges" }
   | { page: "alerts" }
   | { page: "drift" }
+  | { page: "memory" }
+  | { page: "memory-item"; store: string; id: string }
   | { page: "datasets" }
   | { page: "dataset"; datasetId: string }
   | { page: "run"; runId: string }
   | { page: "compare"; baseline: string; candidate: string }
   | { page: "sessions" }
   | { page: "session"; sessionId: string }
-  | { page: "trace"; traceId: string };
+  | { page: "trace"; traceId: string; spanId?: string };
 
 export function route(hash: string): Route {
   if (hash === "#/dashboard") return { page: "dashboard" };
@@ -34,6 +37,15 @@ export function route(hash: string): Route {
   if (hash === "#/alerts") return { page: "alerts" };
   if (hash === "#/drift") return { page: "drift" };
   if (hash === "#/datasets") return { page: "datasets" };
+  if (hash === "#/memory") return { page: "memory" };
+  const memoryItem = /^#\/memory\/item\?(.*)$/.exec(hash);
+  if (memoryItem) {
+    const params = new URLSearchParams(memoryItem[1]);
+    const id = params.get("id");
+    return id
+      ? { page: "memory-item", store: params.get("store") ?? "", id }
+      : { page: "memory" };
+  }
   const compare = /^#\/compare\/([^/]+)\/([^/]+)$/.exec(hash);
   if (compare) {
     try {
@@ -70,12 +82,23 @@ export function route(hash: string): Route {
       return { page: "sessions" };
     }
   }
-  const trace = /^#\/trace\/([0-9a-fA-F]{32})$/.exec(hash);
-  if (trace) return { page: "trace", traceId: trace[1]!.toLowerCase() };
+  const trace = /^#\/trace\/([0-9a-fA-F]{32})(?:\/([0-9a-fA-F]{16}))?$/.exec(
+    hash,
+  );
+  if (trace) {
+    const found: { page: "trace"; traceId: string; spanId?: string } = {
+      page: "trace",
+      traceId: trace[1]!.toLowerCase(),
+    };
+    if (trace[2]) found.spanId = trace[2].toLowerCase();
+    return found;
+  }
   const query = /^#\/\?(.*)$/.exec(hash);
   if (query) {
     const params = new URLSearchParams(query[1]);
-    const filter: { page: "traces"; session?: string; user?: string } = { page: "traces" };
+    const filter: { page: "traces"; session?: string; user?: string } = {
+      page: "traces",
+    };
     const s = params.get("session");
     const u = params.get("user");
     if (s) filter.session = s;
@@ -93,16 +116,22 @@ export function App() {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
   const section =
-    current.page === "dashboard" || current.page === "prices" || current.page === "judges" || current.page === "alerts" || current.page === "drift"
+    current.page === "dashboard" ||
+    current.page === "prices" ||
+    current.page === "judges" ||
+    current.page === "alerts" ||
+    current.page === "drift"
       ? current.page
-      : current.page === "sessions" || current.page === "session"
-        ? "sessions"
-        : current.page === "datasets" ||
-            current.page === "dataset" ||
-            current.page === "run" ||
-            current.page === "compare"
-          ? "datasets"
-          : "traces";
+      : current.page === "memory" || current.page === "memory-item"
+        ? "memory"
+        : current.page === "sessions" || current.page === "session"
+          ? "sessions"
+          : current.page === "datasets" ||
+              current.page === "dataset" ||
+              current.page === "run" ||
+              current.page === "compare"
+            ? "datasets"
+            : "traces";
   return (
     <div className="app">
       <header className="top">
@@ -113,25 +142,52 @@ export function App() {
           <a href="#/" aria-current={section === "traces" ? "page" : undefined}>
             Traces
           </a>
-          <a href="#/sessions" aria-current={section === "sessions" ? "page" : undefined}>
+          <a
+            href="#/sessions"
+            aria-current={section === "sessions" ? "page" : undefined}
+          >
             Sessions
           </a>
-          <a href="#/datasets" aria-current={section === "datasets" ? "page" : undefined}>
+          <a
+            href="#/memory"
+            aria-current={section === "memory" ? "page" : undefined}
+          >
+            Memory
+          </a>
+          <a
+            href="#/datasets"
+            aria-current={section === "datasets" ? "page" : undefined}
+          >
             Datasets
           </a>
-          <a href="#/dashboard" aria-current={section === "dashboard" ? "page" : undefined}>
+          <a
+            href="#/dashboard"
+            aria-current={section === "dashboard" ? "page" : undefined}
+          >
             Dashboard
           </a>
-          <a href="#/judges" aria-current={section === "judges" ? "page" : undefined}>
+          <a
+            href="#/judges"
+            aria-current={section === "judges" ? "page" : undefined}
+          >
             Judges
           </a>
-          <a href="#/drift" aria-current={section === "drift" ? "page" : undefined}>
+          <a
+            href="#/drift"
+            aria-current={section === "drift" ? "page" : undefined}
+          >
             Drift
           </a>
-          <a href="#/alerts" aria-current={section === "alerts" ? "page" : undefined}>
+          <a
+            href="#/alerts"
+            aria-current={section === "alerts" ? "page" : undefined}
+          >
             Alerts
           </a>
-          <a href="#/prices" aria-current={section === "prices" ? "page" : undefined}>
+          <a
+            href="#/prices"
+            aria-current={section === "prices" ? "page" : undefined}
+          >
             Prices
           </a>
         </nav>
@@ -147,6 +203,14 @@ export function App() {
           <Alerts />
         ) : current.page === "drift" ? (
           <Drift />
+        ) : current.page === "memory" ? (
+          <MemoryList />
+        ) : current.page === "memory-item" ? (
+          <MemoryItemView
+            key={`${current.store}|${current.id}`}
+            store={current.store}
+            id={current.id}
+          />
         ) : current.page === "datasets" ? (
           <DatasetList />
         ) : current.page === "dataset" ? (
@@ -154,13 +218,19 @@ export function App() {
         ) : current.page === "run" ? (
           <RunView runId={current.runId} />
         ) : current.page === "compare" ? (
-          <CompareView baseline={current.baseline} candidate={current.candidate} />
+          <CompareView
+            baseline={current.baseline}
+            candidate={current.candidate}
+          />
         ) : current.page === "sessions" ? (
           <SessionList />
         ) : current.page === "session" ? (
           <SessionView sessionId={current.sessionId} />
         ) : current.page === "trace" ? (
-          <TraceView traceId={current.traceId} />
+          <TraceView
+            traceId={current.traceId}
+            {...(current.spanId ? { spanId: current.spanId } : {})}
+          />
         ) : (
           <TraceList
             key={`${current.session ?? ""}|${current.user ?? ""}`}

@@ -699,3 +699,17 @@ a.button-link {
 .warn-text {
   color: var(--warn-fg);
 }
+.memory-content {
+  max-width: 48ch;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.timeline li .memory-content {
+  flex-basis: 100%;
+  max-width: none;
+}
+.memory-current {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 80ch;
+}

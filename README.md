@@ -57,14 +57,15 @@ Within a row, names are tried left to right: current GenAI names, then deprecate
 | Cache read / write | `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens`; `gen_ai.usage.cache_creation.input_tokens` | `llm.token_count.prompt_details.cache_read`, `…cache_write` | |
 | Reasoning tokens | `gen_ai.usage.reasoning.output_tokens` | `llm.token_count.completion_details.reasoning` | |
 | Cost (USD) | none in the conventions; `agentwatch.usage.cost_usd` | `llm.cost.total` | |
-
-When a model call carries tokens but no cost, agentwatch calculates one from the model prices you
-add on the Prices page (regular-expression model match, US dollars per million tokens, optional
-effective date). No prices are built in.
 | Finish reasons | `gen_ai.response.finish_reasons` | `llm.finish_reason` | |
 | Tool, agent | `gen_ai.tool.name`, `gen_ai.agent.name` | `tool.name`, `agent.name` | |
 | Session, user | `gen_ai.conversation.id`, `user.id` | `session.id`, `user.id` | |
 | Error | `error.type` | | |
+| Memory | `gen_ai.memory.store.id`, `gen_ai.memory.record.id`, `gen_ai.memory.records` | | |
+
+When a model call carries tokens but no cost, agentwatch calculates one from the model prices you
+add on the Prices page (regular-expression model match, US dollars per million tokens, optional
+effective date). No prices are built in.
 
 `chat`, `completion`, `text_completion`, `generate_content` and `embeddings` count as model calls,
 as do spans with no operation that name a model and report tokens. OpenInference `CHAIN` spans,
@@ -146,6 +147,15 @@ zero; with fewer than 10 traces on a side it says there is too little data. A mo
 mode alerts on such a change. Simulated traffic with ordinary overdispersion fires falsely about
 once a month, so trial one with `muted`, which records alerts without sending them to any client.
 See [the design notes](docs/design.md#drift-detection).
+
+## Memory
+
+The Memory page lists what an agent remembers, from the GenAI memory spans (`create_memory`,
+`update_memory`, `delete_memory`, `search_memory` and `gen_ai.memory.*`). Each item shows its
+changes, linked to the traces that made them, and the recent model calls it was read into. A model
+call's span lists the items in its context, with their size: that is what was in the prompt, not
+what the model used. Memory history is kept when its traces are pruned. See
+[the design notes](docs/design.md#memory).
 
 ## Develop
 
