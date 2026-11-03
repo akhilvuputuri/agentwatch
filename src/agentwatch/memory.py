@@ -334,33 +334,45 @@ def items(
 
 def delete_item(store: Store, store_id: str, record_id: str, *, now_ns: int | None = None) -> bool:
     """Deletes an item's history: its records, and its records inside the stored memory spans,
-    which are rewritten without them. The deletion is remembered, so re-reading or re-sending
-    those spans cannot bring it back; a later change to the item is recorded as usual. Its text
+    which are rewritten without them, failed ones included. The deletion is remembered, so
+    re-reading or re-sending those spans cannot bring it back. A change is recorded again when
+    its span ends after the deletion by agentwatch's clock (and after the item's last record),
+    so one made just before the deletion but sent after it is not. Its text
     can still be in captured prompts and tool results until their traces are pruned. True
     when the item had any records."""
     now_ns = time.time_ns() if now_ns is None else now_ns
+    names = ", ".join(f"'{name}'" for name in sorted(OPERATIONS))
     with store.transaction() as db:
+        # Every stored memory span that may name it, failed ones included, which record nothing.
         spans = db.execute(
-            "SELECT DISTINCT m.trace_id, m.span_id, s.attributes FROM memory_records m "
-            "JOIN spans s USING (trace_id, span_id) WHERE m.store_id = ? AND m.record_id = ?",
-            [store_id, record_id],
+            f"SELECT trace_id, span_id, attributes FROM spans WHERE operation IN ({names}) "
+            "AND contains(attributes::VARCHAR, ?)",
+            [json.dumps(record_id)[1:-1]],
         ).fetchall()
         found = db.execute(
             "DELETE FROM memory_records WHERE store_id = ? AND record_id = ? RETURNING time_ns",
             [store_id, record_id],
         ).fetchall()
-        if not found:
+        rewritten = 0
+        for trace_id, span_id, text in spans:
+            attributes = json.loads(text)
+            store_value = attributes.get(STORE_ID)
+            if (store_value[:MAX_ID] if isinstance(store_value, str) else "") != store_id:
+                continue
+            kept = _without(attributes, record_id)
+            if kept != attributes:
+                db.execute(
+                    "UPDATE spans SET attributes = ? WHERE trace_id = ? AND span_id = ?",
+                    [json.dumps(kept), trace_id, span_id],
+                )
+                rewritten += 1
+        if not found and not rewritten:
             return False
-        latest = max(int(row[0]) for row in found)
+        latest = max((int(row[0]) for row in found), default=0)
         db.execute(
             "INSERT OR REPLACE INTO memory_deleted VALUES (?, ?, ?, ?)",
             [store_id, record_id, max(latest, now_ns), now_ns],
         )
-        for trace_id, span_id, attributes in spans:
-            db.execute(
-                "UPDATE spans SET attributes = ? WHERE trace_id = ? AND span_id = ?",
-                [json.dumps(_without(json.loads(attributes), record_id)), trace_id, span_id],
-            )
     return True
 
 

@@ -657,8 +657,10 @@ string, as the conventions allow on spans), else from `gen_ai.memory.record.id`.
   of the content, which the changes already hold. `DELETE /api/memory/item?store=&id=` deletes an
   item's history, for example after the agent was told to forget it: its records, and its records
   inside the stored memory spans, which are rewritten without them. The deletion is remembered
-  (`memory_deleted`), so re-reading or re-sending those spans cannot bring it back, while a later
-  change to the item is recorded as usual. The text can still be in captured prompts and tool
+  (`memory_deleted`), so re-reading or re-sending those spans cannot bring it back. A change is
+  recorded again when its span ends after the deletion by agentwatch's clock, so one made just
+  before the deletion but sent after it is dropped, as is one from an exporter whose clock is
+  behind. The text can still be in captured prompts and tool
   results until their traces are pruned. It does not change the agent's own memory.
 
 **In context.** A model call has in context the records of the `search_memory` spans in the same

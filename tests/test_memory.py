@@ -533,3 +533,33 @@ def test_a_deleted_item_stays_gone_from_spans_rebuilds_and_resends(tmp_path: Pat
         "tz": "UTC+2",
     }
     store.close()
+
+
+def test_deleting_also_clears_failed_spans_that_named_the_item() -> None:
+    store = Store()
+    failed = _failed(
+        span(
+            "1" * 16,
+            None,
+            "update_memory",
+            0,
+            1,
+            **{memory.RECORDS: records({"id": "secret", "content": "my diagnosis"})},
+        )
+    )
+    store.insert(
+        [failed, span("2" * 16, None, "create_memory", 2, 3, **{memory.RECORD_ID: "secret"})],
+        received_ns=START,
+    )
+    assert memory.delete_item(store, "", "secret")
+    assert store.query(
+        "SELECT count(*) FROM spans WHERE contains(attributes::VARCHAR, 'diagnosis')"
+    ) == [(0,)]
+    # Only failed spans named it: it is still found and cleared.
+    other = Store()
+    other.insert([failed], received_ns=START)
+    assert memory.delete_item(other, "", "secret")
+    assert other.query(
+        "SELECT count(*) FROM spans WHERE contains(attributes::VARCHAR, 'diagnosis')"
+    ) == [(0,)]
+    assert not memory.delete_item(other, "", "never-there")
