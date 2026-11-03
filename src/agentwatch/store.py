@@ -657,18 +657,30 @@ class Store:
         """Read memory records again from the stored memory spans when the rules have changed,
         or after the upgrade that added them. Records whose spans were pruned are kept as they
         are."""
-        current = str(memory.DERIVATION_VERSION)
+        current = memory.derivation()
         if self._meta("memory_derivation") == current:
             return
         names = ", ".join(f"'{name}'" for name in sorted(memory.OPERATIONS))
+        received = _BASE_COLUMNS.index("received_ns")
         self._db.execute("BEGIN")
         try:
-            received = _BASE_COLUMNS.index("received_ns")
-            rows = self._db.execute(
-                f"SELECT {_COLUMNS} FROM spans WHERE operation IN ({names})"
-            ).fetchall()
-            for row in rows:
-                memory.write(self._db, [_stored(row).span], int(row[received]))
+            # A chunk at a time, in key order, so memory stays proportional to a chunk.
+            after = ("", "")
+            while True:
+                rows = self._db.execute(
+                    f"SELECT {_COLUMNS} FROM spans WHERE operation IN ({names}) "
+                    "AND (trace_id > ? OR (trace_id = ? AND span_id > ?)) "
+                    "ORDER BY trace_id, span_id LIMIT ?",
+                    [after[0], after[0], after[1], _INSERT_CHUNK],
+                ).fetchall()
+                if not rows:
+                    break
+                by_received: dict[int, list[Span]] = {}
+                for row in rows:
+                    by_received.setdefault(int(row[received]), []).append(_stored(row).span)
+                for at, spans in by_received.items():
+                    memory.write(self._db, spans, at)
+                after = (rows[-1][0], rows[-1][1])
             self._set_meta("memory_derivation", current)
             self._db.execute("COMMIT")
         except BaseException:
@@ -741,8 +753,8 @@ class Store:
         a wrong clock (or microseconds sent as nanoseconds) cannot get a new trace deleted.
         Traces and scores of experiment runs are kept, since their runs still show them.
         Scores and judgements older than the cutoff whose trace is gone (or never arrived) go
-        too. Memory records stay: an item's history outlasts its traces. Returns the number of
-        traces deleted.
+        too. Memory records stay, since an item's history outlasts its traces, but a read's copy
+        of the content goes with its trace. Returns the number of traces deleted.
         """
         with self.transaction() as db:
             db.execute(
@@ -760,6 +772,11 @@ class Store:
                     "AND trace_id NOT IN (SELECT trace_id FROM run_items)",
                     [before_ns],
                 )
+            # Memory history stays, but a read's copy of the content goes with its trace.
+            db.execute(
+                f"UPDATE memory_records SET content = NULL WHERE operation = '{memory.SEARCH}' "
+                "AND content IS NOT NULL AND trace_id IN (SELECT trace_id FROM pruned)"
+            )
             db.execute("DROP TABLE pruned")
             db.execute("DELETE FROM alerts WHERE created_ns < ?", [before_ns])
         return count[0] if count else 0

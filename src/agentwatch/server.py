@@ -673,7 +673,15 @@ def create_app(
         record_id = query.get("id")
         if not record_id:
             return PlainTextResponse("id is required", status_code=400)
-        found = await run_in_threadpool(memory.item, store, query.get("store", ""), record_id)
+        store_id = query.get("store", "")
+        if request.method == "DELETE":
+            removed = await run_in_threadpool(memory.delete_item, store, store_id, record_id)
+            return (
+                Response(status_code=204)
+                if removed
+                else PlainTextResponse("memory item not found", status_code=404)
+            )
+        found = await run_in_threadpool(memory.item, store, store_id, record_id)
         if found is None:
             return PlainTextResponse("memory item not found", status_code=404)
         return JSONResponse(found)
@@ -767,7 +775,7 @@ def create_app(
         Route("/api/drift/summary", drift_summary, methods=["GET"]),
         Route("/api/changes", changes_view, methods=["GET"]),
         Route("/api/memory", memory_items, methods=["GET"]),
-        Route("/api/memory/item", memory_item, methods=["GET"]),
+        Route("/api/memory/item", memory_item, methods=["GET", "DELETE"]),
         Route("/api/prices", list_prices, methods=["GET"]),
         Route("/api/prices", post_price, methods=["POST"]),
         Route("/api/prices/{price_id}", delete_price, methods=["DELETE"]),

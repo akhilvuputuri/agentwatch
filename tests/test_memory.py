@@ -377,3 +377,105 @@ def test_migration_from_schema_10(tmp_path: Path) -> None:
     upgraded.insert(agent_trace(), received_ns=START)
     assert len(memory.items(upgraded)) == 2
     upgraded.close()
+
+
+def test_a_read_without_content_does_not_hide_captured_content() -> None:
+    store = Store()
+    store.insert(
+        [
+            span(
+                "1" * 16,
+                None,
+                "create_memory",
+                0,
+                1,
+                **{memory.RECORDS: records({"id": "tz", "content": "UTC+2"})},
+            ),
+            span(
+                "2" * 16,
+                None,
+                "search_memory",
+                2,
+                3,
+                **{memory.RECORDS: records({"id": "tz", "content": None})},
+            ),
+        ],
+        received_ns=START,
+    )
+    [item] = memory.items(store)
+    assert item["content"] == "UTC+2"
+    detail = memory.item(store, "", "tz")
+    assert detail is not None
+    assert detail["reads"][0]["content"] is None
+
+
+@pytest.mark.parametrize("text", ['"' * 70_000, "é" * 70_000, "a" * 70_000])
+def test_cut_content_stays_within_the_cap(text: str) -> None:
+    capped = span(
+        "1" * 16, None, "create_memory", 0, 1, **{memory.RECORDS: [{"id": "x", "content": text}]}
+    )
+    [row] = memory.from_span(capped, START)
+    assert len((row.content or "").encode()) <= memory.MAX_CONTENT_BYTES
+    assert json.loads(row.content or "").endswith(memory.CUT)
+
+
+def test_an_item_read_twice_is_in_a_call_once_and_embeddings_have_no_context() -> None:
+    first = records({"id": "tz", "content": "UTC+1"}, {"id": "nm", "content": "Sam"})
+    second = records({"id": "tz", "content": "UTC+2"}, {"content": "no id"}, {"content": "no id"})
+    trace = [
+        span("1" * 16, None, "invoke_agent", 0, 100),
+        span("2" * 16, "1" * 16, "search_memory", 1, 2, **{memory.RECORDS: first}),
+        span("3" * 16, "1" * 16, "search_memory", 3, 4, **{memory.RECORDS: second}),
+        span("4" * 16, "1" * 16, "embeddings", 5, 6),
+        span("7" * 16, "1" * 16, "chat", 7, 9),
+    ]
+    store = Store()
+    store.insert(trace, received_ns=START)
+    found = memory.in_context(store, [s.span for s in store.trace(T)])
+    assert list(found) == ["7" * 16]
+    assert [(e["record_id"], e["content"]) for e in found["7" * 16]] == [
+        ("nm", "Sam"),
+        ("tz", "UTC+2"),
+        (None, "no id"),
+        (None, "no id"),
+    ]
+
+
+def test_pruning_drops_a_reads_content_but_keeps_the_change() -> None:
+    store = history_store()
+    store.prune(START + 10)
+    detail = memory.item(store, STORE, "tz")
+    assert detail is not None
+    assert [e["content"] for e in detail["changes"]] == ["UTC+3", "UTC+1"]
+    assert [e["content"] for e in detail["reads"]] == [None]
+    assert detail["item"]["reads"] == 1
+
+
+def test_deleting_an_item_removes_everything_recorded_about_it() -> None:
+    store = history_store()
+    client = TestClient(server.create_app(store, allowed_hosts=("testserver",)))
+    assert client.delete("/api/memory/item", params={"store": STORE, "id": "tz"}).status_code == 204
+    assert client.delete("/api/memory/item", params={"store": STORE, "id": "tz"}).status_code == 404
+    assert [i["record_id"] for i in memory.items(store)] == ["name"]
+    assert store.query("SELECT count(*) FROM memory_records WHERE record_id = 'tz'") == [(0,)]
+
+
+def test_a_rule_change_reads_stored_spans_again_in_chunks(tmp_path: Path) -> None:
+    path = tmp_path / "db.duckdb"
+    store = Store(path)
+    many = [
+        span(f"{n:016x}", None, "search_memory", n, n + 1, **{memory.RECORD_ID: f"item-{n % 7}"})
+        for n in range(1, 501)
+    ]
+    store.insert(many, received_ns=START)
+    with store.transaction() as db:
+        db.execute("DELETE FROM memory_records")
+        db.execute("UPDATE meta SET value = 'old' WHERE key = 'memory_derivation'")
+    store.close()
+    reopened = Store(path)
+    assert reopened.query("SELECT count(*) FROM memory_records") == [(500,)]
+    assert (
+        reopened.query_one("SELECT value FROM meta WHERE key = 'memory_derivation'")[0]
+        == memory.derivation()
+    )
+    reopened.close()

@@ -152,9 +152,10 @@ See [the design notes](docs/design.md#drift-detection).
 
 The Memory page lists what an agent remembers, from the GenAI memory spans (`create_memory`,
 `update_memory`, `delete_memory`, `search_memory` and `gen_ai.memory.*`). Each item shows its
-changes, linked to the traces that made them, and the recent model calls it was read into. A model
+changes, linked to the traces that made them, and its recent reads. A model
 call's span lists the items in its context, with their size: that is what was in the prompt, not
-what the model used. Memory history is kept when its traces are pruned. See
+what the model used. Memory history is kept when its traces are pruned, and an item's history can
+be deleted from its page. See
 [the design notes](docs/design.md#memory).
 
 ## Develop

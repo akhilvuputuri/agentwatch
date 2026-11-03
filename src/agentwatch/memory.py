@@ -7,15 +7,18 @@ from `gen_ai.memory.records` (a list, or a JSON string of one, as the convention
 else from `gen_ai.memory.record.id`. `gen_ai.memory.store.id` names the store.
 
 Each record becomes one row, kept when its trace is pruned: an item's history outlasts the
-traces it links to. A span that failed records nothing, since its change or read may not have
-happened. A `delete_memory` without a record ID (the whole store, in the conventions) and a
-write record without an ID are not recorded, since no item can be named.
+traces it links to, though a read's copy of the content goes with its trace. A span that failed
+records nothing, since its change or read may not have happened. A `delete_memory` without a
+record ID (the whole store, in the conventions) and a write record without an ID are not
+recorded, since no item can be named.
 
 A model call has in context the records of the `search_memory` spans in the same agent that
 ended before it started: the spans whose nearest `invoke_agent` ancestor is the call's own (or,
-with none, that have none themselves). So a nested agent sees only its own reads. This is what
-was in the prompt, as the instrumentation reports it; whether the model used an item is not
-known, so it is never called "used".
+with none, that have none themselves). So a nested agent sees only its own reads, and a read
+belongs inside the agent whose calls it feeds. An item read twice is listed once, as its latest
+read. This is what was in the prompt, as the instrumentation reports it; whether the model used
+an item is not known, so it is never called "used". A read alone, with no call after it, is
+counted as a read, not as being in context.
 """
 
 from __future__ import annotations
@@ -44,8 +47,15 @@ DELETE = "delete_memory"
 WRITES = frozenset({"create_memory", "update_memory", "upsert_memory", DELETE})
 OPERATIONS = WRITES | {SEARCH}
 
-# Bump when the rules above change; stored spans are then read again.
+# Bump when the rules above change; stored spans are then read again. They also depend on
+# genai.DERIVATION_VERSION, which decides a span's operation.
 DERIVATION_VERSION = 1
+
+
+def derivation() -> str:
+    """The version of every rule that decides the stored rows."""
+    return f"{DERIVATION_VERSION}.{genai.DERIVATION_VERSION}"
+
 
 MAX_RECORDS = 500
 MAX_ID = 500
@@ -105,9 +115,10 @@ def from_span(span: Span, received_ns: int) -> list[Row]:
                 operation=operation,
                 store_id=store_id,
                 record_id=record_id,
-                content=_capped(record["content"], MAX_CONTENT_BYTES)
-                if "content" in record
-                else None,
+                # A null content is the conventions' way to send a record without its text.
+                content=None
+                if record.get("content") is None
+                else _capped(record["content"], MAX_CONTENT_BYTES),
                 metadata=_metadata(record.get("metadata")),
                 score=_score(record.get("score")),
                 service_name=span.service_name,
@@ -145,13 +156,22 @@ def _score(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+CUT = "… [cut by agentwatch]"
+
+
 def _capped(value: Any, limit: int) -> str:
-    """JSON text of a value; a value whose JSON is longer than `limit` is kept as a cut string."""
+    """JSON text of a value, at most `limit` bytes; a longer one is kept as a cut string."""
     text = json.dumps(jsonable(value), ensure_ascii=False)
     if len(text.encode()) <= limit:
         return text
-    cut = text.encode()[: limit - 64].decode(errors="ignore")
-    return json.dumps(cut + "… [cut by agentwatch]", ensure_ascii=False)
+    whole = value if isinstance(value, str) else text
+    # Escaping can grow the text, so shrink until the JSON of what is kept fits.
+    keep = whole.encode()[:limit].decode(errors="ignore")
+    while True:
+        cut = json.dumps(keep + CUT, ensure_ascii=False)
+        if len(cut.encode()) <= limit:
+            return cut
+        keep = keep[: max(0, len(keep) - max(1, (len(cut.encode()) - limit) // 2 + 1))]
 
 
 def _metadata(value: Any) -> str | None:
@@ -297,6 +317,16 @@ def items(
     return [_item(row) for row in rows]
 
 
+def delete_item(store: Store, store_id: str, record_id: str) -> bool:
+    """Deletes every record of an item, its content with it. True when there were any."""
+    with store.transaction() as db:
+        found = db.execute(
+            "DELETE FROM memory_records WHERE store_id = ? AND record_id = ? RETURNING 1",
+            [store_id, record_id],
+        ).fetchall()
+    return bool(found)
+
+
 def stores(store: Store) -> list[str]:
     rows = store.query("SELECT DISTINCT store_id FROM memory_records ORDER BY store_id")
     return [str(row[0]) for row in rows]
@@ -386,27 +416,39 @@ def in_context(store: Store, spans: Sequence[Span]) -> dict[str, list[dict[str, 
         for span_id in records
         if span_id in by_id and by_id[span_id].status_code != STATUS_ERROR
     ]
+    searches.sort(key=lambda s: (s.end_ns, s.span_id))
     found: dict[str, list[dict[str, Any]]] = {}
     for span in spans:
-        if not genai.read(span).is_model_call:
+        fields = genai.read(span)
+        # An embeddings call has no prompt to hold memory.
+        if not fields.is_model_call or fields.operation == "embeddings":
             continue
-        entries = [
-            {
-                "search_span_id": search.span_id,
-                "search_span_name": search.name,
-                "store_id": row["store_id"],
-                "record_id": row["record_id"],
-                "content": _loads(row["content"]),
-                "metadata": _loads(row["metadata"]),
-                "score": row["score"],
-                "characters": _characters(row["content"], row["metadata"]),
-            }
-            for search in sorted(searches, key=lambda s: (s.end_ns, s.span_id))
-            if search.end_ns <= span.start_ns and agents[search.span_id] == agents[span.span_id]
-            for row in records[search.span_id]
-        ]
-        if entries:
-            found[span.span_id] = entries
+        # An item read more than once is in the prompt once: its latest read stands.
+        latest: dict[tuple[str, str] | int, dict[str, Any]] = {}
+        unnamed = 0
+        for search in searches:
+            if search.end_ns > span.start_ns or agents[search.span_id] != agents[span.span_id]:
+                continue
+            for row in records[search.span_id]:
+                key: tuple[str, str] | int
+                if row["record_id"] is None:
+                    unnamed += 1
+                    key = unnamed
+                else:
+                    key = (row["store_id"], row["record_id"])
+                latest.pop(key, None)
+                latest[key] = {
+                    "search_span_id": search.span_id,
+                    "search_span_name": search.name,
+                    "store_id": row["store_id"],
+                    "record_id": row["record_id"],
+                    "content": _loads(row["content"]),
+                    "metadata": _loads(row["metadata"]),
+                    "score": row["score"],
+                    "characters": _characters(row["content"], row["metadata"]),
+                }
+        if latest:
+            found[span.span_id] = list(latest.values())
     return found
 
 

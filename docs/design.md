@@ -643,27 +643,36 @@ string, as the conventions allow on spans), else from `gen_ai.memory.record.id`.
   have happened. A `delete_memory` without a record ID, which in the conventions deletes the whole
   store, and a write record without an ID are skipped, since no item can be named. A search record
   without an ID is kept for the call's context, but belongs to no item. At most 500 records a
-  span; content over 64 KB of JSON is cut and says so, and metadata over 8 KB is dropped.
+  span; IDs over 500 characters are dropped with their record, content over 64 KB of JSON is cut
+  and says so, and metadata over 8 KB is dropped.
 - **Content.** The conventions make `gen_ai.memory.records` opt-in because it carries content. A
   record whose `content` is `null` has its ID, metadata and size without the text, which is how an
   exporter can report what was in context with content capture off.
 - **Re-sending** a span replaces its records. The rules have a version in `meta`
-  (`memory_derivation`), so stored spans are read again when they change, and once after the
-  upgrade to schema 11.
+  (`memory_derivation`, which also follows `genai.DERIVATION_VERSION`, since that decides a span's
+  operation), so stored spans are read again, 200 at a time, when either changes, and once after
+  the upgrade to schema 11.
 - **Retention.** Records are not pruned with their traces: an item's history outlasts the traces
-  it links to, which then show as no longer kept. They hold whatever content the exporter sent, so
-  deleting it means deleting the database.
+  it links to, which then show as no longer kept. A pruned read keeps its count but loses its copy
+  of the content, which the changes already hold. `DELETE /api/memory/item?store=&id=` deletes
+  everything recorded about one item, content included, for example after the agent was told to
+  forget it; it does not change the agent's own memory.
 
 **In context.** A model call has in context the records of the `search_memory` spans in the same
 agent that ended before it started: the spans whose nearest `invoke_agent` ancestor is the call's
 own, or that have none when the call has none. So reads by a tool inside the agent count for the
-calls after them, and a nested agent sees only its own reads. This is what was in the prompt, as
-the instrumentation reports it. Whether the model used an item is not known, so the UI never says
-it was used. A record's size is its metadata's `characters` when given, else the length of its
-captured content; tokens are an estimate at four characters a token.
+calls after them, and a nested agent sees only its own reads; an exporter should put the read
+that fills a prompt inside the agent whose calls use it. An item read more than once is listed
+once, as its latest read, and embeddings calls have no context. This is what was in the prompt,
+as the instrumentation reports it. Whether the model used an item is not known, so the UI never
+says it was used. The Memory pages count reads, whether or not a call followed them, and only a
+model call's span says what was in context. A record's size is its metadata's `characters` when
+given, else the length of its captured content; tokens are an estimate at four characters a
+token.
 
 **API.** `GET /api/memory?store=&service=&q=&limit=&before=` lists items, most recently active
-first, with `stores` and a `next` cursor; `q` matches the record ID or content. An item's content
+first, with `stores` and a `next` cursor; `q` matches the record ID or content. The cursor follows
+latest activity, so an item that becomes active while you page can be skipped. An item's content
 and metadata are its latest captured ones, `writes` and `reads` count its changes and reads, and
 `deleted` is whether its last change was a delete. `GET /api/memory/item?store=&id=` gives one
 item with all its changes (up to 500) and its 50 most recent reads, fetched apart so the reads of

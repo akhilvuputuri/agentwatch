@@ -101,6 +101,15 @@ export interface MemoryEvent {
   links: { trace_id: string; span_id: string }[];
 }
 
+/** An item with all its changes and its most recent reads (each newest first). */
+export interface MemoryItemDetail {
+  item: MemoryItem;
+  changes: MemoryEvent[];
+  reads: MemoryEvent[];
+  changes_truncated: boolean;
+  reads_truncated: boolean;
+}
+
 export async function listMemory(
   query: { before?: string; store?: string; q?: string; limit?: number },
   signal?: AbortSignal,
@@ -113,24 +122,16 @@ export async function listMemory(
   return getJson(`api/memory?${params}`, signal);
 }
 
-/** An item with all its changes and its most recent reads (each newest first). */
-export interface MemoryItemDetail {
-  item: MemoryItem;
-  changes: MemoryEvent[];
-  reads: MemoryEvent[];
-  changes_truncated: boolean;
-  reads_truncated: boolean;
+export async function getMemoryItem(store: string, id: string, signal?: AbortSignal): Promise<MemoryItemDetail> {
+  return getJson(`api/memory/item?${new URLSearchParams({ store, id })}`, signal);
 }
 
-export async function getMemoryItem(
-  store: string,
-  id: string,
-  signal?: AbortSignal,
-): Promise<MemoryItemDetail> {
-  return getJson(
-    `api/memory/item?${new URLSearchParams({ store, id })}`,
-    signal,
-  );
+/** Deletes everything recorded about an item. */
+export async function deleteMemoryItem(store: string, id: string): Promise<void> {
+  const response = await fetch(`api/memory/item?${new URLSearchParams({ store, id })}`, { method: "DELETE" });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`${response.status} ${(await response.text()).trim()}`);
+  }
 }
 
 export interface NewScore {
@@ -149,16 +150,13 @@ export async function addScore(score: NewScore): Promise<Score> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(score),
   });
-  if (!response.ok)
-    throw new Error(`${response.status} ${(await response.text()).trim()}`);
+  if (!response.ok) throw new Error(`${response.status} ${(await response.text()).trim()}`);
   const body = (await response.json()) as { scores: Score[] };
   return body.scores[0]!;
 }
 
 export async function deleteScore(id: string): Promise<void> {
-  const response = await fetch(`api/scores/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
+  const response = await fetch(`api/scores/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (!response.ok && response.status !== 404) {
     throw new Error(`${response.status} ${(await response.text()).trim()}`);
   }
@@ -211,11 +209,7 @@ export interface SpanRecord {
   attributes: Record<string, unknown>;
   resource: Record<string, unknown>;
   events: SpanEvent[];
-  links: {
-    trace_id: string;
-    span_id: string;
-    attributes: Record<string, unknown>;
-  }[];
+  links: { trace_id: string; span_id: string; attributes: Record<string, unknown> }[];
   genai: GenAIFields;
 }
 
@@ -238,10 +232,7 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   return (await response.json()) as T;
 }
 
-export async function listTraces(
-  query: TraceQuery,
-  signal?: AbortSignal,
-): Promise<TracePage> {
+export async function listTraces(query: TraceQuery, signal?: AbortSignal): Promise<TracePage> {
   const params = new URLSearchParams();
   if (query.limit !== undefined) params.set("limit", String(query.limit));
   if (query.before) params.set("before", query.before);
@@ -252,10 +243,7 @@ export async function listTraces(
   return getJson<TracePage>(`api/traces?${params}`, signal);
 }
 
-export async function getTrace(
-  traceId: string,
-  signal?: AbortSignal,
-): Promise<TraceDetail> {
+export async function getTrace(traceId: string, signal?: AbortSignal): Promise<TraceDetail> {
   return getJson<TraceDetail>(`api/traces/${traceId}`, signal);
 }
 
@@ -354,12 +342,7 @@ export interface ScoreRow {
 }
 
 export interface Metrics {
-  window: {
-    start_ns: string;
-    end_ns: string;
-    bucket_ns: number;
-    service: string | null;
-  };
+  window: { start_ns: string; end_ns: string; bucket_ns: number; service: string | null };
   overview: MetricsOverview;
   by_model: ModelRow[];
   by_tool: ToolRow[];
@@ -418,21 +401,15 @@ export async function listSessions(
 export async function getSession(
   sessionId: string,
   signal?: AbortSignal,
-): Promise<{
-  session: SessionSummary;
-  traces: TraceSummary[];
-  truncated: boolean;
-}> {
+): Promise<{ session: SessionSummary; traces: TraceSummary[]; truncated: boolean }> {
   return getJson(`api/sessions/${encodeURIComponent(sessionId)}`, signal);
 }
 
 /** Hash links to the views, with IDs encoded so any session or user string is safe. */
 export const links = {
   session: (id: string) => `#/session/${encodeURIComponent(id)}`,
-  trace: (traceId: string, spanId?: string) =>
-    `#/trace/${traceId}${spanId ? `/${spanId}` : ""}`,
-  memoryItem: (store: string, id: string) =>
-    `#/memory/item?${new URLSearchParams({ store, id })}`,
+  trace: (traceId: string, spanId?: string) => `#/trace/${traceId}${spanId ? `/${spanId}` : ""}`,
+  memoryItem: (store: string, id: string) => `#/memory/item?${new URLSearchParams({ store, id })}`,
   dataset: (id: string) => `#/dataset/${encodeURIComponent(id)}`,
   run: (id: string) => `#/run/${encodeURIComponent(id)}`,
   compare: (baseline: string, candidate: string) =>
@@ -457,9 +434,7 @@ export interface Price {
   created_ns: string;
 }
 
-export type NewPrice = Omit<Price, "id" | "created_ns" | "start_ns"> & {
-  start_ns?: string;
-};
+export type NewPrice = Omit<Price, "id" | "created_ns" | "start_ns"> & { start_ns?: string };
 
 export async function listPrices(signal?: AbortSignal): Promise<Price[]> {
   const body = await getJson<{ prices: Price[] }>("api/prices", signal);
@@ -472,15 +447,12 @@ export async function addPrice(price: NewPrice): Promise<Price> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(price),
   });
-  if (!response.ok)
-    throw new Error(`${response.status} ${(await response.text()).trim()}`);
+  if (!response.ok) throw new Error(`${response.status} ${(await response.text()).trim()}`);
   return ((await response.json()) as { price: Price }).price;
 }
 
 export async function deletePrice(id: string): Promise<void> {
-  const response = await fetch(`api/prices/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
+  const response = await fetch(`api/prices/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (!response.ok && response.status !== 404) {
     throw new Error(`${response.status} ${(await response.text()).trim()}`);
   }
@@ -508,107 +480,56 @@ export interface DatasetItem {
   created_ns: string;
 }
 
-async function send<T>(
-  method: string,
-  path: string,
-  body?: unknown,
-): Promise<T> {
+async function send<T>(method: string, path: string, body?: unknown): Promise<T> {
   const response = await fetch(path, {
     method,
-    ...(body === undefined
-      ? {}
-      : {
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
-        }),
+    ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
   });
-  if (!response.ok)
-    throw new Error(`${response.status} ${(await response.text()).trim()}`);
+  if (!response.ok) throw new Error(`${response.status} ${(await response.text()).trim()}`);
   return (response.status === 204 ? undefined : await response.json()) as T;
 }
 
 export async function listDatasets(signal?: AbortSignal): Promise<Dataset[]> {
-  return (await getJson<{ datasets: Dataset[] }>("api/datasets", signal))
-    .datasets;
+  return (await getJson<{ datasets: Dataset[] }>("api/datasets", signal)).datasets;
 }
 
-export async function getDataset(
-  id: string,
-  signal?: AbortSignal,
-): Promise<Dataset> {
-  return (
-    await getJson<{ dataset: Dataset }>(
-      `api/datasets/${encodeURIComponent(id)}`,
-      signal,
-    )
-  ).dataset;
+export async function getDataset(id: string, signal?: AbortSignal): Promise<Dataset> {
+  return (await getJson<{ dataset: Dataset }>(`api/datasets/${encodeURIComponent(id)}`, signal)).dataset;
 }
 
-export async function createDataset(
-  name: string,
-  description: string,
-): Promise<Dataset> {
-  return (
-    await send<{ dataset: Dataset }>("POST", "api/datasets", {
-      name,
-      description: description || null,
-    })
-  ).dataset;
+export async function createDataset(name: string, description: string): Promise<Dataset> {
+  return (await send<{ dataset: Dataset }>("POST", "api/datasets", { name, description: description || null }))
+    .dataset;
 }
 
 export async function deleteDataset(id: string): Promise<void> {
   await send("DELETE", `api/datasets/${encodeURIComponent(id)}`);
 }
 
-export async function listItems(
-  datasetId: string,
-  archived: boolean,
-  signal?: AbortSignal,
-): Promise<DatasetItem[]> {
+export async function listItems(datasetId: string, archived: boolean, signal?: AbortSignal): Promise<DatasetItem[]> {
   const query = archived ? "?archived=1" : "";
-  return (
-    await getJson<{ items: DatasetItem[] }>(
-      `api/datasets/${encodeURIComponent(datasetId)}/items${query}`,
-      signal,
-    )
-  ).items;
+  return (await getJson<{ items: DatasetItem[] }>(`api/datasets/${encodeURIComponent(datasetId)}/items${query}`, signal))
+    .items;
 }
 
 export async function addItem(
   datasetId: string,
   item: { input: unknown; expected_output?: unknown },
 ): Promise<DatasetItem> {
-  const body = await send<{ items: DatasetItem[] }>(
-    "POST",
-    `api/datasets/${encodeURIComponent(datasetId)}/items`,
-    item,
-  );
+  const body = await send<{ items: DatasetItem[] }>("POST", `api/datasets/${encodeURIComponent(datasetId)}/items`, item);
   return body.items[0]!;
 }
 
-export async function addItemFromTrace(
-  datasetId: string,
-  traceId: string,
-  spanId: string | null,
-): Promise<DatasetItem> {
-  const body = await send<{ item: DatasetItem }>(
-    "POST",
-    `api/datasets/${encodeURIComponent(datasetId)}/items/from-trace`,
-    {
-      trace_id: traceId,
-      ...(spanId ? { span_id: spanId } : {}),
-    },
-  );
+export async function addItemFromTrace(datasetId: string, traceId: string, spanId: string | null): Promise<DatasetItem> {
+  const body = await send<{ item: DatasetItem }>("POST", `api/datasets/${encodeURIComponent(datasetId)}/items/from-trace`, {
+    trace_id: traceId,
+    ...(spanId ? { span_id: spanId } : {}),
+  });
   return body.item;
 }
 
-export async function setItemStatus(
-  itemId: string,
-  status: "ACTIVE" | "ARCHIVED",
-): Promise<void> {
-  await send("PATCH", `api/dataset-items/${encodeURIComponent(itemId)}`, {
-    status,
-  });
+export async function setItemStatus(itemId: string, status: "ACTIVE" | "ARCHIVED"): Promise<void> {
+  await send("PATCH", `api/dataset-items/${encodeURIComponent(itemId)}`, { status });
 }
 
 export interface Run {
@@ -639,32 +560,14 @@ export interface RunItemResult {
   latency_ms: number;
   input: unknown;
   expected_output: unknown;
-  scores: {
-    id: string;
-    name: string;
-    data_type: ScoreType;
-    value: number | null;
-    label: string | null;
-    comment: string | null;
-  }[];
+  scores: { id: string; name: string; data_type: ScoreType; value: number | null; label: string | null; comment: string | null }[];
 }
 
-export async function listRuns(
-  datasetId: string,
-  signal?: AbortSignal,
-): Promise<RunSummary[]> {
-  return (
-    await getJson<{ runs: RunSummary[] }>(
-      `api/datasets/${encodeURIComponent(datasetId)}/runs`,
-      signal,
-    )
-  ).runs;
+export async function listRuns(datasetId: string, signal?: AbortSignal): Promise<RunSummary[]> {
+  return (await getJson<{ runs: RunSummary[] }>(`api/datasets/${encodeURIComponent(datasetId)}/runs`, signal)).runs;
 }
 
-export async function getRun(
-  runId: string,
-  signal?: AbortSignal,
-): Promise<{ run: Run; items: RunItemResult[] }> {
+export async function getRun(runId: string, signal?: AbortSignal): Promise<{ run: Run; items: RunItemResult[] }> {
   return getJson(`api/runs/${encodeURIComponent(runId)}`, signal);
 }
 
@@ -672,8 +575,7 @@ export async function deleteRun(runId: string): Promise<void> {
   await send("DELETE", `api/runs/${encodeURIComponent(runId)}`);
 }
 
-export type Verdict =
-  "better" | "worse" | "no detectable difference" | "underpowered";
+export type Verdict = "better" | "worse" | "no detectable difference" | "underpowered";
 
 export interface BinaryComparison {
   name: string;
@@ -745,25 +647,13 @@ export interface Comparison {
   }[];
 }
 
-export async function compareRuns(
-  baseline: string,
-  candidate: string,
-  signal?: AbortSignal,
-): Promise<Comparison> {
+export async function compareRuns(baseline: string, candidate: string, signal?: AbortSignal): Promise<Comparison> {
   const params = new URLSearchParams({ baseline, candidate });
   return getJson<Comparison>(`api/compare?${params}`, signal);
 }
 
 export interface JudgeActivity {
-  counts: Record<
-    | "SCORED"
-    | "FAILED"
-    | "PENDING"
-    | "NOT_SAMPLED"
-    | "NO_CONTENT"
-    | "OVER_LIMIT",
-    number
-  >;
+  counts: Record<"SCORED" | "FAILED" | "PENDING" | "NOT_SAMPLED" | "NO_CONTENT" | "OVER_LIMIT", number>;
   calls: number;
   cost_usd: number;
   calls_without_cost: number;
@@ -788,19 +678,7 @@ export interface Judge {
   problem: string | null;
 }
 
-export type NewJudge = Pick<
-  Judge,
-  | "name"
-  | "model"
-  | "base_url"
-  | "api_key_env"
-  | "prompt"
-  | "score_type"
-  | "sample_rate"
-  | "daily_limit"
-  | "service"
-  | "sessions_only"
->;
+export type NewJudge = Pick<Judge, "name" | "model" | "base_url" | "api_key_env" | "prompt" | "score_type" | "sample_rate" | "daily_limit" | "service" | "sessions_only">;
 
 export interface Judgement {
   trace_id: string;
@@ -821,42 +699,19 @@ export async function createJudge(judge: NewJudge): Promise<Judge> {
   return (await send<{ judge: Judge }>("POST", "api/judges", judge)).judge;
 }
 
-export async function updateJudge(
-  id: string,
-  fields: Partial<NewJudge & { enabled: boolean }>,
-): Promise<Judge> {
-  return (
-    await send<{ judge: Judge }>(
-      "PATCH",
-      `api/judges/${encodeURIComponent(id)}`,
-      fields,
-    )
-  ).judge;
+export async function updateJudge(id: string, fields: Partial<NewJudge & { enabled: boolean }>): Promise<Judge> {
+  return (await send<{ judge: Judge }>("PATCH", `api/judges/${encodeURIComponent(id)}`, fields)).judge;
 }
 
 export async function deleteJudge(id: string): Promise<void> {
   await send<void>("DELETE", `api/judges/${encodeURIComponent(id)}`);
 }
 
-export async function listJudgements(
-  id: string,
-  signal?: AbortSignal,
-): Promise<Judgement[]> {
-  return (
-    await getJson<{ judgements: Judgement[] }>(
-      `api/judges/${encodeURIComponent(id)}/judgements`,
-      signal,
-    )
-  ).judgements;
+export async function listJudgements(id: string, signal?: AbortSignal): Promise<Judgement[]> {
+  return (await getJson<{ judgements: Judgement[] }>(`api/judges/${encodeURIComponent(id)}/judgements`, signal)).judgements;
 }
 
-export type DriftMetric =
-  | "model_error_rate"
-  | "tool_error_rate"
-  | "model_mean_ms"
-  | "model_p95_ms"
-  | "cost_per_trace"
-  | "score_mean";
+export type DriftMetric = "model_error_rate" | "tool_error_rate" | "model_mean_ms" | "model_p95_ms" | "cost_per_trace" | "score_mean";
 
 export type MonitorMetric = DriftMetric | "cost_usd" | "trace_count";
 
@@ -900,22 +755,8 @@ export interface Monitor {
   state: MonitorState;
 }
 
-export type NewMonitor = Pick<
-  Monitor,
-  | "name"
-  | "metric"
-  | "score_name"
-  | "service"
-  | "window_minutes"
-  | "comparison"
-  | "threshold"
-> &
-  Partial<
-    Pick<
-      Monitor,
-      "cooldown_minutes" | "min_samples" | "mode" | "baseline_minutes" | "muted"
-    >
-  >;
+export type NewMonitor = Pick<Monitor, "name" | "metric" | "score_name" | "service" | "window_minutes" | "comparison" | "threshold"> &
+  Partial<Pick<Monitor, "cooldown_minutes" | "min_samples" | "mode" | "baseline_minutes" | "muted">>;
 
 export interface Alert {
   id: string;
@@ -942,26 +783,15 @@ export interface Alert {
 }
 
 export async function listMonitors(signal?: AbortSignal): Promise<Monitor[]> {
-  return (await getJson<{ monitors: Monitor[] }>("api/monitors", signal))
-    .monitors;
+  return (await getJson<{ monitors: Monitor[] }>("api/monitors", signal)).monitors;
 }
 
 export async function createMonitor(monitor: NewMonitor): Promise<Monitor> {
-  return (await send<{ monitor: Monitor }>("POST", "api/monitors", monitor))
-    .monitor;
+  return (await send<{ monitor: Monitor }>("POST", "api/monitors", monitor)).monitor;
 }
 
-export async function updateMonitor(
-  id: string,
-  fields: Partial<NewMonitor & { enabled: boolean }>,
-): Promise<Monitor> {
-  return (
-    await send<{ monitor: Monitor }>(
-      "PATCH",
-      `api/monitors/${encodeURIComponent(id)}`,
-      fields,
-    )
-  ).monitor;
+export async function updateMonitor(id: string, fields: Partial<NewMonitor & { enabled: boolean }>): Promise<Monitor> {
+  return (await send<{ monitor: Monitor }>("PATCH", `api/monitors/${encodeURIComponent(id)}`, fields)).monitor;
 }
 
 export async function deleteMonitor(id: string): Promise<void> {
@@ -1007,11 +837,7 @@ export interface DetectedChange {
   first_seen_ns: string;
 }
 
-export async function getDriftSummary(
-  days: number,
-  service: string,
-  signal?: AbortSignal,
-): Promise<DriftSummary> {
+export async function getDriftSummary(days: number, service: string, signal?: AbortSignal): Promise<DriftSummary> {
   const params = new URLSearchParams({ days: String(days) });
   if (service) params.set("service", service);
   return getJson<DriftSummary>(`api/drift/summary?${params}`, signal);
@@ -1024,26 +850,14 @@ export interface DriftWindows {
   current_to: string;
 }
 
-export async function getDriftAround(
-  windows: DriftWindows,
-  service: string,
-  signal?: AbortSignal,
-): Promise<DriftSummary> {
+export async function getDriftAround(windows: DriftWindows, service: string, signal?: AbortSignal): Promise<DriftSummary> {
   const params = new URLSearchParams({ ...windows });
   if (service) params.set("service", service);
   return getJson<DriftSummary>(`api/drift/summary?${params}`, signal);
 }
 
-export async function listChanges(
-  service: string,
-  signal?: AbortSignal,
-): Promise<DetectedChange[]> {
+export async function listChanges(service: string, signal?: AbortSignal): Promise<DetectedChange[]> {
   const params = new URLSearchParams();
   if (service) params.set("service", service);
-  return (
-    await getJson<{ changes: DetectedChange[] }>(
-      `api/changes?${params}`,
-      signal,
-    )
-  ).changes;
+  return (await getJson<{ changes: DetectedChange[] }>(`api/changes?${params}`, signal)).changes;
 }
