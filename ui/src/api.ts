@@ -51,6 +51,87 @@ export interface TraceDetail {
   user_id: string | null;
   spans: SpanRecord[];
   scores: Score[];
+  /** Model call span ID → the memory records it had in context. */
+  in_context: Record<string, InContext[]>;
+}
+
+/** A memory record in a model call's context: read by a search_memory span before the call. */
+export interface InContext {
+  search_span_id: string;
+  search_span_name: string;
+  store_id: string;
+  record_id: string | null;
+  content: unknown;
+  metadata: Record<string, unknown> | null;
+  score: number | null;
+  /** From the instrumentation's metadata, else measured on the captured content; null when neither. */
+  characters: number | null;
+}
+
+export interface MemoryItem {
+  store_id: string;
+  record_id: string;
+  /** The last recorded change deleted it. */
+  deleted: boolean;
+  /** The latest captured content; null when content capture was off. */
+  content: unknown;
+  metadata: Record<string, unknown> | null;
+  writes: number;
+  reads: number;
+  first_ns: string;
+  last_ns: string;
+  last_write_ns: string | null;
+  last_read_ns: string | null;
+  services: string[];
+  cursor: string;
+}
+
+export interface MemoryEvent {
+  trace_id: string;
+  span_id: string;
+  operation: string;
+  content: unknown;
+  metadata: Record<string, unknown> | null;
+  score: number | null;
+  service_name: string;
+  time_ns: string;
+  /** False once the trace was pruned: the record is kept, its trace is not. */
+  trace_stored: boolean;
+  span_name: string | null;
+  links: { trace_id: string; span_id: string }[];
+}
+
+/** An item with all its changes and its most recent reads (each newest first). */
+export interface MemoryItemDetail {
+  item: MemoryItem;
+  changes: MemoryEvent[];
+  reads: MemoryEvent[];
+  changes_truncated: boolean;
+  reads_truncated: boolean;
+}
+
+export async function listMemory(
+  query: { before?: string; store?: string; q?: string; limit?: number },
+  signal?: AbortSignal,
+): Promise<{ items: MemoryItem[]; stores: string[]; next: string | null }> {
+  const params = new URLSearchParams();
+  if (query.limit !== undefined) params.set("limit", String(query.limit));
+  if (query.before) params.set("before", query.before);
+  if (query.store !== undefined) params.set("store", query.store);
+  if (query.q) params.set("q", query.q);
+  return getJson(`api/memory?${params}`, signal);
+}
+
+export async function getMemoryItem(store: string, id: string, signal?: AbortSignal): Promise<MemoryItemDetail> {
+  return getJson(`api/memory/item?${new URLSearchParams({ store, id })}`, signal);
+}
+
+/** Deletes everything recorded about an item. */
+export async function deleteMemoryItem(store: string, id: string): Promise<void> {
+  const response = await fetch(`api/memory/item?${new URLSearchParams({ store, id })}`, { method: "DELETE" });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`${response.status} ${(await response.text()).trim()}`);
+  }
 }
 
 export interface NewScore {
@@ -327,6 +408,8 @@ export async function getSession(
 /** Hash links to the views, with IDs encoded so any session or user string is safe. */
 export const links = {
   session: (id: string) => `#/session/${encodeURIComponent(id)}`,
+  trace: (traceId: string, spanId?: string) => `#/trace/${traceId}${spanId ? `/${spanId}` : ""}`,
+  memoryItem: (store: string, id: string) => `#/memory/item?${new URLSearchParams({ store, id })}`,
   dataset: (id: string) => `#/dataset/${encodeURIComponent(id)}`,
   run: (id: string) => `#/run/${encodeURIComponent(id)}`,
   compare: (baseline: string, candidate: string) =>

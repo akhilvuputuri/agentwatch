@@ -35,6 +35,7 @@ from agentwatch import (
     drift,
     experiments,
     judges,
+    memory,
     metrics,
     monitors,
     otlp,
@@ -630,6 +631,7 @@ def create_app(
             return PlainTextResponse("trace not found", status_code=404)
         found = await run_in_threadpool(store.scores, trace_id)
         [summary] = await run_in_threadpool(store.traces, limit=1, trace=trace_id)
+        context = await run_in_threadpool(memory.in_context, store, [s.span for s in spans])
         return JSONResponse(
             {
                 "trace_id": trace_id,
@@ -637,8 +639,52 @@ def create_app(
                 "user_id": summary.user_id,
                 "spans": [_span_json(s) for s in spans],
                 "scores": [_score_json(score) for score in found],
+                # Model call span ID → the memory records it had in context.
+                "in_context": context,
             }
         )
+
+    async def memory_items(request: Request) -> Response:
+        query = request.query_params
+        try:
+            limit = max(1, min(int(query.get("limit", "50")), memory.MAX_PAGE))
+            before = query.get("before")
+            cursor = None if before in (None, "") else memory.ItemCursor.decode(before)
+        except ValueError:
+            return PlainTextResponse(
+                "limit must be an integer and before a cursor from `next`", status_code=400
+            )
+        found = await run_in_threadpool(
+            memory.items,
+            store,
+            limit=limit,
+            before=cursor,
+            store_id=query.get("store"),
+            service=query.get("service") or None,
+            query=query.get("q") or None,
+        )
+        names = await run_in_threadpool(memory.stores, store)
+        following = found[-1]["cursor"] if len(found) == limit else None
+        return JSONResponse({"items": found, "stores": names, "next": following})
+
+    async def memory_item(request: Request) -> Response:
+        # Record IDs are arbitrary text, so they travel as query parameters, not path segments.
+        query = request.query_params
+        record_id = query.get("id")
+        if not record_id:
+            return PlainTextResponse("id is required", status_code=400)
+        store_id = query.get("store", "")
+        if request.method == "DELETE":
+            removed = await run_in_threadpool(memory.delete_item, store, store_id, record_id)
+            return (
+                Response(status_code=204)
+                if removed
+                else PlainTextResponse("memory item not found", status_code=404)
+            )
+        found = await run_in_threadpool(memory.item, store, store_id, record_id)
+        if found is None:
+            return PlainTextResponse("memory item not found", status_code=404)
+        return JSONResponse(found)
 
     async def metrics_view(request: Request) -> Response:
         query = request.query_params
@@ -728,6 +774,8 @@ def create_app(
         Route("/api/drift", drift_view, methods=["GET"]),
         Route("/api/drift/summary", drift_summary, methods=["GET"]),
         Route("/api/changes", changes_view, methods=["GET"]),
+        Route("/api/memory", memory_items, methods=["GET"]),
+        Route("/api/memory/item", memory_item, methods=["GET", "DELETE"]),
         Route("/api/prices", list_prices, methods=["GET"]),
         Route("/api/prices", post_price, methods=["POST"]),
         Route("/api/prices/{price_id}", delete_price, methods=["DELETE"]),

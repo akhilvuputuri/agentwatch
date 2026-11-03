@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { getTrace, links, STATUS_ERROR, type Score, type TraceDetail } from "./api";
+import { getTrace, type InContext, links, STATUS_ERROR, type Score, type TraceDetail } from "./api";
 import { count, duration, timestamp, usd } from "./format";
 import { AddToDataset } from "./AddToDataset";
 import { ScorePanel } from "./ScorePanel";
+import { approxTokens, contentText } from "./Memory";
 import { layout, type Row } from "./tree";
 
-export function TraceView({ traceId }: { traceId: string }) {
+export function TraceView({ traceId, spanId }: { traceId: string; spanId?: string }) {
   const [detail, setDetail] = useState<TraceDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(spanId ?? null);
   const spans = detail?.spans ?? null;
   const setScores = useCallback(
     (update: (scores: Score[]) => Score[]) =>
@@ -23,14 +24,14 @@ export function TraceView({ traceId }: { traceId: string }) {
     getTrace(traceId, controller.signal).then(
       (result) => {
         setDetail(result);
-        setSelected(null);
+        setSelected(spanId ?? null);
       },
       (reason: unknown) => {
         if (!controller.signal.aborted) setError(String(reason));
       },
     );
     return () => controller.abort();
-  }, [traceId]);
+  }, [traceId, spanId]);
 
   const view = useMemo(() => layout(spans ?? []), [spans]);
   const chosen = view.rows.find((row) => row.span.span_id === selected) ?? view.rows[0];
@@ -84,7 +85,7 @@ export function TraceView({ traceId }: { traceId: string }) {
             />
           ))}
         </div>
-        {chosen && <SpanDetail row={chosen} />}
+        {chosen && <SpanDetail row={chosen} inContext={detail.in_context[chosen.span.span_id] ?? []} />}
       </div>
     </section>
   );
@@ -132,7 +133,7 @@ function SpanRow({
   );
 }
 
-function SpanDetail({ row }: { row: Row }) {
+function SpanDetail({ row, inContext }: { row: Row; inContext: InContext[] }) {
   const { span } = row;
   const g = span.genai;
   const facts: [string, string][] = [];
@@ -162,6 +163,7 @@ function SpanDetail({ row }: { row: Row }) {
           </div>
         ))}
       </dl>
+      {inContext.length > 0 && <MemoryInContext entries={inContext} />}
       <h3>Attributes</h3>
       <Attributes values={span.attributes} />
       {span.events.length > 0 && (
@@ -206,5 +208,54 @@ function Attributes({ values }: { values: Record<string, unknown> }) {
         ))}
       </tbody>
     </table>
+  );
+}
+
+/** The memory records this model call had in its prompt, as the instrumentation reported them. */
+function MemoryInContext({ entries }: { entries: InContext[] }) {
+  const sized = entries.filter((entry) => entry.characters !== null);
+  const characters = sized.reduce((total, entry) => total + (entry.characters ?? 0), 0);
+  return (
+    <>
+      <h3>Memory in context</h3>
+      <p className="muted small" data-testid="memory-in-context">
+        {entries.length} item{entries.length === 1 ? "" : "s"} read into this call's prompt
+        {sized.length > 0 && (
+          <>
+            {" "}
+            · {count(characters)} characters{sized.length < entries.length ? " (of those with a size)" : ""}, about{" "}
+            {count(approxTokens(characters))} tokens
+          </>
+        )}
+        . Being in context does not mean the model used an item.
+      </p>
+      <table className="attrs">
+        <tbody>
+          {entries.map((entry, index) => {
+            const text = contentText(entry.content);
+            return (
+              <tr key={`${entry.search_span_id}:${index}`}>
+                <th>
+                  {entry.record_id ? (
+                    <a href={links.memoryItem(entry.store_id, entry.record_id)}>{entry.record_id}</a>
+                  ) : (
+                    <span className="muted">no ID</span>
+                  )}
+                  <div className="muted small">{entry.search_span_name}</div>
+                </th>
+                <td>
+                  {text ?? <span className="muted">content not captured</span>}
+                  {entry.characters !== null && (
+                    <div className="muted small">
+                      {count(entry.characters)} characters, about {count(approxTokens(entry.characters))} tokens
+                    </div>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </>
   );
 }

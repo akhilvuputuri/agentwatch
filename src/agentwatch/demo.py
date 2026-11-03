@@ -20,6 +20,7 @@ from agentwatch.spans import (
     Attributes,
     Span,
     SpanEvent,
+    SpanLink,
 )
 from agentwatch.store import Store
 
@@ -64,13 +65,181 @@ def generate(*, traces: int = 120, seed: int = 7, end_ns: int) -> list[Span]:
     """Generate `traces` traces spread over the 48 hours before `end_ns`."""
     rng = random.Random(seed)
     ids = _Ids(rng)
+    # Memory draws from its own generator, so the rest of the data is as it was without it.
+    remembered = _Memory(random.Random(seed + 1))
     spans: list[Span] = []
     window = 48 * 3600 * 1_000_000_000
     starts = sorted(end_ns - rng.randrange(window) for _ in range(traces))
+    # A nightly learner, half a day before the end: later turns read what it added.
+    learner_at: int | None = end_ns - 12 * 3600 * 1_000_000_000
     for start in starts:
+        if learner_at is not None and start >= learner_at:
+            spans.extend(remembered.learner(learner_at))
+            learner_at = None
         trace_id = ids.trace()
-        spans.extend(_turn(rng, ids, trace_id, start))
+        turn = _turn(rng, ids, trace_id, start)
+        spans.extend(remembered.turn(turn))
+    if learner_at is not None:
+        spans.extend(remembered.learner(learner_at))
     return spans
+
+
+# Synthetic things the assistant remembers: key, kind and successive values.
+_MEMORIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("preferred_name", "fact", ("Call me Sam.",)),
+    ("timezone", "fact", ("Works in UTC+1.", "Works in UTC+2 over the summer.")),
+    ("meeting_hours", "fact", ("Prefers meetings after 10:00.",)),
+    (
+        "reminder_style",
+        "fact",
+        ("Short reminders, no emoji.", "Short reminders with the time first."),
+    ),
+    (
+        "lesson:calendar:double-check",
+        "lesson",
+        ("Read the calendar again before saying a slot is free.",),
+    ),
+    ("lesson:travel:times", "lesson", ("Give local times when planning a trip.",)),
+)
+MEMORY_STORE = "demo-memory"
+
+
+class _Memory:
+    """Synthetic memory: each turn reads every current item into its prompt, some turns save
+    one, and a nightly learner revises a lesson citing the turns it learned from."""
+
+    def __init__(self, rng: random.Random) -> None:
+        self._rng = rng
+        self._ids = _Ids(rng)
+        # key -> (kind, value index); the first three facts exist from the start.
+        self._current: dict[str, tuple[str, int]] = {
+            key: (kind, 0) for key, kind, _ in _MEMORIES[:3]
+        }
+        self._sources: list[tuple[str, str]] = []
+
+    def _record(self, key: str, *, with_size: bool = True) -> dict[str, Any]:
+        kind, index = self._current[key]
+        value = next(values for k, _, values in _MEMORIES if k == key)[index]
+        metadata: dict[str, Any] = {"kind": kind, "revision": index + 1}
+        if with_size:
+            metadata["characters"] = len(value)
+        return {"id": key, "content": value, "metadata": metadata}
+
+    def turn(self, spans: list[Span]) -> list[Span]:
+        root = spans[0]
+        self._sources.append((root.trace_id, root.span_id))
+        selected = [self._record(key) for key in sorted(self._current)]
+        read = Span(
+            trace_id=root.trace_id,
+            span_id=self._ids.span(),
+            parent_span_id=root.span_id,
+            name="search_memory demo-memory",
+            start_ns=root.start_ns + 1_000_000,
+            end_ns=root.start_ns + 2_000_000,
+            kind=KIND_INTERNAL,
+            status_code=STATUS_OK,
+            attributes={
+                genai.OPERATION: "search_memory",
+                "gen_ai.memory.store.id": MEMORY_STORE,
+                "gen_ai.memory.record.count": len(selected),
+                "gen_ai.memory.records": json.dumps(selected),
+            },
+            resource=_resource(),
+            scope_name="agentwatch.demo",
+        )
+        added = [read]
+        if self._rng.random() < 0.12:
+            added.extend(self._save(root))
+        return [root, *added, *spans[1:]]
+
+    def _save(self, root: Span) -> list[Span]:
+        key, kind, values = self._rng.choice(_MEMORIES[:4])
+        if key in self._current:
+            index = self._current[key][1]
+            if index + 1 >= len(values):
+                return []
+            self._current[key] = (kind, index + 1)
+            operation = "update_memory"
+        else:
+            self._current[key] = (kind, 0)
+            operation = "create_memory"
+        at = root.end_ns - 3_000_000
+        tool = self._ids.span()
+        return [
+            Span(
+                trace_id=root.trace_id,
+                span_id=tool,
+                parent_span_id=root.span_id,
+                name="execute_tool remember",
+                start_ns=at,
+                end_ns=at + 2_000_000,
+                kind=KIND_INTERNAL,
+                status_code=STATUS_OK,
+                attributes={genai.OPERATION: "execute_tool", genai.TOOL_NAME: "remember"},
+                resource=_resource(),
+                scope_name="agentwatch.demo",
+            ),
+            self._write(root.trace_id, tool, operation, key, at + 500_000),
+        ]
+
+    def _write(
+        self,
+        trace_id: str,
+        parent: str,
+        operation: str,
+        key: str,
+        at: int,
+        links: tuple[SpanLink, ...] = (),
+    ) -> Span:
+        return Span(
+            trace_id=trace_id,
+            span_id=self._ids.span(),
+            parent_span_id=parent,
+            name=f"{operation} demo-memory",
+            start_ns=at,
+            end_ns=at + 1_000_000,
+            kind=KIND_INTERNAL,
+            status_code=STATUS_OK,
+            attributes={
+                genai.OPERATION: operation,
+                "gen_ai.memory.store.id": MEMORY_STORE,
+                "gen_ai.memory.record.id": key,
+                "gen_ai.memory.record.count": 1,
+                "gen_ai.memory.records": json.dumps([self._record(key, with_size=False)]),
+            },
+            resource=_resource(),
+            scope_name="agentwatch.demo",
+            links=links,
+        )
+
+    def learner(self, start: int) -> list[Span]:
+        """One nightly learner run: it adds the lessons, linked to the turns it read."""
+        trace_id = self._ids.trace()
+        root = self._ids.span()
+        sources = tuple(
+            SpanLink(trace_id=trace, span_id=span) for trace, span in self._sources[-3:]
+        )
+        writes: list[Span] = []
+        for offset, (key, kind, _) in enumerate(_MEMORIES[4:]):
+            self._current[key] = (kind, 0)
+            at = start + (offset + 1) * 2_000_000_000
+            writes.append(self._write(trace_id, root, "create_memory", key, at, sources))
+        return [
+            Span(
+                trace_id=trace_id,
+                span_id=root,
+                parent_span_id=None,
+                name="invoke_agent learner",
+                start_ns=start,
+                end_ns=start + 10_000_000_000,
+                kind=KIND_INTERNAL,
+                status_code=STATUS_OK,
+                attributes={genai.OPERATION: "invoke_agent", genai.AGENT_NAME: "learner"},
+                resource=_resource(),
+                scope_name="agentwatch.demo",
+            ),
+            *writes,
+        ]
 
 
 def _turn(rng: random.Random, ids: _Ids, trace_id: str, start: int) -> list[Span]:

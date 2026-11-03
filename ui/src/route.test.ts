@@ -16,6 +16,14 @@ describe("route", () => {
     expect(route(links.compare("a/1", "b"))).toEqual({ page: "compare", baseline: "a/1", candidate: "b" });
     expect(route(links.dataset("a b/c"))).toEqual({ page: "dataset", datasetId: "a b/c" });
     expect(route(`#/trace/${"A".repeat(32)}`)).toEqual({ page: "trace", traceId: "a".repeat(32) });
+    expect(route(links.trace("a".repeat(32), "B".repeat(16)))).toEqual({
+      page: "trace",
+      traceId: "a".repeat(32),
+      spanId: "b".repeat(16),
+    });
+    expect(route("#/memory")).toEqual({ page: "memory" });
+    expect(route(links.memoryItem("", "lesson:a b/c&d"))).toEqual({ page: "memory-item", store: "", id: "lesson:a b/c&d" });
+    expect(route("#/memory/item?store=s")).toEqual({ page: "memory" });
   });
   it("round-trips session and user IDs of any shape", () => {
     const odd = "team/chat 1?x=y&z#w%";

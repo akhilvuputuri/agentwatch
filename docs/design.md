@@ -605,7 +605,8 @@ independent. Truncation favours the most recent traces of a window.
 
 `agentwatch serve --retain-days N` (1 to 36,500) deletes, at start and every 6 hours, every
 trace whose last span arrived more than N days ago, with its scores and judgements, and every
-alert created more than N days ago, delivered or not (`Store.prune`). Age is the server's arrival time, not the exporter's span times, so a client
+alert created more than N days ago, delivered or not (`Store.prune`). Memory records are kept
+([memory](#memory)). Age is the server's arrival time, not the exporter's span times, so a client
 with a wrong clock cannot get new traces deleted. A trace with any recent span is kept whole.
 Traces and scores of experiment runs are kept, since their runs still show them. Scores and
 judgements older than the cutoff whose trace no longer exists, or never arrived, are deleted
@@ -626,6 +627,64 @@ uv into a Python 3.13 slim image; all three base images are pinned by digest. It
 tests it: health, OTLP ingest, the UI, the non-root user, and that data survives a restart. On
 `main`, a separate job, the only one with permission to write packages, loads that same tested
 image and publishes it to GHCR as `sha-<commit>` and `main`, recording the digest.
+
+## Memory
+
+What an agent remembers, how each item changed, and what each model call had in context
+(`memory.py`, schema version 11). It reads the GenAI memory spans (semantic-conventions-genai,
+development status): a span whose `gen_ai.operation.name` is `create_memory`, `update_memory`,
+`upsert_memory` or `delete_memory` changed the records it names, and one whose operation is
+`search_memory` read them. Each record is one row of `memory_records`, from
+`gen_ai.memory.records` (a list of `{id, content, metadata, score}`, structured or as a JSON
+string, as the conventions allow on spans), else from `gen_ai.memory.record.id`.
+`gen_ai.memory.store.id` names the store, and an item is a store and record ID.
+
+- **What is not recorded.** A span that failed records nothing, since its change or read may not
+  have happened. A `delete_memory` without a record ID, which in the conventions deletes the whole
+  store, and a write record without an ID are skipped, since no item can be named. A search record
+  without an ID is kept for the call's context, but belongs to no item. At most 500 records a
+  span; IDs over 500 characters are dropped with their record, content over 64 KB of JSON is cut
+  and says so, and metadata over 8 KB is dropped.
+- **Content.** The conventions make `gen_ai.memory.records` opt-in because it carries content. A
+  record whose `content` is `null` has its ID, metadata and size without the text, which is how an
+  exporter can report what was in context with content capture off.
+- **Re-sending** a span replaces its records. The rules have a version in `meta`
+  (`memory_derivation`, which also follows `genai.DERIVATION_VERSION`, since that decides a span's
+  operation), so stored spans are read again, 200 at a time, when either changes, and once after
+  the upgrade to schema 11.
+- **Retention.** Records are not pruned with their traces: an item's history outlasts the traces
+  it links to, which then show as no longer kept. A pruned read keeps its count but loses its copy
+  of the content, which the changes already hold. `DELETE /api/memory/item?store=&id=` deletes an
+  item's history, for example after the agent was told to forget it: its records, and its records
+  inside the stored memory spans, which are rewritten without them. The deletion is remembered
+  (`memory_deleted`), so re-reading or re-sending those spans cannot bring it back. A change is
+  recorded again when its span ends after the deletion by agentwatch's clock, so one made just
+  before the deletion but sent after it is dropped, as is one from an exporter whose clock is
+  behind. The text can still be in captured prompts and tool
+  results until their traces are pruned. It does not change the agent's own memory.
+
+**In context.** A model call has in context the records of the `search_memory` spans in the same
+agent that ended before it started: the spans whose nearest `invoke_agent` ancestor is the call's
+own, or that have none when the call has none. So reads by a tool inside the agent count for the
+calls after them, and a nested agent sees only its own reads; an exporter should put the read
+that fills a prompt inside the agent whose calls use it. An item read more than once is listed
+once, as its latest read, and embeddings calls have no context. This is what was in the prompt,
+as the instrumentation reports it. Whether the model used an item is not known, so the UI never
+says it was used. The Memory pages count reads, whether or not a call followed them, and only a
+model call's span says what was in context. A record's size is its metadata's `characters` when
+given, else the length of its captured content; tokens are an estimate at four characters a
+token.
+
+**API.** `GET /api/memory?store=&service=&q=&limit=&before=` lists items, most recently active
+first, with `stores` and a `next` cursor; `q` matches the record ID or content. The cursor follows
+latest activity, so an item that becomes active while you page can be skipped. An item's content
+and metadata are its latest captured ones, `writes` and `reads` count its changes and reads, and
+`deleted` is whether its last change was a delete. `GET /api/memory/item?store=&id=` gives one
+item with all its changes (up to 500) and its 50 most recent reads, fetched apart so the reads of
+an agent that loads every item each turn cannot bury the changes. Each event carries the links of
+its span, such as a learner's links to the turns it learned from. IDs are arbitrary text, so both
+go in the query string. `GET /api/traces/<id>` adds `in_context`, from model call span ID to its
+records.
 
 ## Sessions and users
 
@@ -684,7 +743,7 @@ screen readers; each chart's data table carries the same values.
 
 ## UI
 
-Hash-routed (`#/`, `#/trace/<id>`), so the static server needs no fallback routes. The waterfall
+Hash-routed (`#/`, `#/trace/<id>`, `#/trace/<id>/<span>` with that span selected, `#/memory`), so the static server needs no fallback routes. The waterfall
 orders spans depth-first by start time, puts the true root first and shows spans whose parent
 never arrived as extra roots marked "parent missing", and keeps spans caught in a parent cycle instead of dropping them.
 Offsets are computed with `BigInt` to keep nanosecond precision.

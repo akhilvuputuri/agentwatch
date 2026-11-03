@@ -862,6 +862,8 @@ def test_migration_from_schema_9(tmp_path: Path) -> None:
     Store(path).close()
     # Back to how version 9 left it, with rows in each table.
     conn = duckdb.connect(str(path))
+    conn.execute("DROP TABLE memory_records")
+    conn.execute("DROP TABLE memory_deleted")
     for table, column in (
         ("monitors", "mode"),
         ("monitors", "baseline_minutes"),
@@ -893,8 +895,10 @@ def test_migration_from_schema_9(tmp_path: Path) -> None:
     conn.close()
 
     upgraded = Store(path)
-    assert upgraded.query_one("SELECT value FROM meta WHERE key = 'schema'")[0] == "10"
-    assert store.SCHEMA_VERSION == 10
+    assert upgraded.query_one("SELECT value FROM meta WHERE key = 'schema'")[0] == str(
+        store.SCHEMA_VERSION
+    )
+    assert store.SCHEMA_VERSION == 11
     [monitor] = monitors.list_monitors(upgraded)
     assert (monitor.mode, monitor.baseline_minutes, monitor.muted) == ("threshold", None, False)
     state = monitors.get_state(upgraded, "m")

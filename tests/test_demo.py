@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from agentwatch import demo, genai
+from agentwatch import demo, genai, memory
 from agentwatch.spans import Span
 from agentwatch.store import Store
 
@@ -23,7 +23,8 @@ def test_demo_traces_are_well_formed() -> None:
     by_trace: dict[str, list[Span]] = defaultdict(list)
     for span in spans:
         by_trace[span.trace_id].append(span)
-    assert len(by_trace) == 60
+    # The turns, and one learner run.
+    assert len(by_trace) == 61
     for members in by_trace.values():
         ids = {span.span_id for span in members}
         assert len(ids) == len(members)
@@ -41,10 +42,38 @@ def test_demo_loads_into_the_store() -> None:
     spans = demo.generate(traces=30, end_ns=END)
     store.insert(spans, received_ns=END)
     summaries = store.traces(limit=100)
-    assert len(summaries) == 30
+    assert len(summaries) == 31
     assert all(summary.complete for summary in summaries)
     assert sum(s.model_calls for s in summaries) == sum(
         1 for s in spans if genai.read(s).is_model_call
     )
     assert any(s.error_count for s in summaries)
     assert all(s.cost_usd is None or s.cost_usd > 0 for s in summaries)
+
+
+def test_demo_memory() -> None:
+    store = Store()
+    spans = demo.generate(traces=30, end_ns=END)
+    store.insert(spans, received_ns=END)
+    found = {item["record_id"]: item for item in memory.items(store)}
+    # Every turn reads the current items into its prompt; the learner adds two lessons.
+    assert found["preferred_name"]["reads"] == 30
+    assert {key for key in found if key.startswith("lesson:")} == {
+        "lesson:calendar:double-check",
+        "lesson:travel:times",
+    }
+    lesson = memory.item(store, demo.MEMORY_STORE, "lesson:travel:times")
+    assert lesson is not None
+    [created] = lesson["changes"]
+    assert created["links"]
+    # Turns after the learner ran read the lesson into their prompts.
+    assert lesson["item"]["reads"] > 0
+
+
+def test_an_item_returns_only_its_most_recent_reads() -> None:
+    store = Store()
+    store.insert(demo.generate(traces=memory.MAX_READS + 5, end_ns=END), received_ns=END)
+    name = memory.item(store, demo.MEMORY_STORE, "preferred_name")
+    assert name is not None
+    assert (len(name["reads"]), name["reads_truncated"]) == (memory.MAX_READS, True)
+    assert name["item"]["reads"] == memory.MAX_READS + 5
