@@ -343,11 +343,13 @@ def delete_item(store: Store, store_id: str, record_id: str, *, now_ns: int | No
     now_ns = time.time_ns() if now_ns is None else now_ns
     names = ", ".join(f"'{name}'" for name in sorted(OPERATIONS))
     with store.transaction() as db:
-        # Every stored memory span that may name it, failed ones included, which record nothing.
+        # Every stored memory span of the store, failed ones included, which record nothing, is
+        # checked in Python: an ID can be escaped twice inside the stored text, so no text search
+        # is safe.
         spans = db.execute(
             f"SELECT trace_id, span_id, attributes FROM spans WHERE operation IN ({names}) "
-            "AND contains(attributes::VARCHAR, ?)",
-            [json.dumps(record_id)[1:-1]],
+            f"AND coalesce(json_extract_string(attributes, '$.\"{STORE_ID}\"'), '') = ?",
+            [store_id],
         ).fetchall()
         found = db.execute(
             "DELETE FROM memory_records WHERE store_id = ? AND record_id = ? RETURNING time_ns",

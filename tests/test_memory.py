@@ -563,3 +563,48 @@ def test_deleting_also_clears_failed_spans_that_named_the_item() -> None:
         "SELECT count(*) FROM spans WHERE contains(attributes::VARCHAR, 'diagnosis')"
     ) == [(0,)]
     assert not memory.delete_item(other, "", "never-there")
+
+
+@pytest.mark.parametrize(
+    "record_id", ["plain", 'a"b', "C:\\notes", "café", "tab\there", "line\nbreak"]
+)
+@pytest.mark.parametrize("as_text", [True, False])
+def test_deleting_clears_spans_whatever_the_id_and_record_form(
+    record_id: str, as_text: bool
+) -> None:
+    listed = [{"id": record_id, "content": "SECRETTEXT"}, {"id": "other", "content": "kept"}]
+    store = Store()
+    store.insert(
+        [
+            span(
+                "1" * 16,
+                None,
+                "create_memory",
+                0,
+                1,
+                **{
+                    memory.STORE_ID: STORE,
+                    memory.RECORDS: json.dumps(listed) if as_text else listed,
+                },
+            ),
+            _failed(
+                span(
+                    "2" * 16,
+                    None,
+                    "update_memory",
+                    2,
+                    3,
+                    **{memory.STORE_ID: STORE, memory.RECORDS: json.dumps(listed)},
+                )
+            ),
+        ],
+        received_ns=START,
+    )
+    assert memory.delete_item(store, STORE, record_id)
+    assert store.query(
+        "SELECT count(*) FROM spans WHERE contains(attributes::VARCHAR, 'SECRETTEXT')"
+    ) == [(0,)]
+    assert store.query(
+        "SELECT count(*) FROM spans WHERE contains(attributes::VARCHAR, 'kept')"
+    ) == [(2,)]
+    assert [i["record_id"] for i in memory.items(store)] == ["other"]
