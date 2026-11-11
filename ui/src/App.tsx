@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Alerts } from "./Alerts";
+import { getAuthSession, signOut } from "./api";
 import { CompareView } from "./Compare";
 import { Dashboard } from "./Dashboard";
 import { DatasetList, DatasetView } from "./Datasets";
@@ -106,6 +107,14 @@ export function App() {
     window.addEventListener("hashchange", onChange);
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
+  const [user, setUser] = useState<string | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    getAuthSession(controller.signal)
+      .then((session) => setUser(session.user))
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, []);
   const section =
     current.page === "dashboard" || current.page === "prices" || current.page === "judges" || current.page === "alerts" || current.page === "drift"
       ? current.page
@@ -154,6 +163,11 @@ export function App() {
             Prices
           </a>
         </nav>
+        {user !== null ? (
+          <button type="button" className="signout" title={`Signed in as ${user}`} onClick={() => void signOut()}>
+            Sign out
+          </button>
+        ) : null}
       </header>
       <main>
         {current.page === "dashboard" ? (

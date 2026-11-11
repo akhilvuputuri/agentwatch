@@ -128,7 +128,7 @@ export async function getMemoryItem(store: string, id: string, signal?: AbortSig
 
 /** Deletes everything recorded about an item. */
 export async function deleteMemoryItem(store: string, id: string): Promise<void> {
-  const response = await fetch(`api/memory/item?${new URLSearchParams({ store, id })}`, { method: "DELETE" });
+  const response = await call(`api/memory/item?${new URLSearchParams({ store, id })}`, { method: "DELETE" });
   if (!response.ok && response.status !== 404) {
     throw new Error(`${response.status} ${(await response.text()).trim()}`);
   }
@@ -145,7 +145,7 @@ export interface NewScore {
 
 /** Adds a score as a human annotation and returns it as stored. */
 export async function addScore(score: NewScore): Promise<Score> {
-  const response = await fetch("api/scores?source=annotation", {
+  const response = await call("api/scores?source=annotation", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(score),
@@ -156,10 +156,34 @@ export async function addScore(score: NewScore): Promise<Score> {
 }
 
 export async function deleteScore(id: string): Promise<void> {
-  const response = await fetch(`api/scores/${encodeURIComponent(id)}`, { method: "DELETE" });
+  const response = await call(`api/scores/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (!response.ok && response.status !== 404) {
     throw new Error(`${response.status} ${(await response.text()).trim()}`);
   }
+}
+
+/** fetch, except that a 401 (signing in is on, and the session has ended) opens the sign-in
+ * page, which returns to the current route afterwards. */
+async function call(path: string, init: RequestInit = {}): Promise<Response> {
+  const response = await fetch(path, init);
+  if (response.status === 401) window.location.assign(`login${window.location.hash}`);
+  return response;
+}
+
+export interface AuthSession {
+  /** The server requires signing in. */
+  auth: boolean;
+  /** The signed-in user; null when signing in is off. */
+  user: string | null;
+}
+
+export async function getAuthSession(signal?: AbortSignal): Promise<AuthSession> {
+  return getJson("api/auth/session", signal);
+}
+
+export async function signOut(): Promise<void> {
+  await fetch("api/auth/logout", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  window.location.assign("login");
 }
 
 export interface TracePage {
@@ -225,7 +249,7 @@ export interface TraceQuery {
 }
 
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(path, signal ? { signal } : {});
+  const response = await call(path, signal ? { signal } : {});
   if (!response.ok) {
     throw new Error(`${response.status} ${(await response.text()).trim()}`);
   }
@@ -442,7 +466,7 @@ export async function listPrices(signal?: AbortSignal): Promise<Price[]> {
 }
 
 export async function addPrice(price: NewPrice): Promise<Price> {
-  const response = await fetch("api/prices", {
+  const response = await call("api/prices", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(price),
@@ -452,7 +476,7 @@ export async function addPrice(price: NewPrice): Promise<Price> {
 }
 
 export async function deletePrice(id: string): Promise<void> {
-  const response = await fetch(`api/prices/${encodeURIComponent(id)}`, { method: "DELETE" });
+  const response = await call(`api/prices/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (!response.ok && response.status !== 404) {
     throw new Error(`${response.status} ${(await response.text()).trim()}`);
   }
@@ -481,7 +505,7 @@ export interface DatasetItem {
 }
 
 async function send<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const response = await fetch(path, {
+  const response = await call(path, {
     method,
     ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
   });

@@ -10,10 +10,10 @@ over datasets, LLM judges that score a sample of new traces, a dashboard of cost
 share and latency over time and by model, tool and agent, monitors that raise alerts when a recent
 metric crosses a threshold, and drift detection that compares a metric between two time windows.
 
-It runs on one machine for one person. There is no authentication, so it binds to `127.0.0.1` by
-default and refuses requests addressed to any other host name, which blocks DNS-rebinding and
-cross-origin browser requests. To reach it from another machine, bind with `--host` and name the
-address clients will use with `--allow-host`.
+It runs on one machine for one person. It binds to `127.0.0.1` by default and refuses requests
+addressed to any other host name, which blocks DNS-rebinding and cross-origin browser requests. To
+reach it from another machine, bind with `--host`, name the address clients will use with
+`--allow-host`, and switch on [signing in](#signing-in).
 
 > Status: early development, following the plan in
 > [chief-agent#323](https://github.com/akhilvuputuri/chief-agent/issues/323). Tracing, dashboards,
@@ -148,6 +148,28 @@ mode alerts on such a change. Simulated traffic with ordinary overdispersion fir
 once a month, so trial one with `muted`, which records alerts without sending them to any client.
 See [the design notes](docs/design.md#drift-detection).
 
+## Signing in
+
+Off by default. To require it, make a password hash and pass a user name:
+
+```bash
+agentwatch hash-password                     # asks for the password twice, prints the hash
+export AGENTWATCH_PASSWORD_HASH='scrypt:...'
+export AGENTWATCH_API_KEY="$(openssl rand -hex 32)"
+agentwatch serve --host 0.0.0.0 --allow-host traces.example.com \
+  --auth-user owner --api-key-env AGENTWATCH_API_KEY
+```
+
+The UI then opens on a sign-in page, and everything but the sign-in page, signing out,
+`/api/auth/session` and `/healthz` needs a session or a key. Programs
+(an OTLP exporter, an alert relay) send `Authorization: Bearer <key>` with a key from a variable
+named by `--api-key-env`; for an OpenTelemetry SDK that is
+`OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<key>`. Session cookies are `Secure`, so serve
+it over HTTPS (a reverse proxy such as Caddy) or pass `--insecure-cookies` for plain HTTP on a
+trusted network. Behind a proxy, pass `--forwarded-allow-ips` with the proxy's address, or every
+visitor shares the proxy's address and five wrong guesses from anyone make you wait too. Sessions are kept in memory, so a restart signs everyone out. See
+[the design notes](docs/design.md#signing-in).
+
 ## Memory
 
 The Memory page lists what an agent remembers, from the GenAI memory spans (`create_memory`,
@@ -173,7 +195,8 @@ cd ui && npm ci && npm run build && npm test && npm run e2e
 
 ## Data and privacy
 
-The demo dataset is generated (`src/agentwatch/demo.py`) and contains no real conversations. Real
+Without [signing in](#signing-in), anyone who can reach the port can read and write everything,
+so keep it on loopback or a private network unless signing in is on. The demo dataset is generated (`src/agentwatch/demo.py`) and contains no real conversations. Real
 traces stay in the local DuckDB file, except the captured messages of traces a judge you
 switched on sends to its model endpoint. agentwatch only reads what exporters send; whether prompts
 or tool arguments are included is the exporter's choice.

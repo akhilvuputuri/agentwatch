@@ -97,6 +97,8 @@ strings, because they exceed JavaScript's exact integer range. Durations are num
 - `GET /api/metrics?from=<ns>&to=<ns>&service=<name>` (or `range=all`; the default is the last 24
   hours): the dashboard's figures, below.
 - `GET /api/services` (root services, the values the list filters on), `GET /healthz`.
+- `GET /api/auth/session` (`{"auth": bool, "user": name or null}`), `POST /api/auth/login`
+  (the sign-in form), `POST /api/auth/logout` (JSON): see [signing in](#signing-in).
 
 ## Datasets
 
@@ -627,6 +629,88 @@ uv into a Python 3.13 slim image; all three base images are pinned by digest. It
 tests it: health, OTLP ingest, the UI, the non-root user, and that data survives a restart. On
 `main`, a separate job, the only one with permission to write packages, loads that same tested
 image and publishes it to GHCR as `sha-<commit>` and `main`, recording the digest.
+
+## Signing in
+
+Off unless `serve --auth-user NAME` is given (`src/agentwatch/auth.py`). Mainstream trace tools
+build sign-in in; this follows their shape at one account's size, on the standard library's
+primitives, with choices taken from OWASP's Password Storage, Session Management and
+Authentication cheat sheets and the Auth Book (auth.pilcrowonpaper.com), not from any one tool.
+Phoenix, read for comparison, hashes with PBKDF2 at 10,000 iterations and compares with `==`;
+OWASP's floor for PBKDF2-SHA256 is 600,000, so it was not copied.
+
+- **One account, no stored password.** The operator runs `agentwatch hash-password` and puts its
+  output in an environment variable (`--password-hash-env`, default `AGENTWATCH_PASSWORD_HASH`).
+  The hash is scrypt with N=2^15, r=8, p=3, one of OWASP's equivalent minimums, at 32 MiB a check
+  (N=2^17 would take 128 MiB of a container capped at 512 MB). The format,
+  `scrypt:N:r:p:salt:key` in unpadded base64url, has no `$`, so Compose and `.env` files keep it
+  whole. A hash needing more than 64 MiB (128 x r x N), N below 2^14 or not a power of two, r
+  outside 1 to 32 or p outside 1 to 16 is refused, and so is a password outside 12 to 1,024
+  characters. An unknown user name is checked against a random decoy with the same parameters,
+  so the time taken does not tell names apart, and the answer is the same "Wrong user name or
+  password." either way.
+- **Checks in turn.** One check runs at a time, on a thread of its own limiter, not the thread
+  pool the API and ingest share, so a burst of guesses waits without holding the threads reads
+  and ingest need. With 8 checks running or waiting, a sign-in gets 503 with `Retry-After: 5`,
+  and is not counted against the limits.
+- **Sessions.** Signing in makes a 256-bit token (`secrets.token_urlsafe(32)`) and keeps only its
+  SHA-256, in memory, so signing out ends the session on the server and a restart ends all of
+  them. A session lasts 7 days unused and 30 days in all; at most 64 are kept, the least recently
+  used going first. Signing in again ends the session the browser came with. OWASP suggests idle
+  limits of minutes for valuable data; this is a personal viewer opened from a phone, so it
+  follows Langfuse's 30-day default instead, and the limits are constants to shorten if that
+  changes.
+- **The cookie.** `__Host-agentwatch`: `Secure`, `HttpOnly`, `Path=/`, no `Domain`,
+  `SameSite=Lax`. Lax rather than Strict, so a link from a chat message to a trace opens signed
+  in. `--insecure-cookies` drops `Secure` for plain HTTP, and with it the `__Host-` prefix
+  browsers would refuse (`agentwatch_session`).
+- **Cross-site requests.** Unchanged from before: the host guard refuses another site's `Origin`,
+  and writes must be JSON, which a cross-site form cannot send. The sign-in form is the one
+  form-encoded write; the guard covers it, and signing out is a JSON write, so another site can
+  neither sign the owner in to its account nor sign them out. The sign-in page sends
+  `Referrer-Policy: same-origin`: under `no-referrer`, browsers send `Origin: null` with a form
+  or a same-origin `fetch` write, which the guard refuses, so a proxy must not set `no-referrer`
+  on these pages either. The page also sends a CSP allowing only its own inline script (by hash)
+  and style, and refuses framing.
+- **Throttling.** Per client address: 5 failures free, then a wait of 1 minute doubling up to an
+  hour, cleared by a success. For the account: at most 30 failures an hour from all addresses,
+  since OWASP ties lockout to the account so that many addresses cannot each take their free
+  tries. Each attempt counts as a failure from the moment it is let through until the password
+  turns out right, in one locked step with the check of the limits, so attempts sent together
+  cannot all slip in before the first failure is recorded. A throttled request gets 429 with
+  `Retry-After` and is not checked. Failures are logged with the address only, never the name or
+  password tried.
+- **What the throttle costs the owner.** One address cannot lock the owner out. Many addresses
+  can: 30 failures an hour keeps new sign-ins refused for as long as it goes on, from anywhere.
+  Sessions already open keep working, and a restart clears the throttle (and every session).
+  That is the price of a cap on distributed guessing; with a long random password the cap is
+  rarely what stops a guess, so it is there for a weak one.
+- **The client address.** The TCP peer, or with `--forwarded-allow-ips` the client a trusted
+  proxy names in `X-Forwarded-For` (uvicorn's proxy headers, otherwise off). Behind a proxy the
+  flag is needed: without it every visitor shares the proxy's address, and five wrong guesses
+  from anyone make the owner wait too. Name the proxy's exact address or network. With Caddy on
+  the host and agentwatch in a container, the peer is the Docker network's gateway (such as
+  `172.18.0.1`), not `127.0.0.1`. `'*'` believes whatever any peer writes, so a client that can
+  reach the port directly could claim a new address for each guess.
+- **Programs.** `--api-key-env VAR` (repeatable) names variables holding keys of at least 32
+  characters, accepted as `Authorization: Bearer <key>` on every route, OTLP ingest included, as
+  Phoenix's system keys are. The presented key's SHA-256 is compared with every key's in
+  constant time. A key is not a user: `/api/auth/session` reports no user for it. Keys have no
+  scopes: an exporter's key can also read, change and delete, so give each program its own key
+  and keep them out of logs.
+- **What stays open.** `/login`, the sign-in post, signing out (so a stale cookie can still be
+  cleared), `/api/auth/session` (whether signing in is on, and who is signed in) and `/healthz`, which then reports only `{"ok": true}`, not the span
+  count. Without a session, a request for the UI page gets a 303 to `/login`, which browsers
+  follow keeping the URL's `#route`; the page copies the route into the form, so signing in
+  returns to it. Any other request gets 401, and the UI sends itself to the sign-in page on a 401.
+- **Failing closed.** `--auth-user` without a usable hash, an empty name (as from an unset
+  Compose variable) or an empty key variable stops the server at start rather than serving
+  without the sign-in asked for. So does a password hash in the environment without
+  `--auth-user`, or `--api-key-env` or `--insecure-cookies` without it: a forgotten flag, not a
+  choice to serve openly.
+
+Not built: more than one account, roles, scoped API keys, password change from the UI (make a
+new hash and restart), two-factor sign-in, and sessions that survive a restart.
 
 ## Memory
 
