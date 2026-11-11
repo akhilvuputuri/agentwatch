@@ -29,6 +29,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from agentwatch import auth as signin
 from agentwatch import (
     comparisons,
     datasets,
@@ -77,8 +78,12 @@ def create_app(
     ui_dir: Path | None = None,
     allowed_hosts: Sequence[str] = LOOPBACK_HOSTS,
     judge_runner: judges.JudgeRunner | None = None,
+    auth: signin.Auth | None = None,
 ) -> Starlette:
     """`allowed_hosts` are the Host header names served; "*" allows any (no rebinding guard).
+
+    `auth`, when given, requires a signed-in session or an API key for everything but the
+    sign-in page and the health check (docs/design.md#signing-in).
 
     `judge_runner`, when given, is the background runner whose problems the judges API reports
     and whose model client a judge's trial uses.
@@ -745,7 +750,13 @@ def create_app(
         return JSONResponse({"services": await run_in_threadpool(store.services)})
 
     async def health(_: Request) -> Response:
+        if auth is not None:
+            # Public when signing in is on, so it says nothing about the data.
+            return JSONResponse({"ok": True})
         return JSONResponse({"ok": True, "spans": await run_in_threadpool(store.span_count)})
+
+    async def auth_session(request: Request) -> Response:
+        return signin.session_json(auth, request)
 
     routes: list[Route | Mount] = [
         Route("/v1/traces", ingest, methods=["POST"]),
@@ -786,13 +797,30 @@ def create_app(
         Route("/api/sessions/{session_id:path}", session),
         Route("/api/services", services),
         Route("/healthz", health),
+        Route("/api/auth/session", auth_session),
     ]
+    if auth is not None:
+        signed_in = auth
+
+        async def login(request: Request) -> Response:
+            return await signin.login(signed_in, request)
+
+        async def logout(request: Request) -> Response:
+            return await signin.logout(signed_in, request)
+
+        routes += [
+            Route("/login", signin.login_page),
+            Route("/api/auth/login", login, methods=["POST"]),
+            Route("/api/auth/logout", logout, methods=["POST"]),
+        ]
     static = ui_dir if ui_dir is not None else _bundled_ui()
     if static is not None and (static / "index.html").is_file():
         routes.append(Mount("/", UiFiles(directory=static, html=True), name="ui"))
     else:
         routes.append(Route("/", _no_ui))
     middleware = [Middleware(HostGuard, allowed=tuple(allowed_hosts))]
+    if auth is not None:
+        middleware.append(Middleware(signin.AuthGuard, auth=auth))
     return Starlette(routes=routes, middleware=middleware)
 
 

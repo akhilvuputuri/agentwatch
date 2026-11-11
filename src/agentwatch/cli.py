@@ -1,4 +1,4 @@
-"""Command line: `agentwatch serve` and `agentwatch demo`."""
+"""Command line: `agentwatch serve`, `agentwatch demo` and `agentwatch hash-password`."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 
+from agentwatch.auth import Auth, AuthConfigError, hash_password
 from agentwatch.judges import JudgePolicy, judge_endpoint
 
 GIL_SWITCH_S = 0.0005
@@ -76,6 +77,36 @@ def main(argv: list[str] | None = None) -> int:
         help="the highest daily call limit a judge may have (default: %(default)s)",
     )
     serve.add_argument(
+        "--auth-user",
+        default=None,
+        metavar="NAME",
+        help="require signing in as NAME, with the password hash in --password-hash-env",
+    )
+    serve.add_argument(
+        "--password-hash-env",
+        default="AGENTWATCH_PASSWORD_HASH",
+        metavar="VAR",
+        help="variable holding the output of `agentwatch hash-password` (default: %(default)s)",
+    )
+    serve.add_argument(
+        "--api-key-env",
+        action="append",
+        default=[],
+        metavar="VAR",
+        help="variable holding a key programs may send as 'Authorization: Bearer' (repeatable)",
+    )
+    serve.add_argument(
+        "--insecure-cookies",
+        action="store_true",
+        help="session cookies without Secure, for plain-HTTP use only (default: Secure)",
+    )
+    serve.add_argument(
+        "--forwarded-allow-ips",
+        default=None,
+        metavar="IPS",
+        help="proxies trusted to name the client in X-Forwarded-For ('*' for any peer)",
+    )
+    serve.add_argument(
         "--demo",
         action="store_true",
         help="load the synthetic demo dataset into an in-memory database",
@@ -86,7 +117,14 @@ def main(argv: list[str] | None = None) -> int:
     demo.add_argument("--traces", type=int, default=120)
     demo.add_argument("--seed", type=int, default=7)
 
+    commands.add_parser(
+        "hash-password",
+        help="read a password and print the hash for --password-hash-env",
+    )
+
     args = parser.parse_args(argv)
+    if args.command == "hash-password":
+        return _hash_password()
     if args.command == "serve":
         if not 1 <= args.judge_max_daily <= 10_000:
             parser.error("--judge-max-daily must be from 1 to 10000")
@@ -99,6 +137,18 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"--judge-endpoint: {error}")
         if args.retain_days is not None and not 1 <= args.retain_days <= 36500:
             parser.error("--retain-days must be from 1 to 36500")
+        if args.api_key_env and not args.auth_user:
+            parser.error("--api-key-env needs --auth-user")
+        auth = None
+        if args.auth_user:
+            auth = _auth(
+                args.auth_user,
+                args.password_hash_env,
+                args.api_key_env,
+                secure_cookies=not args.insecure_cookies,
+            )
+            if auth is None:
+                return 2
         return _serve(
             args.db,
             args.host,
@@ -112,6 +162,8 @@ def main(argv: list[str] | None = None) -> int:
                 key_envs=tuple(args.judge_key_env),
                 max_daily=args.judge_max_daily,
             ),
+            auth=auth,
+            forwarded_allow_ips=args.forwarded_allow_ips,
         )
     return _demo(args.db, args.traces, args.seed)
 
@@ -126,6 +178,8 @@ def _serve(
     retain_days: int | None = None,
     memory_limit: str | None = None,
     judge_policy: JudgePolicy | None = None,
+    auth: Auth | None = None,
+    forwarded_allow_ips: str | None = None,
 ) -> int:
     import uvicorn
 
@@ -148,7 +202,7 @@ def _serve(
     allowed = [*LOOPBACK_HOSTS, *extra_hosts]
     if host not in ("0.0.0.0", "::"):
         allowed.append(host)
-    if host not in LOOPBACK_HOSTS:
+    if host not in LOOPBACK_HOSTS and auth is None:
         print(
             f"warning: binding to {host}; agentwatch has no authentication, "
             "so anyone who can reach this port can read and write traces. "
@@ -172,10 +226,14 @@ def _serve(
         retention.start()
     try:
         uvicorn.run(
-            create_app(store, allowed_hosts=allowed, judge_runner=runner),
+            create_app(store, allowed_hosts=allowed, judge_runner=runner, auth=auth),
             host=host,
             port=port,
             log_level="warning",
+            # The client address throttles failed sign-ins; behind a proxy it is the proxy's
+            # unless the proxy is trusted to name the client.
+            proxy_headers=forwarded_allow_ips is not None,
+            forwarded_allow_ips=forwarded_allow_ips,
         )
     finally:
         # Within a container's stop grace period: an in-flight judge call, monitor query or
@@ -191,6 +249,53 @@ def _serve(
             and (retention is None or not retention.running)
         ):
             store.close()
+    return 0
+
+
+def _auth(user: str, hash_env: str, key_envs: list[str], *, secure_cookies: bool) -> Auth | None:
+    """The sign-in settings from the environment, or None (having said why) if unusable.
+
+    Refusing to start is the safe failure: serving without the sign-in that was asked for
+    would expose everything.
+    """
+    encoded = os.environ.get(hash_env, "")
+    if not encoded.strip():
+        print(f"agentwatch: --auth-user needs a password hash in {hash_env}", file=sys.stderr)
+        return None
+    keys: list[str] = []
+    for name in key_envs:
+        key = os.environ.get(name, "")
+        if not key.strip():
+            print(f"agentwatch: {name} is empty", file=sys.stderr)
+            return None
+        keys.append(key)
+    try:
+        auth = Auth(user, encoded, keys, secure_cookies=secure_cookies)
+    except AuthConfigError as error:
+        print(f"agentwatch: {error}", file=sys.stderr)
+        return None
+    print(
+        f"agentwatch: signing in required (user {user}, {len(keys)} API key(s))",
+        file=sys.stderr,
+    )
+    return auth
+
+
+def _hash_password() -> int:
+    import getpass
+
+    if sys.stdin.isatty():
+        password = getpass.getpass("Password: ")
+        if getpass.getpass("Again: ") != password:
+            print("agentwatch: the passwords differ", file=sys.stderr)
+            return 1
+    else:
+        password = sys.stdin.readline().rstrip("\r\n")
+    try:
+        print(hash_password(password))
+    except ValueError as error:
+        print(f"agentwatch: {error}", file=sys.stderr)
+        return 1
     return 0
 
 

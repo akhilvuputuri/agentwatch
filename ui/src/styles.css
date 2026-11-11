@@ -75,6 +75,7 @@ code {
 }
 .top {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   gap: 10px;
   padding: 14px 0;
@@ -351,8 +352,24 @@ table.attrs {
 /* Navigation */
 .nav {
   display: flex;
-  gap: 14px;
+  flex-wrap: wrap;
+  gap: 6px 14px;
   margin-left: 8px;
+}
+.signout {
+  margin-left: auto;
+  font: inherit;
+  font-size: 13px;
+  color: var(--muted);
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.signout:hover {
+  color: var(--text);
+  background: var(--hover);
 }
 .nav a {
   color: var(--muted);
