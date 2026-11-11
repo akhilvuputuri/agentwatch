@@ -268,7 +268,7 @@ def test_a_right_password_gives_its_attempt_back() -> None:
     assert throttle.wait("192.0.2.7") == 0
 
 
-def burst(signin: auth.Auth, requests: int, *, clients: int = 1) -> list[int]:
+def burst(signin: auth.Auth, requests: int, *, clients: int = 1, first: int = 0) -> list[int]:
     """Wrong passwords sent at once, through the app, from `clients` addresses in turn."""
     app = server.create_app(Store(), allowed_hosts=("testserver",), auth=signin)
 
@@ -276,7 +276,8 @@ def burst(signin: auth.Auth, requests: int, *, clients: int = 1) -> list[int]:
         statuses: list[int] = []
 
         async def one(i: int) -> None:
-            transport = httpx2.ASGITransport(app=app, client=(f"192.0.2.{i % clients}", 1000))
+            address = f"10.0.{(first + i % clients) // 256}.{(first + i % clients) % 256}"
+            transport = httpx2.ASGITransport(app=app, client=(address, 1000))
             async with httpx2.AsyncClient(
                 transport=transport, base_url="https://testserver"
             ) as http:
@@ -300,16 +301,31 @@ def test_a_burst_from_one_address_gets_only_the_free_tries() -> None:
     assert statuses.count(429) == 20 - auth.FREE_FAILURES
 
 
-def test_a_burst_from_many_addresses_stops_at_the_account_cap_and_queue() -> None:
+def test_a_burst_beyond_the_queue_is_told_to_come_back_uncounted() -> None:
     _, signin = app()
     statuses = burst(signin, 60, clients=60)
-    # Each check waits its turn; beyond the queue's length the rest are told to come back.
-    assert statuses.count(401) <= auth.ACCOUNT_FAILURES_PER_HOUR
-    assert set(statuses) <= {401, 429, 503}
+    assert set(statuses) <= {401, 503}
+    assert statuses.count(401) <= auth.MAX_WAITING_CHECKS + 1
     assert signin.waiting_checks == 0
+    # Told to come back, not counted: the account has only the checked ones against it.
+    assert signin.throttle.wait("10.9.9.9") == 0
 
 
-def test_the_api_stays_quick_while_sign_ins_are_checked() -> None:
+def test_waves_from_new_addresses_stop_at_the_account_cap() -> None:
+    _, signin = app()
+    statuses: list[int] = []
+    for wave in range(10):
+        # Fewer than the queue holds, each from an address not seen before.
+        statuses += burst(signin, 6, clients=6, first=wave * 6)
+    assert statuses.count(401) == auth.ACCOUNT_FAILURES_PER_HOUR
+    assert statuses.count(429) == 60 - auth.ACCOUNT_FAILURES_PER_HOUR
+
+
+def test_the_api_stays_quick_while_sign_ins_are_checked(monkeypatch: pytest.MonkeyPatch) -> None:
+    # With the account cap and the queue limit out of the way, only the checks' own limiter
+    # keeps 60 waiting checks off the threads the API needs.
+    monkeypatch.setattr(auth, "ACCOUNT_FAILURES_PER_HOUR", 1000)
+    monkeypatch.setattr(auth, "MAX_WAITING_CHECKS", 1000)
     _, signin = app()
     application = server.create_app(Store(), allowed_hosts=("testserver",), auth=signin)
 
@@ -328,8 +344,7 @@ def test_the_api_stays_quick_while_sign_ins_are_checked() -> None:
 
         async with anyio.create_task_group() as group:
             # More guesses than the shared thread pool's 40, from addresses the per-address
-            # wait does not stop. The account cap, the queue limit and the checks' own
-            # limiter each keep them from holding the threads the API needs.
+            # wait does not stop.
             for i in range(60):
                 group.start_soon(guess, i)
             await anyio.sleep(0.05)

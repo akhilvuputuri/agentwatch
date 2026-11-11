@@ -651,7 +651,8 @@ OWASP's floor for PBKDF2-SHA256 is 600,000, so it was not copied.
   password." either way.
 - **Checks in turn.** One check runs at a time, on a thread of its own limiter, not the thread
   pool the API and ingest share, so a burst of guesses waits without holding the threads reads
-  and ingest need. With 8 checks already waiting, a sign-in gets 503 with `Retry-After: 5`.
+  and ingest need. With 8 checks running or waiting, a sign-in gets 503 with `Retry-After: 5`,
+  and is not counted against the limits.
 - **Sessions.** Signing in makes a 256-bit token (`secrets.token_urlsafe(32)`) and keeps only its
   SHA-256, in memory, so signing out ends the session on the server and a restart ends all of
   them. A session lasts 7 days unused and 30 days in all; at most 64 are kept, the least recently
