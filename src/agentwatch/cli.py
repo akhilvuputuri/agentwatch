@@ -104,7 +104,10 @@ def main(argv: list[str] | None = None) -> int:
         "--forwarded-allow-ips",
         default=None,
         metavar="IPS",
-        help="proxies trusted to name the client in X-Forwarded-For ('*' for any peer)",
+        help=(
+            "addresses or networks of the proxies trusted to name the client in "
+            "X-Forwarded-For, such as 172.18.0.1 (avoid '*', which believes any peer)"
+        ),
     )
     serve.add_argument(
         "--demo",
@@ -137,10 +140,22 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"--judge-endpoint: {error}")
         if args.retain_days is not None and not 1 <= args.retain_days <= 36500:
             parser.error("--retain-days must be from 1 to 36500")
-        if args.api_key_env and not args.auth_user:
-            parser.error("--api-key-env needs --auth-user")
+        # `is None`, not falsiness: an empty --auth-user (an unset variable in a Compose file)
+        # must fail as a bad name, not quietly serve without signing in.
+        if args.auth_user is None:
+            for flag, given in (
+                ("--api-key-env", bool(args.api_key_env)),
+                ("--insecure-cookies", args.insecure_cookies),
+            ):
+                if given:
+                    parser.error(f"{flag} needs --auth-user")
+            if os.environ.get(args.password_hash_env, "").strip():
+                parser.error(
+                    f"{args.password_hash_env} is set but --auth-user is not: "
+                    "pass --auth-user to require signing in, or unset it"
+                )
         auth = None
-        if args.auth_user:
+        if args.auth_user is not None:
             auth = _auth(
                 args.auth_user,
                 args.password_hash_env,

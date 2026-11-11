@@ -23,6 +23,7 @@ cookie's SameSite adds to that, it does not replace it.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import html
@@ -36,7 +37,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from urllib.parse import parse_qs
 
-from starlette.concurrency import run_in_threadpool
+import anyio
+import anyio.to_thread
 from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
@@ -47,8 +49,9 @@ log = logging.getLogger("agentwatch")
 SCRYPT_N = 2**15
 SCRYPT_R = 8
 SCRYPT_P = 3
-# Bounds on a stored hash's parameters, so a mistyped one cannot ask for gigabytes.
-MAX_SCRYPT_N = 2**17
+# Bounds on a stored hash's parameters, so a mistyped one cannot exhaust a small container:
+# scrypt needs 128 * r * N bytes.
+MAX_SCRYPT_MEMORY = 64 * 1024 * 1024
 MAX_SCRYPT_P = 16
 SALT_BYTES = 16
 KEY_BYTES = 32
@@ -65,6 +68,8 @@ PLAIN_COOKIE = "agentwatch_session"
 FREE_FAILURES = 5
 MAX_WAIT_S = 3600
 ACCOUNT_FAILURES_PER_HOUR = 30
+# Password checks waiting their turn beyond this get 503: a burst must not queue without bound.
+MAX_WAITING_CHECKS = 8
 MAX_CLIENTS = 10_000
 MAX_FORM_BYTES = 8 * 1024
 
@@ -127,9 +132,9 @@ class PasswordHash:
             raise AuthConfigError("the password hash is damaged") from error
         if (
             n < 2**14
-            or n > MAX_SCRYPT_N
             or n & (n - 1)
             or not 1 <= r <= 32
+            or 128 * r * n > MAX_SCRYPT_MEMORY
             or not 1 <= p <= MAX_SCRYPT_P
             or len(salt) < 16
             or len(key) != KEY_BYTES
@@ -212,35 +217,48 @@ class Throttle:
         self._clients: OrderedDict[str, _Client] = OrderedDict()
         self._account: list[float] = []
 
+    def _wait(self, client: str, now: float) -> int:
+        self._account = [t for t in self._account if now - t < 3600]
+        waits = [0.0]
+        found = self._clients.get(client)
+        if found is not None:
+            waits.append(found.blocked_until - now)
+        if len(self._account) >= ACCOUNT_FAILURES_PER_HOUR:
+            waits.append(3600 - (now - self._account[0]))
+        return max(0, int(max(waits) + 0.999))
+
     def wait(self, client: str) -> int:
         """Seconds this client must wait before trying again; 0 when it may try now."""
-        now = self.clock()
         with self._lock:
-            self._account = [t for t in self._account if now - t < 3600]
-            waits = [0.0]
-            found = self._clients.get(client)
-            if found is not None:
-                waits.append(found.blocked_until - now)
-            if len(self._account) >= ACCOUNT_FAILURES_PER_HOUR:
-                waits.append(3600 - (now - self._account[0]))
-            return max(0, int(max(waits) + 0.999))
+            return self._wait(client, self.clock())
 
-    def failed(self, client: str) -> None:
+    def begin(self, client: str) -> tuple[int, float | None]:
+        """Takes an attempt: `(0, ticket)` when the client may try now, `(seconds, None)` when
+        it must wait. The attempt counts as a failure, for the client and the account, from
+        this moment until `succeeded` gives it back, so attempts still being checked count
+        against the limits and a burst of them cannot slip through together."""
         now = self.clock()
         with self._lock:
+            wait = self._wait(client, now)
+            if wait:
+                return wait, None
             self._account.append(now)
             found = self._clients.pop(client, None) or _Client()
             found.failures += 1
             if found.failures >= FREE_FAILURES:
-                wait = min(MAX_WAIT_S, 60 * 2 ** (found.failures - FREE_FAILURES))
-                found.blocked_until = now + wait
+                wait_s = min(MAX_WAIT_S, 60 * 2 ** (found.failures - FREE_FAILURES))
+                found.blocked_until = now + wait_s
             self._clients[client] = found
             while len(self._clients) > MAX_CLIENTS:
                 self._clients.popitem(last=False)
+            return 0, now
 
-    def succeeded(self, client: str) -> None:
+    def succeeded(self, client: str, ticket: float) -> None:
+        """The attempt was right: clears the client's record and gives the account its try back."""
         with self._lock:
             self._clients.pop(client, None)
+            with contextlib.suppress(ValueError):
+                self._account.remove(ticket)
 
 
 class Auth:
@@ -267,8 +285,10 @@ class Auth:
         self.cookie = SECURE_COOKIE if secure_cookies else PLAIN_COOKIE
         self.sessions = Sessions(clock)
         self.throttle = Throttle(clock)
-        # One check at a time: 32 MiB each, and a queue of guesses gains nothing by running wide.
-        self._checking = threading.Lock()
+        # One check at a time, on its own thread (checking_limiter), not the pool the API and
+        # ingest share: 32 MiB each, and a queue of guesses gains nothing by running wide.
+        self._limiter: anyio.CapacityLimiter | None = None
+        self.waiting_checks = 0
         # Checked against for an unknown name, so it takes as long as a known one.
         self._decoy = PasswordHash(
             self.password.n,
@@ -285,9 +305,14 @@ class Auth:
 
     def check(self, user: str, password: str) -> bool:
         known = hmac.compare_digest(_digest(user), _digest(self.user))
-        with self._checking:
-            matched = (self.password if known else self._decoy).matches(password)
+        matched = (self.password if known else self._decoy).matches(password)
         return known and matched
+
+    async def check_in_turn(self, user: str, password: str) -> bool:
+        if self._limiter is None:
+            # Made here, inside the event loop, which anyio needs.
+            self._limiter = anyio.CapacityLimiter(1)
+        return await anyio.to_thread.run_sync(self.check, user, password, limiter=self._limiter)
 
     def requester(self, scope: Scope) -> str | None:
         """Who sent this request: the signed-in user, `api-key`, or None."""
@@ -324,7 +349,10 @@ def _cookie(headers: Headers, name: str) -> str:
 
 
 # Reachable without signing in. Everything else needs a session or an API key.
-PUBLIC = frozenset({"/login", "/api/auth/login", "/api/auth/session", "/healthz"})
+# Signing out is open too, so a stale cookie can still be cleared.
+PUBLIC = frozenset(
+    {"/login", "/api/auth/login", "/api/auth/logout", "/api/auth/session", "/healthz"}
+)
 
 
 class AuthGuard:
@@ -388,8 +416,18 @@ async def login(auth: Auth, request: Request) -> Response:
     user = (form.get("username") or [""])[0].strip()
     password = (form.get("password") or [""])[0]
     following = (form.get("next") or [""])[0]
-    if await run_in_threadpool(auth.check, user, password):
-        auth.throttle.succeeded(client)
+    if auth.waiting_checks >= MAX_WAITING_CHECKS:
+        return _page("Busy. Try again in a moment.", 503, {"retry-after": "5"})
+    wait, ticket = auth.throttle.begin(client)
+    if ticket is None:
+        return _page("Too many attempts. Try again later.", 429, {"retry-after": str(wait)})
+    auth.waiting_checks += 1
+    try:
+        matched = await auth.check_in_turn(user, password)
+    finally:
+        auth.waiting_checks -= 1
+    if matched:
+        auth.throttle.succeeded(client, ticket)
         old = _cookie(request.headers, auth.cookie)
         if old:
             auth.sessions.end(old)
@@ -403,7 +441,6 @@ async def login(auth: Auth, request: Request) -> Response:
         )
         auth.set_cookie(response, auth.sessions.create(auth.user))
         return response
-    auth.throttle.failed(client)
     # The address only; never the name or password tried.
     log.warning("sign-in failed from %s", client)
     return _page("Wrong user name or password.", 401)

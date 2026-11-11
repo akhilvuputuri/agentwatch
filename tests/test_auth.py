@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import io
 import logging
+import time
 
+import anyio
+import httpx2
 import pytest
 from starlette.testclient import TestClient
 
@@ -58,6 +61,7 @@ def test_a_password_hash_round_trips_and_keeps_out_of_env_syntax() -> None:
         "bcrypt:1:2:3:4:5",
         "scrypt:1024:8:1:" + HASH.split(":", 4)[4],  # too weak
         "scrypt:1073741824:8:1:" + HASH.split(":", 4)[4],  # too costly
+        "scrypt:131072:32:1:" + HASH.split(":", 4)[4],  # 512 MiB: each bound alone allows it
         "scrypt:32768:8:3:AAAA:" + HASH.rsplit(":", 1)[1],  # salt too short
         HASH[:-4],  # key cut short
     ],
@@ -79,8 +83,11 @@ def test_without_signing_in_only_the_sign_in_page_and_health_answer() -> None:
     page = http.get("/")
     assert page.status_code == 303
     assert page.headers["location"] == "/login"
-    for path in ("/api/traces", "/api/memory", "/api/alerts", "/assets/x.js"):
+    for path in ("/api/traces", "/api/memory", "/api/alerts", "/assets/x.js", "/login/"):
         assert http.get(path).status_code == 401, path
+    for method in ("HEAD", "OPTIONS"):
+        assert http.request(method, "/api/traces").status_code == 401, method
+    assert http.get("/index.html").status_code == 303
     assert http.post("/v1/traces", json=to_otlp_json(encode(spans()))).status_code == 401
     assert http.post("/api/scores", json={}).status_code == 401
     # Health says nothing about the data.
@@ -138,6 +145,14 @@ def test_the_sign_in_form_must_be_a_form_and_from_this_site() -> None:
     assert cross_site.status_code == 403
 
 
+def test_signing_out_clears_a_stale_cookie_too() -> None:
+    http, _ = app()
+    http.cookies.set("__Host-agentwatch", "expired-or-unknown", domain="testserver")
+    response = http.post("/api/auth/logout", json={})
+    assert response.status_code == 204
+    assert "__Host-agentwatch=" in response.headers["set-cookie"]
+
+
 def test_signing_out_ends_the_session_on_the_server() -> None:
     http, signin = app()
     token = sign_in(http).cookies["__Host-agentwatch"]
@@ -175,12 +190,16 @@ def test_sessions_end_after_a_week_unused_or_a_month_in_all() -> None:
     assert sessions.user("x" * 500) is None
 
 
-def test_old_sessions_make_way_for_new_ones() -> None:
+def test_the_least_recently_used_session_makes_way() -> None:
     sessions = auth.Sessions(Clock())
     first = sessions.create("owner")
-    for _ in range(auth.MAX_SESSIONS):
+    second = sessions.create("owner")
+    # Using the first moves it to the back of the line, so the second goes.
+    assert sessions.user(first) == "owner"
+    for _ in range(auth.MAX_SESSIONS - 1):
         sessions.create("owner")
-    assert sessions.user(first) is None
+    assert sessions.user(second) is None
+    assert sessions.user(first) == "owner"
     assert len(sessions) == auth.MAX_SESSIONS
 
 
@@ -222,21 +241,106 @@ def test_the_wait_stops_at_an_hour() -> None:
     clock = Clock()
     throttle = auth.Throttle(clock)
     for _ in range(40):
-        throttle.failed("198.51.100.1")
+        assert throttle.begin("198.51.100.1")[1] is not None
         clock.now += 3601
-    throttle.failed("198.51.100.1")
+    throttle.begin("198.51.100.1")
     assert throttle.wait("198.51.100.1") == auth.MAX_WAIT_S
 
 
-def test_the_account_takes_at_most_thirty_failures_an_hour_from_everyone() -> None:
+def test_the_throttle_counts_thirty_failures_an_hour_for_the_account() -> None:
     clock = Clock()
     throttle = auth.Throttle(clock)
     for i in range(auth.ACCOUNT_FAILURES_PER_HOUR):
-        throttle.failed(f"203.0.113.{i}")
+        assert throttle.begin(f"203.0.113.{i}")[1] is not None
         clock.now += 1
     assert throttle.wait("192.0.2.1") > 3500
+    assert throttle.begin("192.0.2.1") == (throttle.wait("192.0.2.1"), None)
     clock.now += 3600
     assert throttle.wait("192.0.2.1") == 0
+
+
+def test_a_right_password_gives_its_attempt_back() -> None:
+    throttle = auth.Throttle(Clock())
+    for _ in range(auth.ACCOUNT_FAILURES_PER_HOUR * 2):
+        _, ticket = throttle.begin("192.0.2.1")
+        assert ticket is not None
+        throttle.succeeded("192.0.2.1", ticket)
+    assert throttle.wait("192.0.2.7") == 0
+
+
+def burst(signin: auth.Auth, requests: int, *, clients: int = 1) -> list[int]:
+    """Wrong passwords sent at once, through the app, from `clients` addresses in turn."""
+    app = server.create_app(Store(), allowed_hosts=("testserver",), auth=signin)
+
+    async def run() -> list[int]:
+        statuses: list[int] = []
+
+        async def one(i: int) -> None:
+            transport = httpx2.ASGITransport(app=app, client=(f"192.0.2.{i % clients}", 1000))
+            async with httpx2.AsyncClient(
+                transport=transport, base_url="https://testserver"
+            ) as http:
+                response = await http.post(
+                    "/api/auth/login", data={"username": "owner", "password": "wrong guess!!"}
+                )
+                statuses.append(response.status_code)
+
+        async with anyio.create_task_group() as group:
+            for i in range(requests):
+                group.start_soon(one, i)
+        return statuses
+
+    return anyio.run(run)
+
+
+def test_a_burst_from_one_address_gets_only_the_free_tries() -> None:
+    _, signin = app()
+    statuses = burst(signin, 20)
+    assert statuses.count(401) == auth.FREE_FAILURES
+    assert statuses.count(429) == 20 - auth.FREE_FAILURES
+
+
+def test_a_burst_from_many_addresses_stops_at_the_account_cap_and_queue() -> None:
+    _, signin = app()
+    statuses = burst(signin, 60, clients=60)
+    # Each check waits its turn; beyond the queue's length the rest are told to come back.
+    assert statuses.count(401) <= auth.ACCOUNT_FAILURES_PER_HOUR
+    assert set(statuses) <= {401, 429, 503}
+    assert signin.waiting_checks == 0
+
+
+def test_the_api_stays_quick_while_sign_ins_are_checked() -> None:
+    _, signin = app()
+    application = server.create_app(Store(), allowed_hosts=("testserver",), auth=signin)
+
+    def client(address: str) -> httpx2.AsyncClient:
+        transport = httpx2.ASGITransport(app=application, client=(address, 1000))
+        return httpx2.AsyncClient(transport=transport, base_url="https://testserver")
+
+    async def run() -> float:
+        elapsed = float("inf")
+
+        async def guess(i: int) -> None:
+            async with client(f"198.51.100.{i}") as http:
+                await http.post(
+                    "/api/auth/login", data={"username": "owner", "password": "wrong guess!!"}
+                )
+
+        async with anyio.create_task_group() as group:
+            # More guesses than the shared thread pool's 40, from addresses the per-address
+            # wait does not stop. The account cap, the queue limit and the checks' own
+            # limiter each keep them from holding the threads the API needs.
+            for i in range(60):
+                group.start_soon(guess, i)
+            await anyio.sleep(0.05)
+            started = time.perf_counter()
+            async with client("192.0.2.200") as http:
+                response = await http.get("/api/traces", headers={"authorization": f"Bearer {KEY}"})
+            assert response.status_code == 200
+            elapsed = time.perf_counter() - started
+        return elapsed
+
+    assert anyio.run(run) < 0.5
 
 
 def test_failures_are_logged_without_what_was_tried(caplog: pytest.LogCaptureFixture) -> None:
@@ -270,11 +374,25 @@ def test_the_cli_refuses_to_serve_without_the_hash_it_was_told_to_use(
 ) -> None:
     monkeypatch.delenv("AGENTWATCH_PASSWORD_HASH", raising=False)
     assert cli.main(["serve", "--demo", "--auth-user", "owner"]) == 2
+    assert "needs a password hash" in capsys.readouterr().err
+    # An empty name, as from an unset Compose variable, fails rather than serving openly.
+    monkeypatch.setenv("AGENTWATCH_PASSWORD_HASH", HASH)
+    assert cli.main(["serve", "--demo", "--auth-user", ""]) == 2
+    assert "user name" in capsys.readouterr().err
+    # A hash without --auth-user is a forgotten flag, not a choice to serve openly.
+    with pytest.raises(SystemExit):
+        cli.main(["serve", "--demo"])
+    assert "--auth-user is not" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main(["serve", "--demo", "--insecure-cookies"])
+    monkeypatch.delenv("AGENTWATCH_PASSWORD_HASH")
+    assert cli.main(["serve", "--demo", "--auth-user", "owner"]) == 2
     assert "needs a password hash in AGENTWATCH_PASSWORD_HASH" in capsys.readouterr().err
     monkeypatch.setenv("AGENTWATCH_PASSWORD_HASH", HASH)
     monkeypatch.setenv("AW_KEY", "")
     assert cli.main(["serve", "--demo", "--auth-user", "owner", "--api-key-env", "AW_KEY"]) == 2
     assert "AW_KEY is empty" in capsys.readouterr().err
+    monkeypatch.delenv("AGENTWATCH_PASSWORD_HASH")
     with pytest.raises(SystemExit):
         cli.main(["serve", "--demo", "--api-key-env", "AW_KEY"])
 

@@ -160,13 +160,14 @@ agentwatch serve --host 0.0.0.0 --allow-host traces.example.com \
   --auth-user owner --api-key-env AGENTWATCH_API_KEY
 ```
 
-The UI then opens on a sign-in page, and everything but `/healthz` needs a session. Programs
+The UI then opens on a sign-in page, and everything but the sign-in page, signing out,
+`/api/auth/session` and `/healthz` needs a session or a key. Programs
 (an OTLP exporter, an alert relay) send `Authorization: Bearer <key>` with a key from a variable
 named by `--api-key-env`; for an OpenTelemetry SDK that is
 `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<key>`. Session cookies are `Secure`, so serve
 it over HTTPS (a reverse proxy such as Caddy) or pass `--insecure-cookies` for plain HTTP on a
-trusted network. Behind a proxy, `--forwarded-allow-ips` lets failed sign-ins be throttled per
-client rather than per proxy. Sessions are kept in memory, so a restart signs everyone out. See
+trusted network. Behind a proxy, pass `--forwarded-allow-ips` with the proxy's address, or every
+visitor shares the proxy's address and five wrong guesses from anyone make you wait too. Sessions are kept in memory, so a restart signs everyone out. See
 [the design notes](docs/design.md#signing-in).
 
 ## Memory
