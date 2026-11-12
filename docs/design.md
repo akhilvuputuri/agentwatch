@@ -703,6 +703,13 @@ OWASP's floor for PBKDF2-SHA256 is 600,000, so it was not copied.
   count. Without a session, a request for the UI page gets a 303 to `/login`, which browsers
   follow keeping the URL's `#route`; the page copies the route into the form, so signing in
   returns to it. Any other request gets 401, and the UI sends itself to the sign-in page on a 401.
+  A refused attempt (wrong password, busy, too many attempts once the form has been read) shows
+  the form again as the answer to the post, at an address with no `#route`. So the server writes
+  the posted route back into the form when it is a UI route, and the page's script replaces it
+  only from an address that has one; a mistyped password no longer lands on the trace list
+  instead of the linked trace (found on a phone, 13 November 2026). The user name typed is
+  written back too, escaped, and the password field takes the focus; the password is never
+  written back.
 - **Failing closed.** `--auth-user` without a usable hash, an empty name (as from an unset
   Compose variable) or an empty key variable stops the server at start rather than serving
   without the sign-in asked for. So does a password hash in the environment without
@@ -893,3 +900,14 @@ only as escaped JSON in an attribute table.
 
 The demo data now carries synthetic content on model calls and tool calls, generated without
 drawing random numbers so every other demo value is unchanged.
+
+### Filters live in the address
+
+Added 13 November 2026. The trace list's service and "Errors only" (`#/?service=…&errors=1`,
+beside `session` and `user`) and the dashboard's range and service
+(`#/dashboard?range=7d&service=…`; the 24-hour range is the default and is left out) are read
+from the address and changed by changing it. A link or bookmark reopens the same view, a reload
+keeps it, and Back undoes a filter. Such a change goes through `nav.ts`, as picking a span on
+the trace page does: the address changes through the History API and the router is told at
+once. The browser reports a change of `location.hash` only a moment later, and a checkbox
+driven by the address would otherwise show its old state in between.

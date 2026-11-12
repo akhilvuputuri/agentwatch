@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { links, listServices, listTraces, type TraceSummary } from "./api";
+import { links, listServices, listTraces, type TraceFilter, type TraceSummary } from "./api";
+import { navigate } from "./nav";
 import { count, duration, scoreText, share, timestamp, usd } from "./format";
 
 const PAGE = 50;
 
-export function TraceList({ session, user }: { session?: string; user?: string }) {
-  const [service, setService] = useState("");
-  const [errors, setErrors] = useState(false);
+/** The list's filters come from the address, and changing one changes the address. */
+export function TraceList({ session, user, service = "", errors = false }: TraceFilter) {
+  const show = (change: TraceFilter) => {
+    const filter: TraceFilter = { service, errors, ...change };
+    if (session) filter.session = session;
+    if (user) filter.user = user;
+    navigate(links.traces(filter));
+  };
   const [services, setServices] = useState<string[]>([]);
   const [traces, setTraces] = useState<TraceSummary[]>([]);
   const [next, setNext] = useState<string | null>(null);
@@ -68,8 +74,11 @@ export function TraceList({ session, user }: { session?: string; user?: string }
       <div className="toolbar">
         <label>
           Service{" "}
-          <select value={service} onChange={(event) => setService(event.target.value)}>
+          <select value={service} onChange={(event) => show({ service: event.target.value })}>
             <option value="">All</option>
+            {/* A service named by the address but not (or no longer) in the store: still shown as
+                the filter in force, or the list would look unfiltered and empty. */}
+            {service && !services.includes(service) && <option value={service}>{service}</option>}
             {services.map((name) => (
               <option key={name} value={name}>
                 {name || "(unnamed)"}
@@ -78,7 +87,7 @@ export function TraceList({ session, user }: { session?: string; user?: string }
           </select>
         </label>
         <label>
-          <input type="checkbox" checked={errors} onChange={(event) => setErrors(event.target.checked)} /> Errors
+          <input type="checkbox" checked={errors} onChange={(event) => show({ errors: event.target.checked })} /> Errors
           only
         </label>
         <button type="button" onClick={() => setReload((n) => n + 1)}>
@@ -87,7 +96,7 @@ export function TraceList({ session, user }: { session?: string; user?: string }
         {session && (
           <span className="chip">
             Session <a href={links.session(session)}>{session}</a>{" "}
-            <a href={links.traces(user ? { user } : {})} aria-label="Clear session filter">
+            <a href={links.traces({ service, errors, ...(user ? { user } : {}) })} aria-label="Clear session filter">
               ✕
             </a>
           </span>
@@ -95,7 +104,7 @@ export function TraceList({ session, user }: { session?: string; user?: string }
         {user && (
           <span className="chip">
             User {user}{" "}
-            <a href={links.traces(session ? { session } : {})} aria-label="Clear user filter">
+            <a href={links.traces({ service, errors, ...(session ? { session } : {}) })} aria-label="Clear user filter">
               ✕
             </a>
           </span>

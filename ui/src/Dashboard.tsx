@@ -1,20 +1,33 @@
 import { useEffect, useState } from "react";
-import { getMetrics, listServices, type Metrics, type MetricsRange } from "./api";
+import { getMetrics, links, listServices, type Metrics, type MetricsRange } from "./api";
 import { BarChart, ChartTable, LineChart } from "./charts";
+import { navigate } from "./nav";
 import { count, duration, msTick, nsToMs, period, scoreText, share, usd, usdTick } from "./format";
 
-const RANGES: { label: string; range: MetricsRange }[] = [
-  { label: "24 hours", range: { kind: "last", hours: 24 } },
-  { label: "7 days", range: { kind: "last", hours: 24 * 7 } },
-  { label: "30 days", range: { kind: "last", hours: 24 * 30 } },
-  { label: "All time", range: { kind: "all" } },
+/** `key` is what the address holds; the first range is the default and leaves it out. */
+const RANGES: { key: string; label: string; range: MetricsRange }[] = [
+  { key: "24h", label: "24 hours", range: { kind: "last", hours: 24 } },
+  { key: "7d", label: "7 days", range: { kind: "last", hours: 24 * 7 } },
+  { key: "30d", label: "30 days", range: { kind: "last", hours: 24 * 30 } },
+  { key: "all", label: "All time", range: { kind: "all" } },
 ];
 
 const DAY_NS = 24 * 3600 * 1e9;
 
-export function Dashboard() {
-  const [rangeIndex, setRangeIndex] = useState(0);
-  const [service, setService] = useState("");
+/** The range and service come from the address, and changing one changes the address. */
+export function Dashboard({ range, service = "" }: { range?: string; service?: string }) {
+  const rangeIndex = Math.max(
+    0,
+    RANGES.findIndex((option) => option.key === range),
+  );
+  const show = (index: number, name: string) => {
+    navigate(
+      links.dashboard({
+        ...(index > 0 ? { range: RANGES[index]!.key } : {}),
+        ...(name ? { service: name } : {}),
+      }),
+    );
+  };
   const [services, setServices] = useState<string[]>([]);
   const [data, setData] = useState<Metrics | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -49,7 +62,7 @@ export function Dashboard() {
               key={option.label}
               type="button"
               aria-pressed={index === rangeIndex}
-              onClick={() => setRangeIndex(index)}
+              onClick={() => show(index, service)}
             >
               {option.label}
             </button>
@@ -57,8 +70,11 @@ export function Dashboard() {
         </div>
         <label>
           Service{" "}
-          <select value={service} onChange={(event) => setService(event.target.value)}>
+          <select value={service} onChange={(event) => show(rangeIndex, event.target.value)}>
             <option value="">All</option>
+            {/* A service named by the address but not (or no longer) in the store: still shown as
+                the filter in force, or the list would look unfiltered and empty. */}
+            {service && !services.includes(service) && <option value={service}>{service}</option>}
             {services.map((name) => (
               <option key={name} value={name}>
                 {name || "(unnamed)"}

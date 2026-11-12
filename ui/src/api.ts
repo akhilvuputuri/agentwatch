@@ -430,6 +430,14 @@ export async function getSession(
 }
 
 /** Hash links to the views, with IDs encoded so any session or user string is safe. */
+/** What the trace list is narrowed to; all of it lives in the address. */
+export interface TraceFilter {
+  session?: string;
+  user?: string;
+  service?: string;
+  errors?: boolean;
+}
+
 export const links = {
   session: (id: string) => `#/session/${encodeURIComponent(id)}`,
   trace: (traceId: string, spanId?: string) => `#/trace/${traceId}${spanId ? `/${spanId}` : ""}`,
@@ -438,12 +446,21 @@ export const links = {
   run: (id: string) => `#/run/${encodeURIComponent(id)}`,
   compare: (baseline: string, candidate: string) =>
     `#/compare/${encodeURIComponent(baseline)}/${encodeURIComponent(candidate)}`,
-  traces: (filter: { session?: string; user?: string }) => {
+  traces: (filter: TraceFilter) => {
     const params = new URLSearchParams();
     if (filter.session) params.set("session", filter.session);
     if (filter.user) params.set("user", filter.user);
+    if (filter.service) params.set("service", filter.service);
+    if (filter.errors) params.set("errors", "1");
     const query = params.toString();
     return query ? `#/?${query}` : "#/";
+  },
+  dashboard: (view: { range?: string; service?: string }) => {
+    const params = new URLSearchParams();
+    if (view.range) params.set("range", view.range);
+    if (view.service) params.set("service", view.service);
+    const query = params.toString();
+    return query ? `#/dashboard?${query}` : "#/dashboard";
   },
 };
 
