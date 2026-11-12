@@ -3,7 +3,8 @@
 Local tracing for LLM agents. agentwatch receives OpenTelemetry traces over OTLP/HTTP, reads the
 [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai) off each
 span, stores everything in a local DuckDB file and shows it in a web UI: a trace list with tokens,
-cache share and cost per trace, a span waterfall for each trace, sessions (traces grouped by
+cache share and cost per trace, a page for each trace that opens on what was asked, what was replied and the first error, with
+its spans as readable steps or a waterfall, sessions (traces grouped by
 conversation) and users, scores (from an API, OTel `gen_ai.evaluation.result` events, or added by
 hand), datasets (items written by hand, through the API, or made from any trace), experiment runs
 over datasets, LLM judges that score a sample of new traces, a dashboard of cost, tokens, cache

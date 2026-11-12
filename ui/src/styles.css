@@ -14,7 +14,7 @@
   --warn-bg: #fdf1dc;
   --warn-fg: #8a5a00;
   --op-chat: #2f6fdb;
-  --op-tool: #c1781b;
+  --op-tool: #9a5c0e;
   --op-agent: #7a52c7;
   --op-other: #8a929c;
   --error: #d1453b;
@@ -337,12 +337,15 @@ table.attrs {
   vertical-align: top;
   padding: 3px 4px;
   border-bottom: 1px solid var(--line);
-  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+.attrs td {
+  white-space: pre-wrap;
 }
 .attrs th {
   font-weight: 500;
   color: var(--muted);
-  width: 45%;
+  width: 38%;
 }
 .events {
   padding-left: 18px;
@@ -729,4 +732,278 @@ a.button-link {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   max-width: 80ch;
+}
+
+/* Reading a trace: the turn summary, steps, captured content and the span panel. */
+.text-block {
+  min-width: 0;
+}
+pre.text {
+  margin: 0;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+pre.text.clamped {
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(#000 60%, transparent);
+  mask-image: linear-gradient(#000 60%, transparent);
+}
+.io pre.text,
+.call pre.text,
+.span-error pre.text {
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+button.copy {
+  flex: none;
+}
+
+.turn {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-top: 10px;
+}
+.turn-part {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.turn-part:last-child {
+  border-bottom: none;
+}
+.turn-part h3,
+.content-head h3 {
+  margin: 0 0 4px;
+}
+.turn-part p {
+  margin: 0 0 4px;
+}
+.turn-error {
+  border-left: 3px solid var(--error);
+}
+button.turn-open {
+  font-size: inherit;
+  font-weight: 600;
+  margin-right: 8px;
+  text-align: left;
+}
+.trace-scores {
+  margin-top: 10px;
+}
+.trace-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 14px;
+}
+.split.one {
+  grid-template-columns: minmax(0, 1fr);
+}
+.split > div {
+  min-width: 0;
+}
+
+.steps {
+  display: grid;
+  gap: 6px;
+}
+.step {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  min-width: 0;
+}
+.step.failed {
+  border-left: 3px solid var(--error);
+}
+.step.selected {
+  border-color: var(--accent);
+}
+.step-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  padding: 7px 10px;
+  text-align: left;
+  background: transparent;
+}
+.step-head:hover {
+  background: var(--hover);
+}
+.step.selected > .step-head {
+  background: var(--selected);
+}
+.step-head .dur {
+  flex: none;
+}
+.step-body {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--line);
+}
+.step-body p {
+  margin: 0;
+}
+.io {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  gap: 8px;
+}
+.io-label,
+.call-name,
+.msg-role {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.thinking summary,
+details.raw summary,
+details.trace-tools > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+}
+details.raw,
+.content {
+  margin-top: 12px;
+}
+.content-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+.span-error {
+  border-left: 3px solid var(--error);
+  padding-left: 10px;
+  margin-bottom: 12px;
+}
+.detail .facts {
+  margin-top: 10px;
+}
+.messages {
+  display: grid;
+  gap: 8px;
+}
+.msg {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--bg);
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.msg-user {
+  border-left: 3px solid var(--accent);
+}
+.msg-assistant {
+  border-left: 3px solid var(--op-agent);
+}
+.call {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+details.trace-tools {
+  margin-top: 16px;
+}
+details.trace-tools > summary {
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.load-error-actions {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+
+.sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: var(--bg);
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.sheet-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  padding-top: calc(8px + env(safe-area-inset-top));
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.sheet-head button {
+  min-height: 40px;
+  min-width: 40px;
+}
+.sheet-steps {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sheet .detail {
+  position: static;
+  max-height: none;
+  overflow: visible;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+
+/* Kept for screen readers where the word gives way to a dot. */
+@media (max-width: 600px) {
+  .op-word {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .op::before {
+    content: "";
+    display: block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .span-row {
+    grid-template-columns: minmax(0, 1fr) 56px 62px;
+    padding: 10px;
+  }
+  .step-head {
+    min-height: 42px;
+    flex-wrap: wrap;
+  }
+  .io {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+  .trace-bar .segmented button {
+    min-height: 36px;
+    padding: 4px 14px;
+  }
+  .text-block > button.link,
+  .messages > button.link,
+  button.copy {
+    padding: 8px 0;
+  }
 }

@@ -831,3 +831,65 @@ Hash-routed (`#/`, `#/trace/<id>`, `#/trace/<id>/<span>` with that span selected
 orders spans depth-first by start time, puts the true root first and shows spans whose parent
 never arrived as extra roots marked "parent missing", and keeps spans caught in a parent cycle instead of dropping them.
 Offsets are computed with `BigInt` to keep nanosecond precision.
+
+### Reading a trace
+
+Added 13 November 2026, after an audit of the screens on a phone: opening an alert's trace and
+finding what went wrong took one tap and four long scrolls, and what the user had asked appeared
+only as escaped JSON in an attribute table.
+
+- **Turn summary.** The trace page opens with what was asked, what was replied and the first
+  error.
+  - *Asked* is the last user message of the root span's captured input (`gen_ai.input.messages`,
+    then `input.value`), else of the earliest span whose input is a list of messages. Plain text
+    counts as the request only on the root: on another span it may be a search query.
+  - *Replied* is read from the root's captured output, else the latest span's. Agents often end
+    a turn by calling a tool, so when the output ends in a tool call with an argument named
+    `reply`, `answer`, `response` or `message`, that argument is the reply and the heading names
+    the tool; text beside it is the model's preamble. The list of names is short on purpose:
+    `content`, `text` and `output` are as often a file's body or a command's input. An output
+    that ends by calling some other tool is not a reply, whatever text came before the call: the
+    summary says none was captured and names the tool, which is where the turn stopped.
+    Otherwise the reply is the output's text.
+  - *First error* is the earliest failed span with no failed span anywhere below it. A failed
+    span above another only reports it, however many spans that succeeded lie between. (Failed
+    spans that only explain each other, in a parent cycle, give the earliest of them.) It shows
+    the span's status message and exception, then what it returned, because a failed tool's
+    result usually holds the reason. When the root did not fail, the heading adds "the turn went
+    on": a retry that then succeeded, for example.
+- **What is selected.** The span in the address when the trace has it; else the first error;
+  else the root.
+- **Steps and Timeline.** Timeline is the waterfall. Steps lists the same spans in the same order
+  as things that happened: each model call's text (thinking folded away) and the names of the
+  tools it called, each tool's input and output, everything else as one line. A model call's input
+  is not repeated in Steps, since it is mostly the history above it; it is in the span's detail.
+  Steps is the default at 900 px and narrower, Timeline above; the choice is kept in
+  `localStorage`, a per-browser convenience that nothing else depends on.
+- **Captured content** is shown as messages (role, text, tool calls and results) when it is a
+  list of them in the GenAI parts shape or the chat-completions shape, and otherwise as text with
+  JSON indented. JSON text holding a number of 16 digits or more is left as written, since
+  JavaScript would change it on parsing; a number that long inside a message list that is itself
+  one JSON text is already rounded when read, which only a lossless parser would avoid. Line
+  breaks are kept. Long text is cut to a few lines with "Show all", and a long
+  history shows its last four messages first; nothing is dropped, only folded. Each Input, Output
+  and Error has a Copy button. The raw attribute table is still there, folded when the span has
+  content sections.
+- **On a narrow screen a span opens over the page** as a full-screen panel, exactly when the
+  address names one of the trace's spans. The address and the view never disagree: picking a
+  span changes the address through the History API and the router is told at once, so a resize,
+  a reload or Back finds them matching. Tapping a span adds a history entry marked as added by
+  a tap, so the browser's Back closes it. Previous and next replace the entry and keep the mark.
+  Closing goes back over a marked entry (also after a reload, since history state survives one)
+  and otherwise replaces the address with the trace's, so the trace has one entry either way.
+  Escape closes it, and the focus returns to the span's row. Focus is not trapped inside the
+  panel. On a wide screen, picking a span replaces the address without adding history: Back
+  leaves the trace.
+- **Operation words become dots** at 600 px and narrower, so a row has room for the tool's name;
+  the word stays in the markup for screen readers.
+- A trace that cannot be loaded says why in words (not here yet or past retention, or agentwatch
+  unreachable) and offers another try.
+- Scores show as badges under the summary. The form to add one and "Add to dataset" are in a
+  section below the spans, open on a wide screen and folded on a narrow one.
+
+The demo data now carries synthetic content on model calls and tool calls, generated without
+drawing random numbers so every other demo value is unchanged.
