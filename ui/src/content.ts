@@ -46,6 +46,15 @@ export function pretty(value: unknown): string {
   return typeof data === "string" ? data : JSON.stringify(data, null, 2);
 }
 
+/**
+ * `parsed`, except that JSON text holding a long number stays text, so it is shown and copied
+ * as written. (A long number in a message list that was itself one JSON text is already rounded
+ * by the time its parts are read; only a lossless parser would keep it.)
+ */
+function exact(value: unknown): unknown {
+  return typeof value === "string" && LONG_NUMBER.test(value) ? value : parsed(value);
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
@@ -60,10 +69,10 @@ function part(raw: unknown): Part | null {
   if (kind === "reasoning" || kind === "thinking") return text === null ? null : { type: "reasoning", text };
   const id = typeof p.id === "string" ? p.id : null;
   if (kind === "tool_call") {
-    return { type: "tool_call", id, name: typeof p.name === "string" ? p.name : "tool", arguments: parsed(p.arguments) };
+    return { type: "tool_call", id, name: typeof p.name === "string" ? p.name : "tool", arguments: exact(p.arguments) };
   }
   if (kind === "tool_call_response") {
-    return { type: "tool_result", id, result: parsed(p.response ?? p.result ?? p.content) };
+    return { type: "tool_result", id, result: exact(p.response ?? p.result ?? p.content) };
   }
   return { type: "other", kind: kind || "part" };
 }
@@ -99,7 +108,7 @@ function message(raw: unknown): Message | null {
         type: "tool_call",
         id: typeof call.id === "string" ? call.id : null,
         name: typeof fn.name === "string" ? fn.name : "tool",
-        arguments: parsed(fn.arguments),
+        arguments: exact(fn.arguments),
       });
     }
   }
@@ -179,8 +188,8 @@ export interface Reply {
 /**
  * The reply in a captured output. When the output ends in a tool call with a SPOKEN argument,
  * that argument: it is what the user received, and any text beside it is the model's preamble.
- * Otherwise the output's text. An output that only calls some other tool holds no reply: the
- * turn stopped before answering (see `lastCalled`).
+ * An output that ends by calling some other tool holds no reply, whatever text came before the
+ * call: the turn stopped before answering (see `lastCalled`). Otherwise the output's text.
  */
 export function reply(value: unknown): Reply | null {
   if (value === null || value === undefined) return null;
@@ -192,11 +201,13 @@ export function reply(value: unknown): Reply | null {
   const parts = found.flatMap((m) => m.parts);
   const last = parts[parts.length - 1];
   if (last?.type === "tool_call") {
-    const args = record(last.arguments);
+    const args = record(parsed(last.arguments));
     for (const name of SPOKEN) {
       const spoken = args?.[name];
       if (typeof spoken === "string" && spoken.trim()) return { text: spoken.trim(), via: last.name };
     }
+    // Text before a call to some other tool is the model saying what it is about to do.
+    return null;
   }
   const text = texts(found);
   return text ? { text, via: null } : null;
@@ -253,7 +264,9 @@ export function errorOrigins(spans: SpanRecord[]): SpanRecord[] {
       above = above.parent_span_id === null ? undefined : byId.get(above.parent_span_id);
     }
   }
-  return failed.filter((span) => !explained.has(span.span_id)).sort(byStart);
+  const origins = failed.filter((span) => !explained.has(span.span_id)).sort(byStart);
+  // Failed spans that only explain each other (a parent cycle) still failed: the earliest.
+  return origins.length > 0 ? origins : failed.sort(byStart).slice(0, 1);
 }
 
 /** What a turn was, read from its spans. `root` is the span the trace list names the trace by. */

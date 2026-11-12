@@ -80,6 +80,14 @@ describe("parsed and pretty", () => {
     expect(JSON.stringify(JSON.parse(text))).not.toBe(text); // the reason for the rule
     expect(pretty(text)).toBe(text);
     expect(pretty('{"id":123456789012345}')).toBe('{\n  "id": 123456789012345\n}');
+    // The same for a tool call's arguments and a tool result held as text inside a message.
+    const kept = messages([
+      { role: "assistant", parts: [{ type: "tool_call", name: "send", arguments: '{"chat":12345678901234567890}' }] },
+      { role: "tool", parts: [{ type: "tool_call_response", response: '{"id":98765432109876543210}' }] },
+    ]);
+    expect(kept?.[0]?.parts[0]).toMatchObject({ arguments: '{"chat":12345678901234567890}' });
+    expect(kept?.[1]?.parts[0]).toMatchObject({ result: '{"id":98765432109876543210}' });
+    expect(plainText(kept)).toContain("12345678901234567890");
   });
 });
 
@@ -157,11 +165,10 @@ describe("reply", () => {
     expect(reply(says(call("write_file", { path: "a.txt", content: "the file body" })))).toBeNull();
     expect(reply(says(call("run", { text: "ls", output: "x" })))).toBeNull();
     expect(reply(says(call("finish_turn", { reply: "  " })))).toBeNull();
-    // Text said before calling some other tool is still the latest thing said.
-    expect(reply(says({ type: "text", content: "Checking." }, call("get_weather", { city: "Paris" })))).toEqual({
-      text: "Checking.",
-      via: null,
-    });
+    // Text before a call to some other tool is the model's preamble, not a reply.
+    expect(reply(says({ type: "text", content: "I'll check the weather." }, call("get_weather", { city: "Paris" })))).toBeNull();
+    // A call followed by text ends in text, which is the latest thing said.
+    expect(reply(says(call("get_weather", { city: "Paris" }), { type: "text", content: "Sunny." }))).toEqual({ text: "Sunny.", via: null });
     expect(lastCalled(says(call("a", {}), call("get_weather", {})))).toBe("get_weather");
     expect(lastCalled([text("assistant", "done")])).toBeNull();
     expect(lastCalled("plain")).toBeNull();
@@ -227,7 +234,8 @@ describe("summarise", () => {
     const b = span({ parent_span_id: a.span_id, status_code: 2 });
     a.parent_span_id = b.span_id;
     expect(errorOrigins([orphan]).map((each) => each.span_id)).toEqual([orphan.span_id]);
-    expect(errorOrigins([a, b])).toEqual([]);
+    // Spans that only explain each other still failed: the earliest of them.
+    expect(errorOrigins([b, a]).map((each) => each.span_id)).toEqual([a.span_id]);
   });
 
   it("says where a turn that never replied stopped, and that a recovered failure went on", () => {

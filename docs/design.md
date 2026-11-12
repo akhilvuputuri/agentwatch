@@ -846,13 +846,14 @@ only as escaped JSON in an attribute table.
   - *Replied* is read from the root's captured output, else the latest span's. Agents often end
     a turn by calling a tool, so when the output ends in a tool call with an argument named
     `reply`, `answer`, `response` or `message`, that argument is the reply and the heading names
-    the tool; text beside it is the model's preamble. Otherwise it is the output's text. The
-    list of names is short on purpose: `content`, `text` and `output` are as often a file's body
-    or a command's input. An output that only calls some other tool is not a reply: the summary
-    says none was captured and names the tool the last model output called, which is where the
-    turn stopped.
+    the tool; text beside it is the model's preamble. The list of names is short on purpose:
+    `content`, `text` and `output` are as often a file's body or a command's input. An output
+    that ends by calling some other tool is not a reply, whatever text came before the call: the
+    summary says none was captured and names the tool, which is where the turn stopped.
+    Otherwise the reply is the output's text.
   - *First error* is the earliest failed span with no failed span anywhere below it. A failed
-    span above another only reports it, however many spans that succeeded lie between. It shows
+    span above another only reports it, however many spans that succeeded lie between. (Failed
+    spans that only explain each other, in a parent cycle, give the earliest of them.) It shows
     the span's status message and exception, then what it returned, because a failed tool's
     result usually holds the reason. When the root did not fail, the heading adds "the turn went
     on": a retry that then succeeded, for example.
@@ -866,8 +867,10 @@ only as escaped JSON in an attribute table.
   `localStorage`, a per-browser convenience that nothing else depends on.
 - **Captured content** is shown as messages (role, text, tool calls and results) when it is a
   list of them in the GenAI parts shape or the chat-completions shape, and otherwise as text with
-  JSON indented (left as written when it holds a number of 16 digits or more, which JavaScript
-  would change on parsing). Line breaks are kept. Long text is cut to a few lines with "Show all", and a long
+  JSON indented. JSON text holding a number of 16 digits or more is left as written, since
+  JavaScript would change it on parsing; a number that long inside a message list that is itself
+  one JSON text is already rounded when read, which only a lossless parser would avoid. Line
+  breaks are kept. Long text is cut to a few lines with "Show all", and a long
   history shows its last four messages first; nothing is dropped, only folded. Each Input, Output
   and Error has a Copy button. The raw attribute table is still there, folded when the span has
   content sections.

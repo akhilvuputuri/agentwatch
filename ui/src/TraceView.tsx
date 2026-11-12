@@ -106,6 +106,18 @@ export function TraceView({ traceId, spanId }: { traceId: string; spanId?: strin
     };
   }, [sheetSpan]);
 
+  // Escape closes the panel wherever the focus is, including on the page after a tap on text.
+  useEffect(() => {
+    if (sheetSpan === null) return;
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (wasOpenedHere()) window.history.back();
+      else go(links.trace(traceId), "replace", null);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [sheetSpan, traceId]);
+
   if (error) return <LoadError reason={error} onRetry={() => setAttempt((n) => n + 1)} />;
   if (!detail || !spans) return <p className="muted">Loading…</p>;
 
@@ -220,9 +232,6 @@ export function TraceView({ traceId, spanId }: { traceId: string; spanId?: strin
           role="dialog"
           aria-modal="true"
           aria-label={`Span ${displayName(named.span)}`}
-          onKeyDown={(event) => {
-            if (event.key === "Escape") close();
-          }}
         >
           <div className="sheet-head">
             <button type="button" onClick={close} autoFocus>

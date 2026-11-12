@@ -155,6 +155,7 @@ test.describe("on a phone", () => {
     await expect(sheet).toHaveCount(0);
     await expect(step.getByRole("button").first()).toBeFocused();
     await step.getByRole("button").first().click();
+    await sheet.getByRole("heading", { level: 2 }).click(); // the focus leaves the panel's controls
     await page.keyboard.press("Escape");
     await expect(sheet).toHaveCount(0);
     await expect(page).toHaveURL(new RegExp(`#/trace/${traceId}$`));
