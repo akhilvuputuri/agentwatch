@@ -400,6 +400,7 @@ async def login(auth: Auth, request: Request) -> Response:
     client = client_address(request)
     wait = auth.throttle.wait(client)
     if wait:
+        # Refused before the form is read, so there is nothing to keep.
         return _page("Too many attempts. Try again later.", 429, {"retry-after": str(wait)})
     media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if media != "application/x-www-form-urlencoded":
@@ -417,10 +418,22 @@ async def login(auth: Auth, request: Request) -> Response:
     password = (form.get("password") or [""])[0]
     following = (form.get("next") or [""])[0]
     if auth.waiting_checks >= MAX_WAITING_CHECKS:
-        return _page("Busy. Try again in a moment.", 503, {"retry-after": "5"})
+        return _page(
+            "Busy. Try again in a moment.",
+            503,
+            {"retry-after": "5"},
+            following=following,
+            user=user,
+        )
     wait, ticket = auth.throttle.begin(client)
     if ticket is None:
-        return _page("Too many attempts. Try again later.", 429, {"retry-after": str(wait)})
+        return _page(
+            "Too many attempts. Try again later.",
+            429,
+            {"retry-after": str(wait)},
+            following=following,
+            user=user,
+        )
     auth.waiting_checks += 1
     try:
         matched = await auth.check_in_turn(user, password)
@@ -443,7 +456,7 @@ async def login(auth: Auth, request: Request) -> Response:
         return response
     # The address only; never the name or password tried.
     log.warning("sign-in failed from %s", client)
-    return _page("Wrong user name or password.", 401)
+    return _page("Wrong user name or password.", 401, following=following, user=user)
 
 
 async def logout(auth: Auth, request: Request) -> Response:
@@ -468,8 +481,9 @@ def session_json(auth: Auth | None, request: Request) -> Response:
 
 
 # Copies the page's #route into the form, so signing in returns to it. Optional: without
-# script the form still works and lands on the trace list.
-_SCRIPT = 'document.getElementById("next").value=location.hash.startsWith("#/")?location.hash:"";'
+# script the form still works and lands on the trace list. After a failed attempt the page is
+# the form post's answer and has no #route, so the one the server wrote back is left alone.
+_SCRIPT = 'if(location.hash.startsWith("#/"))document.getElementById("next").value=location.hash;'
 _SCRIPT_HASH = base64.b64encode(hashlib.sha256(_SCRIPT.encode()).digest()).decode()
 _STYLE = """
 :root{color-scheme:light dark;--bg:#fbfbfa;--panel:#fff;--ink:#1d2125;--muted:#69707a;
@@ -488,8 +502,19 @@ cursor:pointer}p{margin:0;color:var(--bad);font-size:14px}
 """
 
 
-def _page(error: str = "", status: int = 200, headers: dict[str, str] | None = None) -> Response:
+def _page(
+    error: str = "",
+    status: int = 200,
+    headers: dict[str, str] | None = None,
+    *,
+    following: str = "",
+    user: str = "",
+) -> Response:
+    """The sign-in form. After a refused attempt it keeps where signing in was going
+    (`following`, only when it is a UI route) and the user name typed, never the password."""
     message = f'<p role="alert">{html.escape(error)}</p>' if error else ""
+    route = html.escape(following) if NEXT_ROUTE.fullmatch(following) else ""
+    name = html.escape(user[:64])
     body = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -497,10 +522,10 @@ def _page(error: str = "", status: int = 200, headers: dict[str, str] | None = N
 <body><form method="post" action="/api/auth/login">
 <h1>agentwatch</h1>{message}
 <label>User name<input name="username" autocomplete="username" autocapitalize="none"
- spellcheck="false" required maxlength="64" autofocus></label>
+ spellcheck="false" required maxlength="64" value="{name}"{"" if name else " autofocus"}></label>
 <label>Password<input name="password" type="password" autocomplete="current-password"
- required maxlength="{MAX_PASSWORD}"></label>
-<input type="hidden" name="next" id="next">
+ required maxlength="{MAX_PASSWORD}"{" autofocus" if name else ""}></label>
+<input type="hidden" name="next" id="next" value="{route}">
 <button type="submit">Sign in</button>
 </form><script>{_SCRIPT}</script></body></html>"""
     return HTMLResponse(

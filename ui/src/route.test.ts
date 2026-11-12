@@ -31,6 +31,19 @@ describe("route", () => {
     expect(route(links.traces({ session: odd, user: "u&1" }))).toEqual({ page: "traces", session: odd, user: "u&1" });
     expect(route(links.traces({}))).toEqual({ page: "traces" });
   });
+  it("keeps the trace list's and the dashboard's filters in the address", () => {
+    expect(links.traces({ service: "", errors: false })).toBe("#/");
+    expect(route(links.traces({ service: "a b&c", errors: true, user: "u" }))).toEqual({
+      page: "traces",
+      service: "a b&c",
+      errors: true,
+      user: "u",
+    });
+    expect(route("#/?errors=yes")).toEqual({ page: "traces" });
+    expect(links.dashboard({})).toBe("#/dashboard");
+    expect(route(links.dashboard({ range: "7d", service: "a/b ?" }))).toEqual({ page: "dashboard", range: "7d", service: "a/b ?" });
+    expect(route("#/dashboard?range=")).toEqual({ page: "dashboard" });
+  });
   it("falls back on malformed encodings", () => {
     expect(route("#/session/%E0%A4%A")).toEqual({ page: "sessions" });
   });

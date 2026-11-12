@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { Alerts } from "./Alerts";
-import { getAuthSession, signOut } from "./api";
+import { getAuthSession, signOut, type TraceFilter } from "./api";
 import { CompareView } from "./Compare";
 import { Dashboard } from "./Dashboard";
 import { DatasetList, DatasetView } from "./Datasets";
 import { Drift } from "./Drift";
 import { Judges } from "./Judges";
 import { MemoryItemView, MemoryList } from "./Memory";
+import { onNavigate } from "./nav";
 import { Prices } from "./Prices";
 import { RunView } from "./Runs";
 import { SessionList, SessionView } from "./Sessions";
@@ -14,8 +15,8 @@ import { TraceList } from "./TraceList";
 import { TraceView } from "./TraceView";
 
 export type Route =
-  | { page: "traces"; session?: string; user?: string }
-  | { page: "dashboard" }
+  | ({ page: "traces" } & TraceFilter)
+  | { page: "dashboard"; range?: string; service?: string }
   | { page: "prices" }
   | { page: "judges" }
   | { page: "alerts" }
@@ -31,7 +32,16 @@ export type Route =
   | { page: "trace"; traceId: string; spanId?: string };
 
 export function route(hash: string): Route {
-  if (hash === "#/dashboard") return { page: "dashboard" };
+  const dashboard = /^#\/dashboard(?:\?(.*))?$/.exec(hash);
+  if (dashboard) {
+    const params = new URLSearchParams(dashboard[1] ?? "");
+    const view: { page: "dashboard"; range?: string; service?: string } = { page: "dashboard" };
+    const range = params.get("range");
+    const service = params.get("service");
+    if (range) view.range = range;
+    if (service) view.service = service;
+    return view;
+  }
   if (hash === "#/sessions") return { page: "sessions" };
   if (hash === "#/prices") return { page: "prices" };
   if (hash === "#/judges") return { page: "judges" };
@@ -90,11 +100,14 @@ export function route(hash: string): Route {
   const query = /^#\/\?(.*)$/.exec(hash);
   if (query) {
     const params = new URLSearchParams(query[1]);
-    const filter: { page: "traces"; session?: string; user?: string } = { page: "traces" };
+    const filter: { page: "traces" } & TraceFilter = { page: "traces" };
     const s = params.get("session");
     const u = params.get("user");
+    const service = params.get("service");
     if (s) filter.session = s;
     if (u) filter.user = u;
+    if (service) filter.service = service;
+    if (params.get("errors") === "1") filter.errors = true;
     return filter;
   }
   return { page: "traces" };
@@ -105,7 +118,11 @@ export function App() {
   useEffect(() => {
     const onChange = () => setCurrent(route(window.location.hash));
     window.addEventListener("hashchange", onChange);
-    return () => window.removeEventListener("hashchange", onChange);
+    const stop = onNavigate(onChange);
+    return () => {
+      window.removeEventListener("hashchange", onChange);
+      stop();
+    };
   }, []);
   const [user, setUser] = useState<string | null>(null);
   useEffect(() => {
@@ -171,7 +188,10 @@ export function App() {
       </header>
       <main>
         {current.page === "dashboard" ? (
-          <Dashboard />
+          <Dashboard
+            {...(current.range ? { range: current.range } : {})}
+            {...(current.service ? { service: current.service } : {})}
+          />
         ) : current.page === "prices" ? (
           <Prices />
         ) : current.page === "judges" ? (
@@ -203,6 +223,8 @@ export function App() {
             key={`${current.session ?? ""}|${current.user ?? ""}`}
             {...(current.session ? { session: current.session } : {})}
             {...(current.user ? { user: current.user } : {})}
+            {...(current.service ? { service: current.service } : {})}
+            {...(current.errors ? { errors: true } : {})}
           />
         )}
       </main>

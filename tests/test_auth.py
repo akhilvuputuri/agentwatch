@@ -122,6 +122,47 @@ def test_signing_in_returns_to_the_route_and_ignores_other_destinations() -> Non
         assert sign_in(http, next=elsewhere).headers["location"] == "/", elsewhere
 
 
+def test_a_refused_sign_in_keeps_the_route_and_the_name_but_never_the_password() -> None:
+    http, _ = app()
+    route = "#/trace/" + "a" * 32
+    wrong = http.post(
+        "/api/auth/login",
+        data={"username": "owner", "password": "not the password at all", "next": route},
+    )
+    assert wrong.status_code == 401
+    # The route is written back, so the next attempt from this page still returns to it;
+    # the page's script only overrides it from an address that has a route of its own.
+    assert f'name="next" id="next" value="{route}"' in wrong.text
+    assert 'value="owner"' in wrong.text
+    assert "not the password at all" not in wrong.text
+    assert 'if(location.hash.startsWith("#/"))' in wrong.text
+    assert sign_in(http, next=route).headers["location"] == "/" + route
+
+    # Anything that is not a UI route is dropped, and what is written back is escaped.
+    for elsewhere in ("//evil.example", '#/x"><script>alert(1)</script>', "https://evil.example"):
+        page = http.post(
+            "/api/auth/login",
+            data={"username": '"><b>x', "password": "not the password at all", "next": elsewhere},
+        ).text
+        assert 'name="next" id="next" value=""' in page, elsewhere
+        assert "<script>alert" not in page
+        assert "<b>x" not in page
+        assert 'value="&quot;&gt;&lt;b&gt;x"' in page
+    quoted = http.post(
+        "/api/auth/login",
+        data={
+            "username": "owner",
+            "password": "not the password at all",
+            "next": "#/?user=a'b&x=1",
+        },
+    ).text
+    assert 'value="#/?user=a&#x27;b&amp;x=1"' in quoted
+    # The first page has neither.
+    first = http.get("/login").text
+    assert 'name="next" id="next" value=""' in first
+    assert 'value="owner"' not in first
+
+
 def test_a_wrong_password_or_name_gets_one_answer() -> None:
     http, _ = app()
     wrong = sign_in(http, "not the password at all")

@@ -5,6 +5,11 @@ test("dashboard shows figures, charts and breakdowns for the demo data", async (
   await page.getByRole("button", { name: "All time" }).click();
   const tiles = page.getByTestId("tile");
   await expect(tiles).toHaveCount(8);
+  // The range is in the address, so the same view reopens.
+  await expect(page).toHaveURL(/#\/dashboard\?range=all$/);
+  await page.reload();
+  await expect(page.getByRole("button", { name: "All time" })).toHaveAttribute("aria-pressed", "true");
+  await expect(tiles).toHaveCount(8);
   await expect(tiles.filter({ has: page.getByText("Model calls", { exact: true }) })).toContainText(/\d+/);
   await expect(page.getByRole("img", { name: "Cost per time bucket" })).toBeVisible();
   await expect(page.getByRole("img", { name: /Model call latency/ })).toBeVisible();

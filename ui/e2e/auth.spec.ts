@@ -29,7 +29,13 @@ test("signs in, returns to the linked trace, and signs out", async ({ page, requ
 
   await page.goto(`${SIGNED}/${link}`);
   await expect(page).toHaveURL(new RegExp(`/login${link}$`));
+  // A mistyped password first: the form comes back with the name kept, and still knows the trace.
   await page.getByLabel("User name").fill("owner");
+  await page.getByLabel("Password").fill("a slip of the thumb");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("alert")).toHaveText("Wrong user name or password.");
+  await expect(page.getByLabel("User name")).toHaveValue("owner");
+  await expect(page.getByLabel("Password")).toBeFocused();
   await page.getByLabel("Password").fill(OWNER_PASSWORD);
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page).toHaveURL(new RegExp(`/${link}$`));
