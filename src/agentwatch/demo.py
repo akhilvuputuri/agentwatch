@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from agentwatch import datasets, experiments, genai, scores
@@ -266,6 +266,8 @@ def _turn(rng: random.Random, ids: _Ids, trace_id: str, start: int) -> list[Span
                 tool, clock = _tool_call(rng, ids, trace_id, root, clock)
                 spans.append(tool)
     end = clock + rng.randrange(1, 15) * 1_000_000
+    question, answer = rng.choice(_REQUESTS)
+    spans = _with_content(spans, root, question, answer)
     spans.insert(
         0,
         Span(
@@ -283,7 +285,7 @@ def _turn(rng: random.Random, ids: _Ids, trace_id: str, start: int) -> list[Span
                 genai.AGENT_NAME: "assistant",
                 genai.CONVERSATION_ID: f"demo-{conversation}",
                 genai.USER_ID: f"user-{conversation % 3 + 1}",
-                **_messages(rng, failed),
+                **_messages(question, answer, failed),
             },
             resource=_resource(),
             scope_name="agentwatch.demo",
@@ -494,9 +496,8 @@ _REQUESTS = (
 )
 
 
-def _messages(rng: random.Random, failed: bool) -> Attributes:
+def _messages(question: str, answer: str, failed: bool) -> Attributes:
     """Synthetic captured messages, in the GenAI conventions' opt-in message format."""
-    question, answer = rng.choice(_REQUESTS)
     captured: Attributes = {
         "gen_ai.input.messages": json.dumps(
             [{"role": "user", "parts": [{"type": "text", "content": question}]}]
@@ -507,6 +508,108 @@ def _messages(rng: random.Random, failed: bool) -> Attributes:
             [{"role": "assistant", "parts": [{"type": "text", "content": answer}]}]
         )
     return captured
+
+
+# Synthetic arguments and results for each demo tool.
+_TOOL_CONTENT: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
+    "search_notes": (
+        {"query": "garden project"},
+        {
+            "notes": [
+                {"title": "Garden plan", "updated": "last week"},
+                {"title": "Seed order", "updated": "last month"},
+                {"title": "Watering rota", "updated": "in spring"},
+            ]
+        },
+    ),
+    "read_calendar": (
+        {"day": "tomorrow"},
+        {
+            "events": [
+                {"at": "10:00", "title": "Design review"},
+                {"at": "15:30", "title": "Dentist"},
+            ]
+        },
+    ),
+    "web_search": (
+        {"query": "solar panel payback period"},
+        {"results": [{"title": "Panel types compared", "url": "https://example.com/panels"}]},
+    ),
+    "fetch_page": (
+        {"url": "https://example.com/panels"},
+        {
+            "status": 200,
+            "text": "Monocrystalline panels cost more and pay back sooner.\n\nSee the table.",
+        },
+    ),
+    "create_reminder": (
+        {"text": "Call the bank", "at": "Friday 09:00"},
+        {"created": True, "id": "reminder-demo"},
+    ),
+}
+_SYSTEM = "You are a demo assistant. Use the tools to answer, and say so when one fails."
+
+
+def _with_content(spans: list[Span], root: str, question: str, answer: str) -> list[Span]:
+    """The turn's spans with synthetic captured content: what each model call was sent and
+    said (text, or the tool calls that follow it), and each tool's arguments and result.
+
+    Draws no random numbers, so the rest of the demo data is as it was without content.
+    """
+
+    def text(role: str, content: str) -> dict[str, Any]:
+        return {"role": role, "parts": [{"type": "text", "content": content}]}
+
+    found: list[Span] = []
+    for index, span in enumerate(spans):
+        operation = span.attributes.get(genai.OPERATION)
+        extra: Attributes = {}
+        if operation == "execute_tool":
+            arguments, result = _TOOL_CONTENT[str(span.attributes[genai.TOOL_NAME])]
+            if span.status_code == STATUS_ERROR:
+                result = {"error": "The demo service did not answer in time."}
+            extra = {
+                "gen_ai.tool.call.arguments": json.dumps(arguments),
+                "gen_ai.tool.call.result": json.dumps(result),
+            }
+        elif operation == "chat":
+            extra["gen_ai.input.messages"] = json.dumps(
+                [text("system", _SYSTEM), text("user", question)]
+            )
+            if span.status_code != STATUS_ERROR:
+                calls: list[dict[str, Any]] = []
+                for later in spans[index + 1 :]:
+                    if later.parent_span_id != span.parent_span_id:
+                        continue
+                    following = later.attributes.get(genai.OPERATION)
+                    if following == "chat":
+                        break
+                    if following == "execute_tool":
+                        name = str(later.attributes[genai.TOOL_NAME])
+                        calls.append(
+                            {
+                                "type": "tool_call",
+                                "id": later.attributes[genai.TOOL_CALL_ID],
+                                "name": name,
+                                "arguments": _TOOL_CONTENT[name][0],
+                            }
+                        )
+                    elif following == "invoke_agent":
+                        calls.append(
+                            {
+                                "type": "tool_call",
+                                "id": f"call_{later.span_id}",
+                                "name": "ask_researcher",
+                                "arguments": {"question": question},
+                            }
+                        )
+                said = answer if span.parent_span_id == root else "Here is what I found."
+                parts = calls or [{"type": "text", "content": said}]
+                extra["gen_ai.output.messages"] = json.dumps(
+                    [{"role": "assistant", "parts": parts}]
+                )
+        found.append(replace(span, attributes={**span.attributes, **extra}) if extra else span)
+    return found
 
 
 def seed_datasets(store: Store) -> None:

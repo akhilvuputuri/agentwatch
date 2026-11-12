@@ -18,7 +18,8 @@ test("lists demo traces and opens a span tree", async ({ page }) => {
   await chat.click();
   const detail = page.getByTestId("span-detail");
   await expect(detail).toContainText("Input tokens");
-  await expect(detail).toContainText("gen_ai.request.model");
+  await detail.getByText(/^Attributes \(\d+\)$/).click();
+  await expect(detail.getByRole("rowheader", { name: "gen_ai.request.model" })).toBeVisible();
 
   await page.getByRole("link", { name: "← All traces" }).click();
   await expect(rows.first()).toBeVisible();
