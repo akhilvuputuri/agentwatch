@@ -370,11 +370,13 @@ def test_migration_from_schema_10(tmp_path: Path) -> None:
     conn = duckdb.connect(str(path))
     conn.execute("DROP TABLE memory_records")
     conn.execute("DROP TABLE memory_deleted")
+    for column in ("detail", "examples"):
+        conn.execute(f"ALTER TABLE alerts DROP COLUMN {column}")
     conn.execute("DELETE FROM meta WHERE key = 'memory_derivation'")
     conn.execute("UPDATE meta SET value = '10' WHERE key = 'schema'")
     conn.close()
     upgraded = Store(path)
-    assert upgraded.query_one("SELECT value FROM meta WHERE key = 'schema'")[0] == "11"
+    assert upgraded.query_one("SELECT value FROM meta WHERE key = 'schema'")[0] == "12"
     upgraded.insert(agent_trace(), received_ns=START)
     assert len(memory.items(upgraded)) == 2
     upgraded.close()

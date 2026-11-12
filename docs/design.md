@@ -440,8 +440,43 @@ Deleting a monitor deletes its state and keeps its alerts.
 
 **What an alert contains.** Names and numbers only: monitor ID and name (copied, so it outlives
 the monitor), kind, metric, comparison, threshold, value, bound, samples, window, creation time,
-delivery time and `reason` (null unless an edit resolved it, as above). No trace content. `Store.prune` deletes alerts older than its cutoff by creation
+delivery time and `reason` (null unless an edit resolved it, as above), and what a firing alert
+points at (below). No message content. `Store.prune` deletes alerts older than its cutoff by creation
 time, delivered or not; monitors and states are not affected.
+
+**What a firing alert points at** (schema version 12, added 13 November 2026). An alert used to
+say only that a number crossed a line, and whoever received it had to go and find the traces. A
+tool that failed 48 of its 50 calls went unseen that way, under a global rate that stayed within
+its limit. When a monitor goes from OK to firing, the alert now records:
+
+- `detail`: for the error rates, the tool or model with the most failed calls in the window, as
+  "`<name>` failed 4 of 5 calls" (fewest calls, then name, break a tie). Null for other metrics.
+- `examples`: at most three traces, one row a trace, each `{trace_id, span_id, label}`:
+  the latest failed call of each trace for an error rate (label: tool or model, and
+  `error.type`); the costliest traces for cost (no span); each trace's slowest model call for
+  latency; for a score, each trace's score furthest on the alert's side (lowest for `below`,
+  highest for `above`). A trace count points at nothing. Drift alerts point at the current
+  window, never the baseline.
+
+They follow the same population as the figure they explain (the window, the service filter, calls
+by start time). They are read once, when the alert fires, outside the transaction and only on a
+pass that would take an OK monitor to firing, so a quiet pass asks nothing more and the lock is
+held no longer. Resolved alerts carry none. They are not kept up to date: a trace named here may
+later be removed by retention, and its link then says so. Muted alerts record them too.
+
+Labels and `detail` carry names taken from spans (a tool, a model, an error type) and numbers,
+never message content. Since they are shown wherever the alert is delivered, they are cleaned
+like a monitor's name (control, format and bidi characters become spaces; one line) and cut to
+120 characters.
+
+**Links.** With `serve --public-url <origin>`, each alert in the API has `url` (the Alerts page)
+and each example a `url` to its trace, with the span when there is one; without it they are null.
+A client that delivers alerts elsewhere has no other way to know where the UI is, and agentwatch
+is the one place that knows. The value must be a plain `http` or `https` origin (no user name,
+path, query or fragment) whose host this server answers to (`--allow-host`, the bind address or
+loopback), or the server does not start: a link to anywhere else would be refused by the host
+guard or would send whoever follows it to another site. Nothing is stored: links are built when
+the API answers, so changing the address changes every link.
 
 **Delivery is polling.** There are no webhooks, so no URL or secret is ever stored and agentwatch
 sends nothing. A client polls `GET /api/alerts?undelivered=1`, which lists the oldest first, acts
@@ -453,7 +488,7 @@ API: `GET/POST /api/monitors`, `GET/PATCH/DELETE /api/monitors/<id>` (each with 
 `GET /api/alerts?limit=&undelivered=1` (newest first unless `undelivered`) and
 `POST /api/alerts/<id>/delivered` (404 if unknown; the body is ignored, but the request must say
 `application/json` as every write does). The UI's Alerts page adds monitors, lists them with their
-state, and lists recent alerts. Whether these thresholds and windows suit real traffic has not
+state, and lists recent alerts, each firing one with its detail and links to its examples. Whether these thresholds and windows suit real traffic has not
 been measured.
 
 ## Drift detection

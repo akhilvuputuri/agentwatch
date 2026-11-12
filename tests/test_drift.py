@@ -748,6 +748,12 @@ def test_hourly_cadence_and_the_alert(db: Store, traces: Traces) -> None:
     assert alert.samples == 30
     assert alert.baseline_minutes == monitor.baseline_minutes
     assert alert.muted is False
+    # It points at failed calls in the current window, not the baseline's.
+    assert alert.detail is not None
+    assert alert.detail.endswith("failed 30 of 30 calls")
+    assert len(alert.examples) == monitors.MAX_EXAMPLES
+    current = {row[0] for row in db.query("SELECT trace_id FROM spans WHERE status_code = 2")}
+    assert {example.trace_id for example in alert.examples} <= current
 
 
 def test_a_resolved_drift_alert_shows_the_windows_agree_at_the_new_level(
@@ -875,6 +881,8 @@ def test_migration_from_schema_9(tmp_path: Path) -> None:
         ("alerts", "baseline_value"),
         ("alerts", "baseline_minutes"),
         ("alerts", "muted"),
+        ("alerts", "detail"),
+        ("alerts", "examples"),
     ):
         conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
     conn.execute(
@@ -898,7 +906,10 @@ def test_migration_from_schema_9(tmp_path: Path) -> None:
     assert upgraded.query_one("SELECT value FROM meta WHERE key = 'schema'")[0] == str(
         store.SCHEMA_VERSION
     )
-    assert store.SCHEMA_VERSION == 11
+    assert store.SCHEMA_VERSION == 12
+    # An alert from before alerts pointed at anything reads as pointing at nothing.
+    [old_alert] = monitors.list_alerts(upgraded)
+    assert (old_alert.detail, old_alert.examples) == (None, ())
     [monitor] = monitors.list_monitors(upgraded)
     assert (monitor.mode, monitor.baseline_minutes, monitor.muted) == ("threshold", None, False)
     state = monitors.get_state(upgraded, "m")

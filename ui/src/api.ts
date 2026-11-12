@@ -821,6 +821,10 @@ export interface Alert {
   baseline_minutes: number | null;
   /** Its monitor was muted, so it was written as already delivered. */
   muted: boolean;
+  /** Firing alerts: the worst contributor in words, when one stands out. */
+  detail: string | null;
+  /** Firing alerts: traces behind the figure, read when the alert fired. */
+  examples: { trace_id: string; span_id: string | null; label: string }[];
 }
 
 export async function listMonitors(signal?: AbortSignal): Promise<Monitor[]> {

@@ -30,6 +30,7 @@ agentwatch stores no URL or secret and calls nothing.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import threading
@@ -43,7 +44,9 @@ from typing import Any
 import duckdb
 
 from agentwatch import drift
+from agentwatch import metrics as figures_of
 from agentwatch.metrics import Window, monitor_figures, score_figures
+from agentwatch.scores import BOOLEAN
 from agentwatch.stats import wilson
 from agentwatch.store import Store
 
@@ -84,6 +87,9 @@ ERROR_RATES = (MODEL_ERROR_RATE, TOOL_ERROR_RATE)
 RATE_MIN_SAMPLES = 3
 DEFAULT_MIN_SAMPLES = 10
 DEFAULT_COOLDOWN_MINUTES = 60
+# How many traces a firing alert points at, and how long a label or the detail line may be.
+MAX_EXAMPLES = 3
+MAX_LABEL = 120
 # Controls, format and bidi characters, and line breaks: a name is shown wherever an alert is
 # delivered, and must not be able to fake a new line or reorder what is around it.
 _REFUSED_IN_NAME = ("Cc", "Cf", "Cs", "Zl", "Zp")
@@ -160,6 +166,25 @@ class MonitorState:
 
 
 @dataclass(frozen=True, slots=True)
+class Example:
+    """A trace behind a firing alert, and the span in it when one span is the point."""
+
+    trace_id: str
+    span_id: str | None
+    # What makes it an example: the failed call and its error, the cost, the latency, the score.
+    label: str
+
+
+@dataclass(frozen=True, slots=True)
+class Pointers:
+    """What a firing alert points at, read when it fires and not kept up to date after."""
+
+    # The worst contributor in words ("search failed 4 of 5 calls"); None when no one is.
+    detail: str | None = None
+    examples: tuple[Example, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class Alert:
     id: str
     monitor_id: str
@@ -186,6 +211,9 @@ class Alert:
     baseline_minutes: int | None = None
     # Its monitor was muted, so it was written as already delivered.
     muted: bool = False
+    # Firing alerts only: see Pointers.
+    detail: str | None = None
+    examples: tuple[Example, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +239,7 @@ _STATE_COLUMNS = (
 _ALERT_COLUMNS = (
     "id, monitor_id, monitor_name, kind, metric, comparison, threshold, value, bound, samples, "
     "window_minutes, created_ns, delivered_ns, reason, mode, baseline_value, "
-    "baseline_minutes, muted"
+    "baseline_minutes, muted, detail, examples"
 )
 _FIELDS = (
     "name",
@@ -377,7 +405,16 @@ def list_alerts(store: Store, *, limit: int = 50, undelivered: bool = False) -> 
         f"SELECT {_ALERT_COLUMNS} FROM alerts {where} ORDER BY created_ns {order}, id LIMIT ?",
         [limit],
     )
-    return [Alert(*row) for row in rows]
+    return [_alert(row) for row in rows]
+
+
+def _alert(row: tuple[Any, ...]) -> Alert:
+    *fields, stored = row
+    found: list[dict[str, Any]] = json.loads(stored) if stored else []
+    examples = tuple(
+        Example(str(each["trace_id"]), each.get("span_id"), str(each["label"])) for each in found
+    )
+    return Alert(*fields, examples=examples)
 
 
 def mark_delivered(store: Store, alert_id: str, *, now_ns: int | None = None) -> Alert:
@@ -391,7 +428,7 @@ def mark_delivered(store: Store, alert_id: str, *, now_ns: int | None = None) ->
         row = db.execute(f"SELECT {_ALERT_COLUMNS} FROM alerts WHERE id = ?", [alert_id]).fetchone()
     if row is None:
         raise NotFound("alert not found")
-    return Alert(*row)
+    return _alert(row)
 
 
 def _known(body: Any) -> dict[str, Any]:
@@ -589,6 +626,19 @@ def evaluate(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None
     if monitor.mode == DRIFT:
         return _evaluate_drift(store, monitor, now_ns)
     reading = read(store, monitor, now_ns)
+    comparable = reading.value is not None and (
+        not reading.needs_samples or reading.samples >= monitor.min_samples
+    )
+    # Read before the transaction, like the metric, and only when this reading would take an
+    # OK monitor to firing: the queries stay out of the lock and out of every quiet pass.
+    pointers = Pointers()
+    if (
+        comparable
+        and next_state(monitor, reading, OK, None, now_ns)[0] == FIRING
+        and get_state(store, monitor.id).state != FIRING
+    ):
+        window = Window(now_ns - monitor.window_minutes * MINUTE_NS, now_ns, monitor.service)
+        pointers = point_at(store, monitor, window)
     with store.transaction() as db:
         row = db.execute(f"SELECT {_COLUMNS} FROM monitors WHERE id = ?", [monitor.id]).fetchone()
         if row is None or Monitor(*row) != monitor:
@@ -625,6 +675,7 @@ def evaluate(store: Store, monitor: Monitor, now_ns: int) -> MonitorState | None
                 value=reading.value,
                 bound=reading.bound,
                 samples=reading.samples,
+                pointers=pointers if following == FIRING else Pointers(),
             )
         result = MonitorState(
             monitor_id=monitor.id,
@@ -738,6 +789,10 @@ def _evaluate_drift(store: Store, monitor: Monitor, now_ns: int) -> MonitorState
         confidence=DRIFT_CONFIDENCE,
         resamples=DRIFT_RESAMPLES,
     )
+    # As in `evaluate`: before the transaction, and only on a breach that could fire.
+    pointers = Pointers()
+    if drift_breach(monitor, result) and get_state(store, monitor.id).state != FIRING:
+        pointers = point_at(store, monitor, Window(split, now_ns, monitor.service))
     with store.transaction() as db:
         row = db.execute(f"SELECT {_COLUMNS} FROM monitors WHERE id = ?", [monitor.id]).fetchone()
         if row is None or Monitor(*row) != monitor:
@@ -773,6 +828,7 @@ def _evaluate_drift(store: Store, monitor: Monitor, now_ns: int) -> MonitorState
                 bound=bound,
                 samples=result.current_samples,
                 baseline_value=result.baseline_value,
+                pointers=pointers if following == FIRING else Pointers(),
             )
         written = MonitorState(
             monitor_id=monitor.id,
@@ -804,10 +860,12 @@ def _write_alert(
     samples: int = 0,
     reason: str | None = None,
     baseline_value: float | None = None,
+    pointers: Pointers | None = None,
 ) -> None:
+    pointers = pointers or Pointers()
     db.execute(
         f"INSERT INTO alerts ({_ALERT_COLUMNS}) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             uuid.uuid4().hex,
             monitor.id,
@@ -827,8 +885,105 @@ def _write_alert(
             baseline_value,
             monitor.baseline_minutes,
             muted,
+            pointers.detail,
+            json.dumps([asdict(each) for each in pointers.examples]) if pointers.examples else None,
         ],
     )
+
+
+# --- What an alert points at ---------------------------------------------------------------
+
+
+def point_at(store: Store, monitor: Monitor, window: Window) -> Pointers:
+    """The traces behind the monitor's figure over `window`, and its worst contributor.
+
+    Each metric points at what would explain it: failed calls for an error rate (those of the
+    tool or model with the most failures first), the costliest traces, the slowest model calls, the scores furthest
+    on the alert's side. A trace count has nothing to point at. Labels carry names from spans,
+    so they are cleaned like a monitor's name before anything shows or delivers them.
+    """
+    metric = monitor.metric
+    if metric in ERROR_RATES:
+        tools = metric == TOOL_ERROR_RATE
+        worst = figures_of.worst_calls(store, window, tools=tools)
+        detail = (
+            None
+            if worst is None
+            else _label(
+                f"{worst['name']} failed {worst['failed']} of {worst['calls']} "
+                f"call{'' if worst['calls'] == 1 else 's'}"
+            )
+        )
+        rows = figures_of.failed_calls(
+            store,
+            window,
+            tools=tools,
+            first=None if worst is None else worst["name"],
+            limit=MAX_EXAMPLES,
+        )
+        return Pointers(
+            detail,
+            tuple(
+                Example(
+                    row["trace_id"],
+                    row["span_id"],
+                    _label(
+                        f"{(row['tool_name'] or row['name']) if tools else row['model']}: "
+                        f"{row['error_type'] or 'failed'}"
+                    ),
+                )
+                for row in rows
+            ),
+        )
+    if metric in (COST_USD, drift.COST_PER_TRACE):
+        rows = figures_of.costly_traces(store, window, limit=MAX_EXAMPLES)
+        return Pointers(
+            examples=tuple(
+                Example(row["trace_id"], None, f"{_usd(row['cost_usd'])} in this trace")
+                for row in rows
+            )
+        )
+    if metric in (MODEL_P95_MS, drift.MODEL_MEAN_MS):
+        rows = figures_of.slow_calls(store, window, limit=MAX_EXAMPLES)
+        return Pointers(
+            examples=tuple(
+                Example(
+                    row["trace_id"],
+                    row["span_id"],
+                    _label(f"{row['model']}: {row['duration_ms'] / 1000:.1f} s"),
+                )
+                for row in rows
+            )
+        )
+    if metric == SCORE_MEAN:
+        name = monitor.score_name or ""
+        rows = figures_of.extreme_scores(
+            store, window, name, lowest=monitor.comparison == BELOW, limit=MAX_EXAMPLES
+        )
+        return Pointers(
+            examples=tuple(
+                Example(row["trace_id"], row["span_id"], _label(f"{name}: {_score(row)}"))
+                for row in rows
+            )
+        )
+    return Pointers()
+
+
+def _label(text: str) -> str:
+    """One line, free of the characters a monitor's name may not hold, cut to MAX_LABEL."""
+    kept = "".join(" " if unicodedata.category(char) in _REFUSED_IN_NAME else char for char in text)
+    kept = " ".join(kept.split())
+    return kept if len(kept) <= MAX_LABEL else kept[: MAX_LABEL - 1] + "…"
+
+
+def _usd(value: float) -> str:
+    return f"${value:.4f}" if 0 < value < 0.01 else f"${value:.2f}"
+
+
+def _score(row: dict[str, Any]) -> str:
+    if row["data_type"] == BOOLEAN:
+        return "yes" if row["value"] >= 0.5 else "no"
+    return f"{row['value']:g}"
 
 
 class MonitorRunner:

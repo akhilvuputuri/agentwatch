@@ -364,6 +364,116 @@ _SCORE_FIGURES = f"""
 """
 
 
+# The traces behind a monitor's figure, for an alert to point at. Each follows the population
+# of the figure it explains (`windowed`, or scores on traces in scope), one row per trace.
+# Parameter 5 is the row limit, except where said.
+# Parameter 5: the name whose failures come first (the worst one), or NULL. Parameter 6: the limit.
+_FAILED_CALLS = f"""
+    WITH {{scope}}
+    SELECT trace_id, span_id, name, tool_name, error_type,
+           coalesce(response_model, request_model, '(unknown)') AS model
+    FROM windowed
+    WHERE {{calls}} AND status_code = {STATUS_ERROR}
+    QUALIFY row_number() OVER (
+        PARTITION BY trace_id
+        ORDER BY ({{key}} IS NOT DISTINCT FROM ?5) DESC, start_ns DESC, span_id
+    ) = 1
+    ORDER BY ({{key}} IS NOT DISTINCT FROM ?5) DESC, start_ns DESC, trace_id
+    LIMIT ?6
+"""
+# The name with the most failures; fewest calls, then name, break ties.
+_WORST_CALLS = f"""
+    WITH {{scope}}
+    SELECT {{key}} AS name, count(*) AS calls,
+           count(*) FILTER (WHERE status_code = {STATUS_ERROR}) AS failed
+    FROM windowed WHERE {{calls}}
+    GROUP BY 1 HAVING count(*) FILTER (WHERE status_code = {STATUS_ERROR}) > 0
+    ORDER BY failed DESC, calls, name
+    LIMIT 1
+"""
+_COSTLY_TRACES = """
+    WITH {scope}
+    SELECT trace_id, cost_usd FROM (
+        SELECT trace_id, sum(cost_usd) FILTER (WHERE counts_toward_totals) AS cost_usd
+        FROM windowed GROUP BY trace_id
+    )
+    WHERE cost_usd IS NOT NULL
+    ORDER BY cost_usd DESC, trace_id
+    LIMIT ?5
+"""
+_SLOW_CALLS = f"""
+    WITH {{scope}}
+    SELECT trace_id, span_id, coalesce(response_model, request_model, '(unknown)') AS model,
+           {_DURATION_MS} AS duration_ms
+    FROM windowed
+    WHERE is_model_call
+    QUALIFY row_number() OVER (
+        PARTITION BY trace_id ORDER BY {_DURATION_MS} DESC, start_ns DESC, span_id
+    ) = 1
+    ORDER BY duration_ms DESC, start_ns DESC, trace_id
+    LIMIT ?5
+"""
+# Parameter 5: the score's name. Parameter 6: the limit.
+_EXTREME_SCORES = f"""
+    WITH {{scope}}
+    SELECT trace_id, span_id, value, data_type
+    FROM scores
+    WHERE name = ?5 AND data_type IN ('{BOOLEAN}', '{NUMERIC}') AND value IS NOT NULL
+      AND created_ns >= ?3 AND created_ns < ?4 AND trace_id IN (SELECT trace_id FROM traces)
+    QUALIFY row_number() OVER (
+        PARTITION BY trace_id ORDER BY value {{order}}, created_ns DESC, id
+    ) = 1
+    ORDER BY value {{order}}, created_ns DESC, trace_id
+    LIMIT ?6
+"""
+
+
+def _calls(tools: bool) -> tuple[str, str]:
+    """The filter for tool or model calls, and the name they are grouped by."""
+    if tools:
+        return "operation = 'execute_tool'", "coalesce(tool_name, name)"
+    return "is_model_call", _MODEL_NAME
+
+
+def failed_calls(
+    store: Store, window: Window, *, tools: bool, first: str | None, limit: int
+) -> list[dict[str, Any]]:
+    """One failed model or tool call from each trace in the window: those of `first` (a tool or
+    model name) before any other, then newest first."""
+    calls, key = _calls(tools)
+    query = _FAILED_CALLS.format(scope=_SCOPE, calls=calls, key=key)
+    return store.query(query, [*_params(window), first, limit], with_names=True)
+
+
+def worst_calls(store: Store, window: Window, *, tools: bool) -> dict[str, Any] | None:
+    """The tool or model with the most failed calls in the window: name, calls and failed."""
+    calls, key = _calls(tools)
+    rows = store.query(
+        _WORST_CALLS.format(scope=_SCOPE, calls=calls, key=key), _params(window), with_names=True
+    )
+    return rows[0] if rows else None
+
+
+def costly_traces(store: Store, window: Window, *, limit: int) -> list[dict[str, Any]]:
+    """The traces that cost most in the window, by the cost that counts toward totals."""
+    query = _COSTLY_TRACES.format(scope=_SCOPE)
+    return store.query(query, [*_params(window), limit], with_names=True)
+
+
+def slow_calls(store: Store, window: Window, *, limit: int) -> list[dict[str, Any]]:
+    """Each trace's slowest model call in the window, slowest first."""
+    query = _SLOW_CALLS.format(scope=_SCOPE)
+    return store.query(query, [*_params(window), limit], with_names=True)
+
+
+def extreme_scores(
+    store: Store, window: Window, name: str, *, lowest: bool, limit: int
+) -> list[dict[str, Any]]:
+    """Each trace's lowest (or highest) score of this name recorded in the window."""
+    query = _EXTREME_SCORES.format(scope=_SCOPE, order="ASC" if lowest else "DESC")
+    return store.query(query, [*_params(window), name, limit], with_names=True)
+
+
 # Durations kept per trace for a percentile: its most recent calls.
 MAX_CALLS_PER_TRACE = 200
 _MODEL_NAME = "coalesce(response_model, request_model, '(unknown)')"

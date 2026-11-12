@@ -79,8 +79,12 @@ def create_app(
     allowed_hosts: Sequence[str] = LOOPBACK_HOSTS,
     judge_runner: judges.JudgeRunner | None = None,
     auth: signin.Auth | None = None,
+    public_url: str | None = None,
 ) -> Starlette:
     """`allowed_hosts` are the Host header names served; "*" allows any (no rebinding guard).
+
+    `public_url`, as `public_base` returns it, is where people open the UI; alerts then carry
+    links to themselves and to the traces they point at.
 
     `auth`, when given, requires a signed-in session or an API key for everything but the
     sign-in page and the health check (docs/design.md#signing-in).
@@ -473,7 +477,7 @@ def create_app(
         return await _monitor_call(
             lambda: {
                 "alerts": [
-                    _alert_json(a)
+                    _alert_json(a, public_url)
                     for a in monitors.list_alerts(store, limit=limit, undelivered=undelivered)
                 ]
             }
@@ -486,7 +490,7 @@ def create_app(
         if media != otlp.JSON:
             return PlainTextResponse("send application/json", status_code=415)
         return await _monitor_call(
-            lambda: {"alert": _alert_json(monitors.mark_delivered(store, alert_id))}
+            lambda: {"alert": _alert_json(monitors.mark_delivered(store, alert_id), public_url)}
         )
 
     # One comparison at a time: a bootstrap is CPU in Python, so several would starve ingest.
@@ -1033,11 +1037,46 @@ def _state_json(state: monitors.MonitorState) -> dict[str, Any]:
     return data
 
 
-def _alert_json(alert: monitors.Alert) -> dict[str, Any]:
+def _alert_json(alert: monitors.Alert, public_url: str | None) -> dict[str, Any]:
+    """`url` (the alerts page, and each example's trace) is None unless a public URL is set:
+    a client delivering the alert elsewhere has no other way to know where the UI is."""
+
+    def trace_url(example: monitors.Example) -> str | None:
+        if public_url is None:
+            return None
+        span = f"/{example.span_id}" if example.span_id else ""
+        return f"{public_url}/#/trace/{example.trace_id}{span}"
+
     return asdict(alert) | {
         "created_ns": str(alert.created_ns),
         "delivered_ns": None if alert.delivered_ns is None else str(alert.delivered_ns),
+        "url": None if public_url is None else f"{public_url}/#/alerts",
+        "examples": [asdict(each) | {"url": trace_url(each)} for each in alert.examples],
     }
+
+
+def public_base(value: str, allowed_hosts: Sequence[str]) -> str:
+    """`value` as the UI's public address, `scheme://host[:port]`, or ValueError saying why not.
+
+    It is put in front of links that leave agentwatch (in alerts), so it must be a plain http
+    or https origin, and its host one this server answers to: a link to anywhere else would be
+    refused by the host guard, or would send whoever follows it to another site.
+    """
+    try:
+        parts = urlsplit(value)
+        host, port = parts.hostname, parts.port
+    except ValueError as error:
+        raise ValueError(f"--public-url is not a URL: {error}") from None
+    if parts.scheme not in ("http", "https") or not host:
+        raise ValueError("--public-url must be an http or https URL")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("--public-url must not hold a user name or password")
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        raise ValueError("--public-url must be an origin, with no path, query or fragment")
+    if "*" not in allowed_hosts and host not in {name.lower() for name in allowed_hosts}:
+        raise ValueError(f"--public-url names {host}, which is not passed with --allow-host")
+    bracketed = f"[{host}]" if ":" in host else host
+    return f"{parts.scheme}://{bracketed}" + (f":{port}" if port is not None else "")
 
 
 def _dataset_json(dataset: datasets.Dataset) -> dict[str, Any]:
