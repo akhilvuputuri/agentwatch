@@ -31,8 +31,16 @@ export function parsed(value: unknown): unknown {
   }
 }
 
-/** Text for reading: JSON indented, plain text as it is. */
+/** JavaScript holds integers exactly only up to 2^53, about 16 digits. */
+const LONG_NUMBER = /\d{16,}/;
+
+/**
+ * Text for reading: JSON indented, plain text as it is. JSON text with a number too long to
+ * survive parsing is left as it was written, since indenting it would change the number shown
+ * and copied.
+ */
 export function pretty(value: unknown): string {
+  if (typeof value === "string" && LONG_NUMBER.test(value)) return value;
   const data = parsed(value);
   if (data === null || data === undefined) return "";
   return typeof data === "string" ? data : JSON.stringify(data, null, 2);
@@ -140,18 +148,27 @@ function texts(found: Message[], type: "text" | "reasoning" = "text"): string {
     .trim();
 }
 
-/** What the user last said in a captured input; for anything else, its text. Null when empty. */
-function asked(value: unknown): string | null {
+/**
+ * What the user last said in a captured input. Anything that is not a list of messages is taken
+ * as the request itself only with `plain` (the root span's own input): on another span it may be
+ * a search query or a tool's argument.
+ */
+function asked(value: unknown, plain: boolean): string | null {
   if (value === null || value === undefined) return null;
   const found = messages(value);
-  if (!found) return pretty(value) || null;
+  if (!found) return plain ? pretty(value) || null : null;
   const users = found.filter((m) => m.role === "user" && texts([m]));
   const last = users[users.length - 1];
-  return (last ? texts([last]) : texts(found)) || null;
+  return (last ? texts([last]) : plain ? texts(found) : "") || null;
 }
 
-/** Argument names agents use for the text of a reply they send through a tool. */
-const SPOKEN = ["reply", "message", "text", "answer", "response", "content", "output"];
+/**
+ * Argument names that mean "say this to the user" when an agent ends a turn by calling a tool
+ * (`finish_turn {reply}`, `send_message {message}`). Kept short on purpose: `content`, `text`
+ * or `output` are as often a file's body or a command's input, and showing those as the reply
+ * to a turn that never replied is worse than showing none.
+ */
+const SPOKEN = ["reply", "answer", "response", "message"];
 
 export interface Reply {
   text: string;
@@ -160,8 +177,10 @@ export interface Reply {
 }
 
 /**
- * The reply in a captured output: its text, or, when the model answered only by calling a tool
- * (agents often end a turn that way), that call's text argument.
+ * The reply in a captured output. When the output ends in a tool call with a SPOKEN argument,
+ * that argument: it is what the user received, and any text beside it is the model's preamble.
+ * Otherwise the output's text. An output that only calls some other tool holds no reply: the
+ * turn stopped before answering (see `lastCalled`).
  */
 export function reply(value: unknown): Reply | null {
   if (value === null || value === undefined) return null;
@@ -170,28 +189,36 @@ export function reply(value: unknown): Reply | null {
     const text = pretty(value);
     return text ? { text, via: null } : null;
   }
-  const text = texts(found);
-  if (text) return { text, via: null };
-  const calls = found.flatMap((m) => m.parts).flatMap((p) => (p.type === "tool_call" ? [p] : []));
-  const last = calls[calls.length - 1];
-  if (!last) return null;
-  const args = record(last.arguments);
-  if (args) {
-    const strings = Object.entries(args).filter((entry): entry is [string, string] => typeof entry[1] === "string");
-    const named = SPOKEN.map((name) => strings.find(([key]) => key === name)).find((entry) => entry !== undefined);
-    const spoken = named ?? (strings.length === 1 ? strings[0] : undefined);
-    if (spoken && spoken[1].trim()) return { text: spoken[1].trim(), via: last.name };
+  const parts = found.flatMap((m) => m.parts);
+  const last = parts[parts.length - 1];
+  if (last?.type === "tool_call") {
+    const args = record(last.arguments);
+    for (const name of SPOKEN) {
+      const spoken = args?.[name];
+      if (typeof spoken === "string" && spoken.trim()) return { text: spoken.trim(), via: last.name };
+    }
   }
-  return { text: pretty(last.arguments), via: last.name };
+  const text = texts(found);
+  return text ? { text, via: null } : null;
+}
+
+/** The tool a captured output last called, when it is a list of messages that calls one. */
+export function lastCalled(value: unknown): string | null {
+  const calls = (messages(value) ?? []).flatMap((m) => m.parts).flatMap((p) => (p.type === "tool_call" ? [p.name] : []));
+  return calls[calls.length - 1] ?? null;
 }
 
 export interface Summary {
-  /** What was asked: the root's captured input, else the earliest captured input. */
+  /** What was asked: the root's captured input, else the earliest captured user message. */
   asked: string | null;
   replied: Reply | null;
-  /** The earliest failed span that no failed child explains. */
+  /** Without a reply: the tool the latest captured output called, where the turn stopped. */
+  stoppedAt: string | null;
+  /** The earliest failed span that no failed span below it explains. */
   firstError: SpanRecord | null;
   errors: number;
+  /** The root span did not fail, so whatever failed, the turn went on past it. */
+  finished: boolean;
   modelCalls: number;
   toolCalls: number;
 }
@@ -208,10 +235,24 @@ function byStart(a: SpanRecord, b: SpanRecord): number {
   return diff < 0n ? -1 : diff > 0n ? 1 : a.span_id.localeCompare(b.span_id);
 }
 
-/** The failed spans that started a failure: no failed child, earliest first. */
+/**
+ * The failed spans that started a failure, earliest first: those with no failed span anywhere
+ * below them. A failed span above another failed one, however many spans that succeeded lie
+ * between, only reports it.
+ */
 export function errorOrigins(spans: SpanRecord[]): SpanRecord[] {
+  const byId = new Map(spans.map((span) => [span.span_id, span]));
   const failed = spans.filter((span) => span.status_code === STATUS_ERROR);
-  const explained = new Set(failed.map((span) => span.parent_span_id));
+  const explained = new Set<string>();
+  for (const span of failed) {
+    const seen = new Set([span.span_id]); // guards against parent cycles
+    let above = span.parent_span_id === null ? undefined : byId.get(span.parent_span_id);
+    while (above && !seen.has(above.span_id)) {
+      seen.add(above.span_id);
+      explained.add(above.span_id);
+      above = above.parent_span_id === null ? undefined : byId.get(above.parent_span_id);
+    }
+  }
   return failed.filter((span) => !explained.has(span.span_id)).sort(byStart);
 }
 
@@ -225,14 +266,20 @@ export function summarise(spans: SpanRecord[], root: SpanRecord | undefined): Su
     }
     return null;
   };
-  const input = (span: SpanRecord) => asked(attribute(span, INPUT_ATTRIBUTES));
-  const output = (span: SpanRecord) => reply(attribute(span, OUTPUT_ATTRIBUTES));
+  const output = (span: SpanRecord) => attribute(span, OUTPUT_ATTRIBUTES);
   const origins = errorOrigins(spans);
+  // The root's own output is the turn's, when it has one; else the latest span's.
+  const latest = (root && output(root)) ?? first([...ordered].reverse(), output);
+  const replied = reply(latest);
   return {
-    asked: (root && input(root)) ?? first(ordered, input),
-    replied: (root && output(root)) ?? first([...ordered].reverse(), output),
+    asked:
+      (root && asked(attribute(root, INPUT_ATTRIBUTES), true)) ??
+      first(ordered, (span) => asked(attribute(span, INPUT_ATTRIBUTES), false)),
+    replied,
+    stoppedAt: replied ? null : lastCalled(latest),
     firstError: origins[0] ?? null,
     errors: origins.length,
+    finished: root !== undefined && root.status_code !== STATUS_ERROR,
     modelCalls: spans.filter(isModelCall).length,
     toolCalls: spans.filter((span) => span.genai.operation === "execute_tool").length,
   };

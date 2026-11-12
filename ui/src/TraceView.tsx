@@ -32,6 +32,25 @@ function storedMode(): Mode | null {
   }
 }
 
+/**
+ * Change the address without leaving the page and tell the router at once (it listens for
+ * `hashchange`, which the History API does not send). The span shown always matches the
+ * address, so a resize, a reload or Back never finds the two disagreeing.
+ */
+function go(hash: string, how: "push" | "replace", state: unknown = window.history.state): void {
+  if (how === "push") window.history.pushState(state, "", hash);
+  else window.history.replaceState(state, "", hash);
+  window.dispatchEvent(new HashChangeEvent("hashchange"));
+}
+
+/** History state of an entry a tap on a span added: closing the span goes back over it. */
+const OPENED = { agentwatchSpanOpened: true };
+
+function wasOpenedHere(): boolean {
+  const state: unknown = window.history.state;
+  return typeof state === "object" && state !== null && "agentwatchSpanOpened" in state;
+}
+
 /** Spans that wrap others and repeat their cost, so trace totals leave them out. */
 const WRAPPERS = new Set(["invoke_agent", "create_agent", "invoke_workflow"]);
 
@@ -39,11 +58,10 @@ export function TraceView({ traceId, spanId }: { traceId: string; spanId?: strin
   const [detail, setDetail] = useState<TraceDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
-  const [picked, setPicked] = useState<string | null>(spanId ?? null);
   const [chosenMode, setChosenMode] = useState<Mode | null>(storedMode);
   const narrow = useNarrow();
-  // True once a tap here opened the span panel, so closing it can go back instead of forward.
-  const pushed = useRef(false);
+  // The span whose panel was last open, to give the focus back to its row when it closes.
+  const opened = useRef<string | null>(null);
   const spans = detail?.spans ?? null;
   const setScores = useCallback(
     (update: (scores: Score[]) => Score[]) =>
@@ -61,30 +79,32 @@ export function TraceView({ traceId, spanId }: { traceId: string; spanId?: strin
     return () => controller.abort();
   }, [traceId, attempt]);
 
-  useEffect(() => {
-    setPicked(spanId ?? null);
-    if (!spanId) pushed.current = false;
-  }, [traceId, spanId]);
-
   const view = useMemo(() => layout(spans ?? []), [spans]);
   const root = view.rows[0]?.span;
   const summary = useMemo(() => summarise(spans ?? [], root), [spans, root]);
   // The span in the address, else the one that failed first, else the root.
-  const chosen =
-    view.rows.find((row) => row.span.span_id === picked) ??
-    view.rows.find((row) => row.span.span_id === summary.firstError?.span_id) ??
-    view.rows[0];
-  // On a narrow screen a span opens over the page, and only when the address names one.
-  const sheet = narrow && spanId !== undefined && chosen !== undefined;
+  const named = view.rows.find((row) => row.span.span_id === spanId);
+  const chosen = named ?? view.rows.find((row) => row.span.span_id === summary.firstError?.span_id) ?? view.rows[0];
+  // On a narrow screen a span opens over the page, and only when the address names one of
+  // this trace's spans.
+  const sheet = narrow && named !== undefined;
+  const sheetSpan = sheet ? named.span.span_id : null;
 
   useEffect(() => {
-    if (!sheet) return;
+    if (sheetSpan === null) {
+      // Closed: back to the row it was opened from, where a keyboard or reader user was.
+      const last = opened.current;
+      opened.current = null;
+      if (last) document.querySelector<HTMLElement>(`[data-span="${last}"]`)?.focus();
+      return;
+    }
+    opened.current = sheetSpan;
     const before = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
       document.body.style.overflow = before;
     };
-  }, [sheet]);
+  }, [sheetSpan]);
 
   if (error) return <LoadError reason={error} onRetry={() => setAttempt((n) => n + 1)} />;
   if (!detail || !spans) return <p className="muted">Loading…</p>;
@@ -99,27 +119,26 @@ export function TraceView({ traceId, spanId }: { traceId: string; spanId?: strin
     }
   };
   const select = (id: string) => {
-    if (narrow) {
-      // A new history entry, so the browser's Back closes the span and returns here.
-      pushed.current = true;
-      window.location.hash = links.trace(traceId, id);
-      return;
-    }
-    setPicked(id);
-    // Replaced, not added: Back should leave the trace, not walk through every span looked at.
-    window.history.replaceState(null, "", links.trace(traceId, id));
+    // On a narrow screen a new history entry, so the browser's Back closes the span and returns
+    // here. On a wide one replaced, not added: Back should leave the trace, not walk through
+    // every span looked at.
+    if (narrow) go(links.trace(traceId, id), "push", OPENED);
+    else go(links.trace(traceId, id), "replace");
   };
-  const step = (id: string) => window.location.replace(links.trace(traceId, id));
+  // Previous and next keep the entry (and whether a tap added it), so Back still closes.
+  const step = (id: string) => go(links.trace(traceId, id), "replace");
   const close = () => {
-    if (pushed.current) {
-      pushed.current = false;
-      window.history.back();
-    } else {
-      window.location.replace(links.trace(traceId));
-    }
+    // Over the entry a tap added, also after a reload; a span reached by a link has no such
+    // entry, so its address is replaced with the trace's.
+    if (wasOpenedHere()) window.history.back();
+    else go(links.trace(traceId), "replace", null);
   };
   const arrows = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    // Only from a span's own row, and only the bare key: text selection, a "Show all" button
+    // or a folded section inside the list keep their keys.
+    if (event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
+    if (!(event.target instanceof HTMLElement) || !event.target.hasAttribute("data-span")) return;
     const at = view.rows.findIndex((row) => row.span.span_id === chosen?.span.span_id);
     const next = view.rows[at + (event.key === "ArrowDown" ? 1 : -1)];
     if (!next) return;
@@ -191,10 +210,20 @@ export function TraceView({ traceId, spanId }: { traceId: string; spanId?: strin
         <div onKeyDown={narrow ? undefined : arrows}>
           {mode === "steps" ? <Steps {...list} /> : <Waterfall {...list} totalNs={view.totalNs} />}
         </div>
-        {!narrow && chosen && <SpanDetail row={chosen} inContext={detail.in_context[chosen.span.span_id] ?? []} />}
+        {!narrow && chosen && (
+          <SpanDetail key={chosen.span.span_id} row={chosen} inContext={detail.in_context[chosen.span.span_id] ?? []} />
+        )}
       </div>
       {sheet && (
-        <div className="sheet" role="dialog" aria-modal="true" aria-label={`Span ${displayName(chosen.span)}`}>
+        <div
+          className="sheet"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Span ${displayName(named.span)}`}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") close();
+          }}
+        >
           <div className="sheet-head">
             <button type="button" onClick={close} autoFocus>
               ← Back to trace
@@ -221,7 +250,7 @@ export function TraceView({ traceId, spanId }: { traceId: string; spanId?: strin
               </button>
             </span>
           </div>
-          <SpanDetail row={chosen} inContext={detail.in_context[chosen.span.span_id] ?? []} />
+          <SpanDetail key={named.span.span_id} row={named} inContext={detail.in_context[named.span.span_id] ?? []} />
         </div>
       )}
       <details className="trace-tools" open={!narrow}>
@@ -293,13 +322,16 @@ function TurnSummary({ summary, onOpen }: { summary: Summary; onOpen: (spanId: s
       {!summary.replied && (summary.asked || failed) && (
         <div className="turn-part">
           <h3>Replied</h3>
-          <p className="muted small">No reply was captured.</p>
+          <p className="muted small">
+            No reply was captured.{summary.stoppedAt ? ` The last model output called ${summary.stoppedAt}.` : ""}
+          </p>
         </div>
       )}
       {failed && (
         <div className="turn-part turn-error" data-testid="first-error">
           <h3>
             First error{summary.errors > 1 ? ` (of ${summary.errors})` : ""}
+            {summary.finished ? " · the turn went on" : ""}
           </h3>
           <p>
             <button type="button" className="link turn-open" onClick={() => onOpen(failed.span_id)}>

@@ -1,6 +1,19 @@
 import { describe, expect, it } from "vitest";
 import type { SpanRecord } from "./api";
-import { displayName, errorOrigins, errorText, messages, parsed, plainText, pretty, reply, spanInput, spanOutput, summarise } from "./content";
+import {
+  displayName,
+  errorOrigins,
+  errorText,
+  lastCalled,
+  messages,
+  parsed,
+  plainText,
+  pretty,
+  reply,
+  spanInput,
+  spanOutput,
+  summarise,
+} from "./content";
 
 let next = 0;
 function span(over: Omit<Partial<SpanRecord>, "genai"> & { genai?: Partial<SpanRecord["genai"]> } = {}): SpanRecord {
@@ -61,6 +74,13 @@ describe("parsed and pretty", () => {
     expect(pretty("line one\nline two")).toBe("line one\nline two");
     expect(pretty(null)).toBe("");
   });
+
+  it("leaves JSON as written when parsing would change a long number", () => {
+    const text = '{"id":12345678901234567890,"ok":true}';
+    expect(JSON.stringify(JSON.parse(text))).not.toBe(text); // the reason for the rule
+    expect(pretty(text)).toBe(text);
+    expect(pretty('{"id":123456789012345}')).toBe('{\n  "id": 123456789012345\n}');
+  });
 });
 
 describe("messages", () => {
@@ -118,12 +138,33 @@ describe("reply", () => {
     expect(reply("free text")).toEqual({ text: "free text", via: null });
   });
 
-  it("is the last tool call's spoken argument when the model only called a tool", () => {
-    const call = (args: unknown) => [{ role: "assistant", parts: [{ type: "tool_call", id: "c", name: "finish_turn", arguments: args }] }];
-    expect(reply(call({ reply: "All set.", reason: "done" }))).toEqual({ text: "All set.", via: "finish_turn" });
-    expect(reply(call({ note: "only one string", n: 2 }))).toEqual({ text: "only one string", via: "finish_turn" });
-    // No argument is plainly the reply: show them all.
-    expect(reply(call({ a: "x", b: "y" }))).toEqual({ text: '{\n  "a": "x",\n  "b": "y"\n}', via: "finish_turn" });
+  const call = (name: string, args: unknown) => ({ type: "tool_call", id: "c", name, arguments: args });
+  const says = (...parts: unknown[]) => [{ role: "assistant", parts }];
+
+  it("is the spoken argument when the output ends by calling a tool that says something", () => {
+    expect(reply(says(call("finish_turn", { reply: "All set.", reason: "done" })))).toEqual({ text: "All set.", via: "finish_turn" });
+    expect(reply(says(call("send_message", '{"message":" hi "}')))).toEqual({ text: "hi", via: "send_message" });
+    // What the user received, not the model's preamble beside it.
+    expect(reply(says({ type: "text", content: "Let me wrap up." }, call("finish_turn", { reply: "Real reply" })))).toEqual({
+      text: "Real reply",
+      via: "finish_turn",
+    });
+  });
+
+  it("does not take another tool's arguments for a reply", () => {
+    // A turn that stopped after asking for a tool never replied.
+    expect(reply(says(call("get_weather", { city: "Paris" })))).toBeNull();
+    expect(reply(says(call("write_file", { path: "a.txt", content: "the file body" })))).toBeNull();
+    expect(reply(says(call("run", { text: "ls", output: "x" })))).toBeNull();
+    expect(reply(says(call("finish_turn", { reply: "  " })))).toBeNull();
+    // Text said before calling some other tool is still the latest thing said.
+    expect(reply(says({ type: "text", content: "Checking." }, call("get_weather", { city: "Paris" })))).toEqual({
+      text: "Checking.",
+      via: null,
+    });
+    expect(lastCalled(says(call("a", {}), call("get_weather", {})))).toBe("get_weather");
+    expect(lastCalled([text("assistant", "done")])).toBeNull();
+    expect(lastCalled("plain")).toBeNull();
   });
 
   it("is null when nothing was captured", () => {
@@ -151,6 +192,8 @@ describe("summarise", () => {
     const summary = summarise(all, root);
     expect(summary.asked).toBe("book it");
     expect(summary.replied).toEqual({ text: "booked", via: null });
+    expect(summary.stoppedAt).toBeNull();
+    expect(summary.finished).toBe(false);
     expect(summary.firstError?.span_id).toBe(tool.span_id);
     expect(summary.errors).toBe(2);
     expect(summary.modelCalls).toBe(1);
@@ -171,8 +214,63 @@ describe("summarise", () => {
     expect(summary.firstError).toBeNull();
   });
 
+  it("finds the failure below a span that succeeded, not the failed span above it", () => {
+    const root = span({ status_code: 2, status_message: "turn failed", genai: { operation: "invoke_agent" } });
+    const step = span({ parent_span_id: root.span_id });
+    const tool = span({ parent_span_id: step.span_id, status_code: 2, genai: { operation: "execute_tool", tool_name: "fetch" } });
+    const summary = summarise([root, step, tool], root);
+    expect(summary.firstError?.span_id).toBe(tool.span_id);
+    expect(summary.errors).toBe(1);
+    // A parent that is missing, or a cycle, ends the walk.
+    const orphan = span({ parent_span_id: "f".repeat(16), status_code: 2 });
+    const a = span({ status_code: 2 });
+    const b = span({ parent_span_id: a.span_id, status_code: 2 });
+    a.parent_span_id = b.span_id;
+    expect(errorOrigins([orphan]).map((each) => each.span_id)).toEqual([orphan.span_id]);
+    expect(errorOrigins([a, b])).toEqual([]);
+  });
+
+  it("says where a turn that never replied stopped, and that a recovered failure went on", () => {
+    const stopped = span({ status_code: 2, genai: { operation: "invoke_agent" } });
+    const asking = span({
+      parent_span_id: stopped.span_id,
+      attributes: {
+        "gen_ai.output.messages": JSON.stringify([{ role: "assistant", parts: [{ type: "tool_call", name: "get_weather", arguments: { city: "Paris" } }] }]),
+      },
+    });
+    const failed = summarise([stopped, asking], stopped);
+    expect(failed.replied).toBeNull();
+    expect(failed.stoppedAt).toBe("get_weather");
+    expect(failed.finished).toBe(false);
+
+    const root = span({ genai: { operation: "invoke_agent" }, attributes: { "gen_ai.output.messages": JSON.stringify([text("assistant", "done")]) } });
+    const retry = span({ parent_span_id: root.span_id, status_code: 2 });
+    const recovered = summarise([root, retry], root);
+    expect(recovered.finished).toBe(true);
+    expect(recovered.firstError?.span_id).toBe(retry.span_id);
+  });
+
+  it("takes plain text for the request only from the root", () => {
+    const root = span({ genai: { operation: "invoke_agent" } });
+    const search = span({ parent_span_id: root.span_id, attributes: { "input.value": "search: user prefs" } });
+    const chat = span({ parent_span_id: root.span_id, attributes: { "gen_ai.input.messages": JSON.stringify([text("system", "s"), text("user", "the question")]) } });
+    expect(summarise([root, search, chat], root).asked).toBe("the question");
+    expect(summarise([root, search], root).asked).toBeNull();
+    const plain = span({ attributes: { "input.value": "typed request" } });
+    expect(summarise([plain], plain).asked).toBe("typed request");
+  });
+
   it("is empty for a trace with no content", () => {
-    expect(summarise([], undefined)).toEqual({ asked: null, replied: null, firstError: null, errors: 0, modelCalls: 0, toolCalls: 0 });
+    expect(summarise([], undefined)).toEqual({
+      asked: null,
+      replied: null,
+      stoppedAt: null,
+      firstError: null,
+      errors: 0,
+      finished: false,
+      modelCalls: 0,
+      toolCalls: 0,
+    });
   });
 });
 
