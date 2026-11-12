@@ -381,7 +381,7 @@ _FAILED_CALLS = f"""
     ORDER BY ({{key}} IS NOT DISTINCT FROM ?5) DESC, start_ns DESC, trace_id
     LIMIT ?6
 """
-# The name with the most failures; fewest calls, then name, break ties.
+# The two names with the most failures, so the caller can tell a leader from a tie.
 _WORST_CALLS = f"""
     WITH {{scope}}
     SELECT {{key}} AS name, count(*) AS calls,
@@ -389,13 +389,15 @@ _WORST_CALLS = f"""
     FROM windowed WHERE {{calls}}
     GROUP BY 1 HAVING count(*) FILTER (WHERE status_code = {STATUS_ERROR}) > 0
     ORDER BY failed DESC, calls, name
-    LIMIT 1
+    LIMIT 2
 """
+# `{{spans}}` is the population the figure sums: the spans that started in the window, or
+# every span of the traces whose root did.
 _COSTLY_TRACES = """
     WITH {scope}
     SELECT trace_id, cost_usd FROM (
         SELECT trace_id, sum(cost_usd) FILTER (WHERE counts_toward_totals) AS cost_usd
-        FROM windowed GROUP BY trace_id
+        FROM {spans} GROUP BY trace_id
     )
     WHERE cost_usd IS NOT NULL
     ORDER BY cost_usd DESC, trace_id
@@ -446,17 +448,24 @@ def failed_calls(
 
 
 def worst_calls(store: Store, window: Window, *, tools: bool) -> dict[str, Any] | None:
-    """The tool or model with the most failed calls in the window: name, calls and failed."""
+    """The tool or model that failed more calls in the window than any other (name, calls and
+    failed), or None when none did or the most is shared: a name that only won a tie-break
+    would read as the cause."""
     calls, key = _calls(tools)
     rows = store.query(
         _WORST_CALLS.format(scope=_SCOPE, calls=calls, key=key), _params(window), with_names=True
     )
-    return rows[0] if rows else None
+    if not rows or (len(rows) > 1 and rows[1]["failed"] == rows[0]["failed"]):
+        return None
+    return rows[0]
 
 
-def costly_traces(store: Store, window: Window, *, limit: int) -> list[dict[str, Any]]:
-    """The traces that cost most in the window, by the cost that counts toward totals."""
-    query = _COSTLY_TRACES.format(scope=_SCOPE)
+def costly_traces(store: Store, window: Window, *, whole: bool, limit: int) -> list[dict[str, Any]]:
+    """The traces that cost most, by the cost that counts toward totals. With `whole`, the
+    traces whose root started in the window and all their spans (cost per trace's population,
+    as `cost_rows`); otherwise each trace's spans that started in the window (a cost total's)."""
+    spans = "spans JOIN started USING (trace_id)" if whole else "windowed"
+    query = _COSTLY_TRACES.format(scope=_SCOPE, spans=spans)
     return store.query(query, [*_params(window), limit], with_names=True)
 
 

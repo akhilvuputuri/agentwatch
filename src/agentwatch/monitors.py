@@ -87,8 +87,10 @@ ERROR_RATES = (MODEL_ERROR_RATE, TOOL_ERROR_RATE)
 RATE_MIN_SAMPLES = 3
 DEFAULT_MIN_SAMPLES = 10
 DEFAULT_COOLDOWN_MINUTES = 60
-# How many traces a firing alert points at, and how long a label or the detail line may be.
+# How many traces a firing alert points at, and how long a name taken from a span may be in a
+# label or the detail line (which then stay well under MAX_LABEL, the cut for either).
 MAX_EXAMPLES = 3
+MAX_SPAN_NAME = 64
 MAX_LABEL = 120
 # Controls, format and bidi characters, and line breaks: a name is shown wherever an alert is
 # delivered, and must not be able to fake a new line or reorder what is around it.
@@ -897,12 +899,16 @@ def _write_alert(
 def point_at(store: Store, monitor: Monitor, window: Window) -> Pointers:
     """The traces behind the monitor's figure over `window`, and its worst contributor.
 
-    Each metric points at what would explain it: failed calls for an error rate (those of the
-    tool or model with the most failures first), the costliest traces, the slowest model calls, the scores furthest
-    on the alert's side. A trace count has nothing to point at. Labels carry names from spans,
-    so they are cleaned like a monitor's name before anything shows or delivers them.
+    Each metric points at what would explain a figure that is too high: failed calls for an
+    error rate (first those of the tool or model that failed more than any other, when one
+    did), the costliest traces, the slowest model calls. A score points at the scores furthest
+    on the alert's side. Nothing explains a count, or a cost, latency or error rate that is too
+    low, so those point at nothing. Names from spans are shortened and cleaned (`_span_name`) before
+    they go into a label, so a long one cannot push out the numbers beside it.
     """
     metric = monitor.metric
+    if metric != SCORE_MEAN and monitor.comparison == BELOW:
+        return Pointers()
     if metric in ERROR_RATES:
         tools = metric == TOOL_ERROR_RATE
         worst = figures_of.worst_calls(store, window, tools=tools)
@@ -910,7 +916,7 @@ def point_at(store: Store, monitor: Monitor, window: Window) -> Pointers:
             None
             if worst is None
             else _label(
-                f"{worst['name']} failed {worst['failed']} of {worst['calls']} "
+                f"{_span_name(worst['name'])} failed {worst['failed']} of {worst['calls']} "
                 f"call{'' if worst['calls'] == 1 else 's'}"
             )
         )
@@ -928,19 +934,21 @@ def point_at(store: Store, monitor: Monitor, window: Window) -> Pointers:
                     row["trace_id"],
                     row["span_id"],
                     _label(
-                        f"{(row['tool_name'] or row['name']) if tools else row['model']}: "
-                        f"{row['error_type'] or 'failed'}"
+                        f"{_span_name((row['tool_name'] or row['name']) if tools else row['model'])}: "
+                        f"{_span_name(row['error_type'] or 'failed')}"
                     ),
                 )
                 for row in rows
             ),
         )
     if metric in (COST_USD, drift.COST_PER_TRACE):
-        rows = figures_of.costly_traces(store, window, limit=MAX_EXAMPLES)
+        # A total sums the spans that started in the window; cost per trace takes whole traces.
+        whole = metric == drift.COST_PER_TRACE
+        rows = figures_of.costly_traces(store, window, whole=whole, limit=MAX_EXAMPLES)
+        said = "this trace cost {}" if whole else "{} of it in this trace"
         return Pointers(
             examples=tuple(
-                Example(row["trace_id"], None, f"{_usd(row['cost_usd'])} in this trace")
-                for row in rows
+                Example(row["trace_id"], None, said.format(_usd(row["cost_usd"]))) for row in rows
             )
         )
     if metric in (MODEL_P95_MS, drift.MODEL_MEAN_MS):
@@ -950,7 +958,7 @@ def point_at(store: Store, monitor: Monitor, window: Window) -> Pointers:
                 Example(
                     row["trace_id"],
                     row["span_id"],
-                    _label(f"{row['model']}: {row['duration_ms'] / 1000:.1f} s"),
+                    _label(f"{_span_name(row['model'])}: {row['duration_ms'] / 1000:.1f} s"),
                 )
                 for row in rows
             )
@@ -962,11 +970,28 @@ def point_at(store: Store, monitor: Monitor, window: Window) -> Pointers:
         )
         return Pointers(
             examples=tuple(
-                Example(row["trace_id"], row["span_id"], _label(f"{name}: {_score(row)}"))
+                Example(
+                    row["trace_id"], row["span_id"], _label(f"{_span_name(name)}: {_score(row)}")
+                )
                 for row in rows
             )
         )
     return Pointers()
+
+
+def _span_name(text: str) -> str:
+    """A name taken from a span (a tool, a model, an error type, a score), as one word of at
+    most MAX_SPAN_NAME characters: whitespace and the characters a monitor's name may not hold
+    become underscores, so it cannot read as a sentence of its own or start a new line.
+
+    It is still text an agent's inputs can shape, and may look like an address. Whatever shows
+    a label must show it as literal text, never as markup or a link (docs/design.md).
+    """
+    word = "".join(
+        "_" if char.isspace() or unicodedata.category(char) in _REFUSED_IN_NAME else char
+        for char in text
+    )
+    return word if len(word) <= MAX_SPAN_NAME else word[: MAX_SPAN_NAME - 1] + "…"
 
 
 def _label(text: str) -> str:

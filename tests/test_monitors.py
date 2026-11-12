@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +9,7 @@ import duckdb
 import pytest
 from starlette.testclient import TestClient
 
-from agentwatch import genai, metrics, monitors, server, store
+from agentwatch import drift, genai, metrics, monitors, server, store
 from agentwatch.monitors import FIRING, OK, MonitorRunner
 from agentwatch.retention import DAY_NS
 from agentwatch.scores import API, BOOLEAN, CATEGORICAL, NUMERIC, Score
@@ -829,8 +830,8 @@ def test_cost_latency_and_score_alerts_point_at_the_extremes(db: Store, traces: 
     cost = fired(db, name="cost", metric=monitors.COST_USD, threshold=1.0)
     assert cost.detail is None
     assert cost.examples == (
-        monitors.Example(dear, None, "$1.50 in this trace"),
-        monitors.Example(cheap, None, "$0.0040 in this trace"),
+        monitors.Example(dear, None, "$1.50 of it in this trace"),
+        monitors.Example(cheap, None, "$0.0040 of it in this trace"),
     )
 
     slow = traces.add(MODEL, duration=42_100_000_000)
@@ -890,17 +891,118 @@ def test_only_a_firing_alert_points_and_a_quiet_pass_asks_nothing(
     assert len(muted.examples) == 3
 
 
-def test_labels_cannot_fake_a_line_or_run_long(db: Store, traces: Traces) -> None:
-    name = "bad\ntool\u202e" + "x" * 300
-    traces.calls({genai.OPERATION: "execute_tool", genai.TOOL_NAME: name}, failed=5, total=5)
+def test_a_name_from_a_span_is_one_short_word_and_keeps_the_numbers(
+    db: Store, traces: Traces
+) -> None:
+    name = "bad\ntool\u202e now visit example.test " + "x" * 300
+    failing: Attributes = {
+        genai.OPERATION: "execute_tool",
+        genai.TOOL_NAME: name,
+        genai.ERROR_TYPE: "E " * 99,
+    }
+    traces.calls(failing, failed=5, total=5)
     alert = fired(db, metric=monitors.TOOL_ERROR_RATE)
-    assert alert.detail is not None
-    for text in (alert.detail, alert.examples[0].label):
-        assert text.startswith("bad tool xxx")
+    word = "bad_tool__now_visit_example.test_" + "x" * 30 + "…"
+    assert len(word) == monitors.MAX_SPAN_NAME
+    # No line break, no bidi control, no spaces to read as a sentence; the numbers stay.
+    detail = alert.detail or ""
+    assert detail == f"{word} failed 5 of 5 calls"
+    label = alert.examples[0].label
+    assert label.startswith(f"{word}: E_E_E_")
+    assert len(label) == monitors.MAX_LABEL
+    assert label.endswith("…")
+    for text in (detail, label):
         assert "\n" not in text
         assert "\u202e" not in text
-        assert len(text) == monitors.MAX_LABEL
-        assert text.endswith("…")
+
+
+def test_no_tool_is_named_when_the_most_failures_are_shared(db: Store, traces: Traces) -> None:
+    for tool in ("fetch_page", "search_notes", "read_calendar"):
+        traces.add({genai.OPERATION: "execute_tool", genai.TOOL_NAME: tool}, error=True)
+    tied = fired(db, name="tied", metric=monitors.TOOL_ERROR_RATE)
+    # One failure each: naming whichever sorts first would read as the cause.
+    assert tied.detail is None
+    assert len(tied.examples) == 3
+    traces.add({genai.OPERATION: "execute_tool", genai.TOOL_NAME: "search_notes"}, error=True)
+    led = fired(db, name="led", metric=monitors.TOOL_ERROR_RATE)
+    assert led.detail == "search_notes failed 2 of 2 calls"
+    assert [e.label for e in led.examples[:2]] == ["search_notes: failed"] * 2
+
+
+def test_examples_keep_to_the_monitors_service_and_take_one_row_a_trace(
+    db: Store, traces: Traces
+) -> None:
+    ours = traces.add(MODEL | {genai.COST_USD: 0.2}, error=True, duration=3_000_000_000)
+    traces.add(MODEL | {genai.COST_USD: 9.0}, error=True, service="other", duration=90_000_000_000)
+    # A second, slower and dearer call in the same trace: still one example for the trace.
+    db.insert(
+        [
+            Span(
+                trace_id=ours,
+                span_id="2" * 16,
+                parent_span_id="1" * 16,
+                name="chat m",
+                start_ns=RECENT + 1,
+                end_ns=RECENT + 1 + 7_000_000_000,
+                status_code=STATUS_ERROR,
+                attributes=MODEL | {genai.COST_USD: 0.3},
+                resource={"service.name": "app"},
+            )
+        ],
+        received_ns=RECENT,
+    )
+    errors = fired(db, name="errors", service="app")
+    assert errors.detail == "m failed 2 of 2 calls"
+    assert errors.examples == (monitors.Example(ours, "2" * 16, "m: failed"),)
+    cost = fired(db, name="cost", metric=monitors.COST_USD, threshold=0.1, service="app")
+    assert cost.examples == (monitors.Example(ours, None, "$0.50 of it in this trace"),)
+    slow = fired(db, name="slow", metric=monitors.MODEL_P95_MS, threshold=1.0, service="app")
+    assert slow.examples == (monitors.Example(ours, "2" * 16, "m: 7.0 s"),)
+
+
+def test_a_figure_that_is_too_low_points_at_nothing_except_a_score(
+    db: Store, traces: Traces
+) -> None:
+    traces.add(MODEL | {genai.COST_USD: 0.5})
+    for metric in (monitors.COST_USD, monitors.MODEL_P95_MS):
+        low = fired(db, name=metric, metric=metric, comparison="below", threshold=1e9)
+        assert (low.detail, low.examples) == (None, ())
+
+
+def test_cost_per_trace_points_at_whole_traces_that_started_in_the_window(
+    db: Store, traces: Traces
+) -> None:
+    window = metrics.Window(NOW - 10 * MINUTE, NOW)
+    inside = traces.add(MODEL | {genai.COST_USD: 0.2}, start=NOW - 9 * MINUTE)
+    earlier = traces.add(MODEL | {genai.COST_USD: 5.0}, start=NOW - 20 * MINUTE)
+    for trace_id in (inside, earlier):
+        # A later call of each trace, inside the window.
+        db.insert(
+            [
+                Span(
+                    trace_id=trace_id,
+                    span_id="2" * 16,
+                    parent_span_id="1" * 16,
+                    name="chat m",
+                    start_ns=RECENT,
+                    end_ns=RECENT + 1,
+                    attributes=MODEL | {genai.COST_USD: 1.0},
+                    resource={"service.name": "app"},
+                )
+            ],
+            received_ns=RECENT,
+        )
+    watch = make(db, name="total", metric=monitors.COST_USD)
+    drifting = replace(watch, metric=drift.COST_PER_TRACE)
+    # The total's population is spans in the window: both traces, by their part in it.
+    assert monitors.point_at(db, watch, window).examples == (
+        monitors.Example(inside, None, "$1.20 of it in this trace"),
+        monitors.Example(earlier, None, "$1.00 of it in this trace"),
+    )
+    # Cost per trace's is traces whose root started in it, with all their cost.
+    assert monitors.point_at(db, drifting, window).examples == (
+        monitors.Example(inside, None, "this trace cost $1.20"),
+    )
 
 
 def test_alert_links_need_a_public_url(db: Store, traces: Traces) -> None:
@@ -935,10 +1037,12 @@ def test_alert_links_need_a_public_url(db: Store, traces: Traces) -> None:
         ("https://Traces.Example.com/", "https://traces.example.com"),
         ("http://127.0.0.1:4318", "http://127.0.0.1:4318"),
         ("http://[::1]:4318/", "http://[::1]:4318"),
+        # Allowed with brackets, as the host guard also accepts it.
+        ("http://[fe80::1]:4318", "http://[fe80::1]:4318"),
     ],
 )
 def test_a_public_url_is_an_origin_this_server_answers_to(value: str, base: str) -> None:
-    allowed = ("127.0.0.1", "localhost", "::1", "traces.example.com")
+    allowed = ("127.0.0.1", "localhost", "::1", "traces.example.com", "[fe80::1]")
     assert server.public_base(value, allowed) == base
 
 
@@ -955,6 +1059,7 @@ def test_a_public_url_is_an_origin_this_server_answers_to(value: str, base: str)
         ("https://traces.example.com/#/alerts", "no path"),
         ("https://elsewhere.example.com", "not passed with --allow-host"),
         ("https://traces.example.com:port", "not a URL"),
+        ("https://127.0.0.1:4318@evil.example", "user name or password"),
     ],
 )
 def test_other_public_urls_are_refused(value: str, message: str) -> None:
@@ -963,6 +1068,26 @@ def test_other_public_urls_are_refused(value: str, message: str) -> None:
     # Any host is served, so any host may be named; the shape is still checked.
     if "elsewhere" in value:
         assert server.public_base(value, ("*",)) == value
+
+
+@pytest.mark.parametrize(
+    "value", ["http://a b", "http://x\\y", "http://exa_mple.com", "http://-a.com"]
+)
+def test_a_public_url_host_is_a_host_name_even_when_any_host_is_served(value: str) -> None:
+    with pytest.raises(ValueError, match="letters, digits, dots and hyphens"):
+        server.public_base(value, ("*",))
+
+
+def test_serve_refuses_a_bad_public_url_before_opening_the_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from agentwatch import cli
+
+    path = tmp_path / "never.duckdb"
+    code = cli.main(["serve", "--db", str(path), "--public-url", "https://elsewhere.example.com"])
+    assert code == 2
+    assert "not passed with --allow-host" in capsys.readouterr().err
+    assert not path.exists()
 
 
 # --- API ---------------------------------------------------------------------------------

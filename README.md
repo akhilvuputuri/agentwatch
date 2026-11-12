@@ -137,8 +137,8 @@ firing and when it resolves. Error rates fire only when a 95% statistical bound 
 threshold, so a few unlucky calls cannot set one off, and a firing monitor resolves only after its
 value has stayed good for a cooldown (60 minutes by default). agentwatch sends nothing itself: a client
 polls `GET /api/alerts?undelivered=1` and confirms each alert with
-`POST /api/alerts/<id>/delivered`. A firing alert names the worst tool or model for an error
-rate and points at up to three traces behind its figure; with `serve --public-url
+`POST /api/alerts/<id>/delivered`. A firing alert names the tool or model that failed most (for an
+error rate, when one stands out) and points at up to three traces behind its figure; with `serve --public-url
 https://traces.example.com` each of those carries a link the client can pass on. See
 [the design notes](docs/design.md#monitors-and-alerts).
 

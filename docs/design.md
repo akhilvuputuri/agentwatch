@@ -445,29 +445,38 @@ points at (below). No message content. `Store.prune` deletes alerts older than i
 time, delivered or not; monitors and states are not affected.
 
 **What a firing alert points at** (schema version 12, added 13 November 2026). An alert used to
-say only that a number crossed a line, and whoever received it had to go and find the traces. A
-tool that failed 48 of its 50 calls went unseen that way, under a global rate that stayed within
-its limit. When a monitor goes from OK to firing, the alert now records:
+say only that a number crossed a line, and whoever received it had to go and find the traces
+behind it. When a monitor goes from OK to firing, the alert now records:
 
-- `detail`: for the error rates, the tool or model with the most failed calls in the window, as
-  "`<name>` failed 4 of 5 calls" (fewest calls, then name, break a tie). Null for other metrics.
+- `detail`: for the error rates, the tool or model that failed more calls in the window than any
+  other, as "`<name>` failed 4 of 5 calls". Null when the most failures are shared (a name that
+  only won a tie-break would read as the cause) and for other metrics.
 - `examples`: at most three traces, one row a trace, each `{trace_id, span_id, label}`:
-  the latest failed call of each trace for an error rate (label: tool or model, and
-  `error.type`); the costliest traces for cost (no span); each trace's slowest model call for
+  for an error rate, a failed call of each trace, those of the `detail` name first and then the
+  newest (label: tool or model, and `error.type`); for a cost total, the traces with the most
+  cost among the spans that started in the window, and for cost per trace, the costliest traces
+  whose root started in it, whole (no span either way); each trace's slowest model call for
   latency; for a score, each trace's score furthest on the alert's side (lowest for `below`,
-  highest for `above`). A trace count points at nothing. Drift alerts point at the current
-  window, never the baseline.
+  highest for `above`). Drift alerts point at the current window, never the baseline.
 
-They follow the same population as the figure they explain (the window, the service filter, calls
-by start time). They are read once, when the alert fires, outside the transaction and only on a
+Nothing explains a trace count, or a cost, latency or error rate that is too low, so those
+alerts point at nothing. This does not make a failing tool raise an alert by itself: one tool
+can fail nearly every call while a global rate stays within its limit, and no alert then fires.
+What changes is that an alert that does fire names it.
+
+They follow the population of the figure they explain (the window, the service filter, calls by
+start time). They are read once, when the alert fires, outside the transaction and only on a
 pass that would take an OK monitor to firing, so a quiet pass asks nothing more and the lock is
 held no longer. Resolved alerts carry none. They are not kept up to date: a trace named here may
 later be removed by retention, and its link then says so. Muted alerts record them too.
 
-Labels and `detail` carry names taken from spans (a tool, a model, an error type) and numbers,
-never message content. Since they are shown wherever the alert is delivered, they are cleaned
-like a monitor's name (control, format and bidi characters become spaces; one line) and cut to
-120 characters.
+Labels and `detail` carry names taken from spans (a tool, a model, an error type, a score) and
+numbers, never message content. Each name is made one word of at most 64 characters before it
+goes in (whitespace, control, format and bidi characters become underscores), so it cannot read
+as a sentence, start a new line or push out the numbers beside it; the whole is one line of at
+most 120 characters. A name is still text that an agent's inputs can shape, and it may look like
+an address. **A client must show labels and `detail` as literal text, never as markup or as a
+link**; the only links are the `url` fields below.
 
 **Links.** With `serve --public-url <origin>`, each alert in the API has `url` (the Alerts page)
 and each example a `url` to its trace, with the span when there is one; without it they are null.

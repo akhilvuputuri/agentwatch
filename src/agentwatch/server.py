@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -1055,6 +1056,10 @@ def _alert_json(alert: monitors.Alert, public_url: str | None) -> dict[str, Any]
     }
 
 
+# A DNS name or an IPv4 address, or an IPv6 address as urlsplit returns it (no brackets).
+_HOST_NAME = re.compile(r"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?|[0-9a-f:.]{2,45}")
+
+
 def public_base(value: str, allowed_hosts: Sequence[str]) -> str:
     """`value` as the UI's public address, `scheme://host[:port]`, or ValueError saying why not.
 
@@ -1069,11 +1074,16 @@ def public_base(value: str, allowed_hosts: Sequence[str]) -> str:
         raise ValueError(f"--public-url is not a URL: {error}") from None
     if parts.scheme not in ("http", "https") or not host:
         raise ValueError("--public-url must be an http or https URL")
+    if not _HOST_NAME.fullmatch(host):
+        raise ValueError("--public-url must name a host by letters, digits, dots and hyphens")
     if parts.username is not None or parts.password is not None:
         raise ValueError("--public-url must not hold a user name or password")
     if parts.path not in ("", "/") or parts.query or parts.fragment:
         raise ValueError("--public-url must be an origin, with no path, query or fragment")
-    if "*" not in allowed_hosts and host not in {name.lower() for name in allowed_hosts}:
+    # Compared as the host guard compares a request's Host: lower case, without brackets.
+    if "*" not in allowed_hosts and host not in {
+        name.lower().strip("[]") for name in allowed_hosts
+    }:
         raise ValueError(f"--public-url names {host}, which is not passed with --allow-host")
     bracketed = f"[{host}]" if ":" in host else host
     return f"{parts.scheme}://{bracketed}" + (f":{port}" if port is not None else "")
