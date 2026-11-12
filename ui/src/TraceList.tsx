@@ -76,6 +76,9 @@ export function TraceList({ session, user, service = "", errors = false }: Trace
           Service{" "}
           <select value={service} onChange={(event) => show({ service: event.target.value })}>
             <option value="">All</option>
+            {/* A service named by the address but not (or no longer) in the store: still shown as
+                the filter in force, or the list would look unfiltered and empty. */}
+            {service && !services.includes(service) && <option value={service}>{service}</option>}
             {services.map((name) => (
               <option key={name} value={name}>
                 {name || "(unnamed)"}

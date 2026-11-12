@@ -43,5 +43,12 @@ test("filters to traces with errors, and the address keeps the filter", async ({
   await page.goBack();
   await page.goBack();
   await expect(page.getByLabel("Errors only")).not.toBeChecked();
+
+  // A service the store does not have still shows as the filter in force.
+  await page.goto("/#/?service=gone");
+  await expect(page.getByLabel("Service")).toHaveValue("gone");
+  await expect(page.getByText("No traces yet.")).toBeVisible();
+  await page.getByLabel("Service").selectOption("");
+  await expect(page).toHaveURL(/#\/$/);
   await expect(rows.filter({ hasNotText: "error" }).first()).toBeVisible();
 });

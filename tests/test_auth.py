@@ -157,6 +157,23 @@ def test_a_refused_sign_in_keeps_the_route_and_the_name_but_never_the_password()
         },
     ).text
     assert 'value="#/?user=a&#x27;b&amp;x=1"' in quoted
+    # Every refusal that has read the form keeps both; control characters in a name are dropped.
+    busy = auth._page(  # pyright: ignore[reportPrivateUsage]
+        "Busy. Try again in a moment.",
+        503,
+        {"retry-after": "5"},
+        following=route,
+        user="ow\x00n\r\ne\x1br",
+    )
+    body = bytes(busy.body).decode()
+    assert busy.status_code == 503
+    assert busy.headers["retry-after"] == "5"
+    assert f'value="{route}"' in body
+    assert 'value="owner"' in body
+    # The name typed is there, so the password field is where typing continues.
+    assert 'value="owner">' in body
+    assert 'maxlength="1024" autofocus>' in body
+    assert body.count("autofocus") == 1
     # The first page has neither.
     first = http.get("/login").text
     assert 'name="next" id="next" value=""' in first

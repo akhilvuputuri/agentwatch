@@ -10,6 +10,11 @@ test("dashboard shows figures, charts and breakdowns for the demo data", async (
   await page.reload();
   await expect(page.getByRole("button", { name: "All time" })).toHaveAttribute("aria-pressed", "true");
   await expect(tiles).toHaveCount(8);
+  await page.getByLabel("Service").selectOption("demo-assistant");
+  await expect(page).toHaveURL(/#\/dashboard\?range=all&service=demo-assistant$/);
+  await page.reload();
+  await expect(page.getByLabel("Service")).toHaveValue("demo-assistant");
+  await expect(page.getByRole("button", { name: "All time" })).toHaveAttribute("aria-pressed", "true");
   await expect(tiles.filter({ has: page.getByText("Model calls", { exact: true }) })).toContainText(/\d+/);
   await expect(page.getByRole("img", { name: "Cost per time bucket" })).toBeVisible();
   await expect(page.getByRole("img", { name: /Model call latency/ })).toBeVisible();

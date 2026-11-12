@@ -514,7 +514,8 @@ def _page(
     (`following`, only when it is a UI route) and the user name typed, never the password."""
     message = f'<p role="alert">{html.escape(error)}</p>' if error else ""
     route = html.escape(following) if NEXT_ROUTE.fullmatch(following) else ""
-    name = html.escape(user[:64])
+    # Printable characters only: a control character has no place in a name or in the page.
+    name = html.escape("".join(char for char in user if char.isprintable())[:64])
     body = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
