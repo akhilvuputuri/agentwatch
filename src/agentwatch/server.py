@@ -1067,10 +1067,10 @@ def _is_host(host: str) -> bool:
     if _DNS_NAME.fullmatch(host):
         return True
     try:
-        ipaddress.ip_address(host)
+        # A zone ("fe80::1%eth0") names an interface of this machine, not an address to link to.
+        return ipaddress.ip_address(host).version == 4 or "%" not in host
     except ValueError:
         return False
-    return True
 
 
 def public_base(value: str, allowed_hosts: Sequence[str]) -> str:
