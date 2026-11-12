@@ -19,7 +19,7 @@ from agentwatch import genai, memory
 from agentwatch.scores import Score, ScoreConflict, from_span_events
 from agentwatch.spans import STATUS_ERROR, Attributes, Span, SpanEvent, SpanLink, jsonable
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # The original (version 1) schema. Newer versions are reached through MIGRATIONS, so a new
 # database and an upgraded one end up identical.
@@ -250,6 +250,12 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             requested_ns BIGINT NOT NULL,
             PRIMARY KEY (store_id, record_id)
         )""",
+    ),
+    12: (
+        # What a firing alert points at: a line naming the worst contributor, and a JSON list
+        # of {trace_id, span_id, label}.
+        "ALTER TABLE alerts ADD COLUMN detail VARCHAR",
+        "ALTER TABLE alerts ADD COLUMN examples JSON",
     ),
 }
 REPORTED = "reported"

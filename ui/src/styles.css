@@ -1007,3 +1007,8 @@ details.trace-tools > summary {
     padding: 8px 0;
   }
 }
+
+.alert-examples {
+  margin: 2px 0 0;
+  padding-left: 16px;
+}

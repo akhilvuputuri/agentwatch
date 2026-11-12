@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +9,7 @@ import duckdb
 import pytest
 from starlette.testclient import TestClient
 
-from agentwatch import genai, metrics, monitors, server, store
+from agentwatch import drift, genai, metrics, monitors, server, store
 from agentwatch.monitors import FIRING, OK, MonitorRunner
 from agentwatch.retention import DAY_NS
 from agentwatch.scores import API, BOOLEAN, CATEGORICAL, NUMERIC, Score
@@ -744,6 +745,362 @@ def test_default_min_samples_per_metric(db: Store, metric: str, minimum: int) ->
     assert given.min_samples == 7
 
 
+# --- What an alert points at ---------------------------------------------------------------
+
+
+def fired(db: Store, **fields: Any) -> monitors.Alert:
+    """The one alert a new monitor writes when evaluated now."""
+    monitor = make(db, **fields)
+    state = monitors.evaluate(db, monitor, NOW)
+    assert state is not None
+    assert state.state == FIRING
+    [alert] = [a for a in alerts(db) if a.monitor_id == monitor.id]
+    return alert
+
+
+def test_a_tool_error_alert_names_the_worst_tool_and_its_latest_failures(
+    db: Store, traces: Traces
+) -> None:
+    flaky: Attributes = {genai.OPERATION: "execute_tool", genai.TOOL_NAME: "parcel_list"}
+    failing = flaky | {genai.ERROR_TYPE: "TOOL_FAILED"}
+    made = [
+        traces.add(failing, start=NOW - (6 - minute) * MINUTE, error=True) for minute in range(1, 5)
+    ]
+    traces.add(flaky)
+    # Another tool fails too, most recently of all: the worst tool's failures still come first.
+    traces.add(TOOL | {genai.ERROR_TYPE: "timeout"}, start=NOW - 9 * MINUTE, error=True)
+    traces.add(TOOL | {genai.ERROR_TYPE: "timeout"}, start=NOW - MINUTE, error=True)
+    traces.calls(TOOL, failed=0, total=2)
+    # Outside the window, and a model call: neither is an example.
+    traces.add(failing, start=NOW - 30 * MINUTE, error=True)
+    traces.add(MODEL, error=True)
+    alert = fired(db, metric=monitors.TOOL_ERROR_RATE)
+    assert alert.detail == "parcel_list failed 4 of 5 calls"
+    assert len(alert.examples) == 3
+    # Newest first, each with the span that failed.
+    assert alert.examples[0] == monitors.Example(made[-1], "1" * 16, "parcel_list: TOOL_FAILED")
+    assert [e.label for e in alert.examples] == ["parcel_list: TOOL_FAILED"] * 3
+
+
+def test_other_tools_failures_follow_the_worst_tools(db: Store, traces: Traces) -> None:
+    parcel: Attributes = {genai.OPERATION: "execute_tool", genai.TOOL_NAME: "parcel_list"}
+    older = traces.add(TOOL, start=NOW - 8 * MINUTE, error=True)
+    newer = traces.add(TOOL, start=NOW - 4 * MINUTE, error=True)
+    latest = traces.add(parcel, start=NOW - MINUTE, error=True)
+    traces.calls(TOOL, failed=0, total=2)
+    alert = fired(db, metric=monitors.TOOL_ERROR_RATE)
+    assert alert.detail == "t failed 2 of 4 calls"
+    # The worst tool's failures, newest first, then the rest; "failed" when no type was given.
+    assert alert.examples == (
+        monitors.Example(newer, "1" * 16, "t: failed"),
+        monitors.Example(older, "1" * 16, "t: failed"),
+        monitors.Example(latest, "1" * 16, "parcel_list: failed"),
+    )
+
+
+def test_a_model_error_alert_points_at_one_failed_call_a_trace(db: Store, traces: Traces) -> None:
+    trace_id = traces.add(MODEL, error=True)
+    db.insert(
+        [
+            Span(
+                trace_id=trace_id,
+                span_id=f"{n:016x}",
+                parent_span_id="1" * 16,
+                name="chat m",
+                start_ns=RECENT + n * 1_000,
+                end_ns=RECENT + n * 1_000 + 1,
+                status_code=STATUS_ERROR,
+                attributes=MODEL | {genai.ERROR_TYPE: "rate_limited"},
+                resource={"service.name": "app"},
+            )
+            for n in (2, 3)
+        ],
+        received_ns=RECENT,
+    )
+    alert = fired(db)
+    assert alert.detail == "m failed 3 of 3 calls"
+    # One example for the trace: its latest failure.
+    assert alert.examples == (monitors.Example(trace_id, f"{3:016x}", "m: rate_limited"),)
+
+
+def test_cost_latency_and_score_alerts_point_at_the_extremes(db: Store, traces: Traces) -> None:
+    cheap = traces.add(MODEL | {genai.COST_USD: 0.004})
+    dear = traces.add(MODEL | {genai.COST_USD: 1.5})
+    traces.add(MODEL)
+    cost = fired(db, name="cost", metric=monitors.COST_USD, threshold=1.0)
+    assert cost.detail is None
+    assert cost.examples == (
+        monitors.Example(dear, None, "$1.50 of it in this trace"),
+        monitors.Example(cheap, None, "$0.0040 of it in this trace"),
+    )
+
+    slow = traces.add(MODEL, duration=42_100_000_000)
+    latency = fired(db, name="slow", metric=monitors.MODEL_P95_MS, threshold=1.0)
+    assert latency.examples[0] == monitors.Example(slow, "1" * 16, "m: 42.1 s")
+    assert len(latency.examples) == 3
+
+    for value in (1.0, 0.0, 1.0, 0.0):
+        traces.score("answer_ok", value, data_type=BOOLEAN)
+    low = fired(
+        db,
+        name="low",
+        metric=monitors.SCORE_MEAN,
+        score_name="answer_ok",
+        comparison="below",
+        threshold=0.9,
+    )
+    assert [e.label for e in low.examples] == ["answer_ok: no", "answer_ok: no", "answer_ok: yes"]
+    traces.score("rating", 2.5)
+    traces.score("rating", 9.0)
+    high = fired(db, name="high", metric=monitors.SCORE_MEAN, score_name="rating", threshold=1.0)
+    assert [e.label for e in high.examples] == ["rating: 9", "rating: 2.5"]
+
+
+def test_only_a_firing_alert_points_and_a_quiet_pass_asks_nothing(
+    db: Store, traces: Traces, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: list[int] = []
+    real = monitors.point_at
+
+    def counted(store: Store, monitor: monitors.Monitor, window: metrics.Window) -> Any:
+        asked.append(window.end_ns)
+        return real(store, monitor, window)
+
+    monkeypatch.setattr(monitors, "point_at", counted)
+    monitor = make(db)
+    traces.calls(MODEL, failed=0, total=5)
+    monitors.evaluate(db, monitor, NOW)
+    assert asked == []  # nothing to explain
+    traces.calls(MODEL, failed=20, total=20)
+    monitors.evaluate(db, monitor, NOW)
+    monitors.evaluate(db, monitor, NOW + MINUTE)
+    assert asked == [NOW]  # once, when it fired; not again while it stays firing
+    later = NOW + 11 * MINUTE
+    traces.calls(MODEL, failed=0, total=5, start=later - MINUTE)
+    monitors.evaluate(db, monitor, later)
+    firing, resolved = alerts(db)
+    assert (firing.kind, len(firing.examples)) == ("firing", 3)
+    assert (resolved.kind, resolved.detail, resolved.examples) == ("resolved", None, ())
+    # A count has nothing to point at; a muted monitor's alert still does.
+    silence = fired(
+        db, name="silence", metric=monitors.TRACE_COUNT, comparison="below", threshold=10_000
+    )
+    assert (silence.detail, silence.examples) == (None, ())
+    muted = fired(db, name="muted", muted=True)
+    assert muted.muted
+    assert len(muted.examples) == 3
+
+
+def test_a_name_from_a_span_is_one_short_word_and_keeps_the_numbers(
+    db: Store, traces: Traces
+) -> None:
+    name = "bad\ntool\u202e now visit example.test " + "x" * 300
+    failing: Attributes = {
+        genai.OPERATION: "execute_tool",
+        genai.TOOL_NAME: name,
+        genai.ERROR_TYPE: "E " * 99,
+    }
+    traces.calls(failing, failed=5, total=5)
+    alert = fired(db, metric=monitors.TOOL_ERROR_RATE)
+    start = "bad_tool__now_visit_example.test_"
+    word = start + "x" * (monitors.MAX_SPAN_NAME - len(start) - 1) + "…"
+    # No line break, no bidi control, no spaces to read as a sentence; the numbers stay.
+    detail = alert.detail or ""
+    assert detail == f"{word} failed 5 of 5 calls"
+    # Both names at their longest still fit, so the error type is whole too.
+    kind = ("E_" * 99)[: monitors.MAX_SPAN_NAME - 1] + "…"
+    label = alert.examples[0].label
+    assert label == f"{word}: {kind}"
+    assert len(label) <= monitors.MAX_LABEL
+    for text in (detail, label):
+        assert "\n" not in text
+        assert "\u202e" not in text
+
+
+def test_no_tool_is_named_when_the_most_failures_are_shared(db: Store, traces: Traces) -> None:
+    for tool in ("fetch_page", "search_notes", "read_calendar"):
+        traces.add({genai.OPERATION: "execute_tool", genai.TOOL_NAME: tool}, error=True)
+    tied = fired(db, name="tied", metric=monitors.TOOL_ERROR_RATE)
+    # One failure each: naming whichever sorts first would read as the cause.
+    assert tied.detail is None
+    assert len(tied.examples) == 3
+    traces.add({genai.OPERATION: "execute_tool", genai.TOOL_NAME: "search_notes"}, error=True)
+    led = fired(db, name="led", metric=monitors.TOOL_ERROR_RATE)
+    assert led.detail == "search_notes failed 2 of 2 calls"
+    assert [e.label for e in led.examples[:2]] == ["search_notes: failed"] * 2
+
+
+def test_examples_keep_to_the_monitors_service_and_take_one_row_a_trace(
+    db: Store, traces: Traces
+) -> None:
+    ours = traces.add(MODEL | {genai.COST_USD: 0.2}, error=True, duration=3_000_000_000)
+    traces.add(MODEL | {genai.COST_USD: 9.0}, error=True, service="other", duration=90_000_000_000)
+    # A second, slower and dearer call in the same trace: still one example for the trace.
+    db.insert(
+        [
+            Span(
+                trace_id=ours,
+                span_id="2" * 16,
+                parent_span_id="1" * 16,
+                name="chat m",
+                start_ns=RECENT + 1,
+                end_ns=RECENT + 1 + 7_000_000_000,
+                status_code=STATUS_ERROR,
+                attributes=MODEL | {genai.COST_USD: 0.3},
+                resource={"service.name": "app"},
+            )
+        ],
+        received_ns=RECENT,
+    )
+    errors = fired(db, name="errors", service="app")
+    assert errors.detail == "m failed 2 of 2 calls"
+    assert errors.examples == (monitors.Example(ours, "2" * 16, "m: failed"),)
+    cost = fired(db, name="cost", metric=monitors.COST_USD, threshold=0.1, service="app")
+    assert cost.examples == (monitors.Example(ours, None, "$0.50 of it in this trace"),)
+    slow = fired(db, name="slow", metric=monitors.MODEL_P95_MS, threshold=1.0, service="app")
+    assert slow.examples == (monitors.Example(ours, "2" * 16, "m: 7.0 s"),)
+
+
+def test_a_figure_that_is_too_low_points_at_nothing_except_a_score(
+    db: Store, traces: Traces
+) -> None:
+    traces.add(MODEL | {genai.COST_USD: 0.5})
+    for metric in (monitors.COST_USD, monitors.MODEL_P95_MS):
+        low = fired(db, name=metric, metric=metric, comparison="below", threshold=1e9)
+        assert (low.detail, low.examples) == (None, ())
+
+
+def test_cost_per_trace_points_at_whole_traces_that_started_in_the_window(
+    db: Store, traces: Traces
+) -> None:
+    window = metrics.Window(NOW - 10 * MINUTE, NOW)
+    inside = traces.add(MODEL | {genai.COST_USD: 0.2}, start=NOW - 9 * MINUTE)
+    earlier = traces.add(MODEL | {genai.COST_USD: 5.0}, start=NOW - 20 * MINUTE)
+    for trace_id in (inside, earlier):
+        # A later call of each trace, inside the window.
+        db.insert(
+            [
+                Span(
+                    trace_id=trace_id,
+                    span_id="2" * 16,
+                    parent_span_id="1" * 16,
+                    name="chat m",
+                    start_ns=RECENT,
+                    end_ns=RECENT + 1,
+                    attributes=MODEL | {genai.COST_USD: 1.0},
+                    resource={"service.name": "app"},
+                )
+            ],
+            received_ns=RECENT,
+        )
+    watch = make(db, name="total", metric=monitors.COST_USD)
+    drifting = replace(watch, metric=drift.COST_PER_TRACE)
+    # The total's population is spans in the window: both traces, by their part in it.
+    assert monitors.point_at(db, watch, window).examples == (
+        monitors.Example(inside, None, "$1.20 of it in this trace"),
+        monitors.Example(earlier, None, "$1.00 of it in this trace"),
+    )
+    # Cost per trace's is traces whose root started in it, with all their cost.
+    assert monitors.point_at(db, drifting, window).examples == (
+        monitors.Example(inside, None, "this trace cost $1.20"),
+    )
+
+
+def test_alert_links_need_a_public_url(db: Store, traces: Traces) -> None:
+    traces.calls(MODEL, failed=5, total=5)
+    alert = fired(db)
+    local = TestClient(server.create_app(db, ui_dir=None), base_url="http://127.0.0.1")
+    [plain] = local.get("/api/alerts").json()["alerts"]
+    assert plain["url"] is None
+    assert plain["detail"] == "m failed 5 of 5 calls"
+    assert [e["url"] for e in plain["examples"]] == [None] * 3
+    public = TestClient(
+        server.create_app(db, ui_dir=None, public_url="https://traces.example.com"),
+        base_url="http://127.0.0.1",
+    )
+    [linked] = public.get("/api/alerts").json()["alerts"]
+    assert linked["url"] == "https://traces.example.com/#/alerts"
+    first = alert.examples[0]
+    assert linked["examples"][0] == {
+        "trace_id": first.trace_id,
+        "span_id": first.span_id,
+        "label": first.label,
+        "url": f"https://traces.example.com/#/trace/{first.trace_id}/{first.span_id}",
+    }
+    delivered = public.post(f"/api/alerts/{alert.id}/delivered", headers=JSON).json()["alert"]
+    assert delivered["examples"] == linked["examples"]
+
+
+@pytest.mark.parametrize(
+    ("value", "base"),
+    [
+        ("https://traces.example.com", "https://traces.example.com"),
+        ("https://Traces.Example.com/", "https://traces.example.com"),
+        ("http://127.0.0.1:4318", "http://127.0.0.1:4318"),
+        ("http://[::1]:4318/", "http://[::1]:4318"),
+        # Allowed with brackets, as the host guard also accepts it.
+        ("http://[fe80::1]:4318", "http://[fe80::1]:4318"),
+    ],
+)
+def test_a_public_url_is_an_origin_this_server_answers_to(value: str, base: str) -> None:
+    allowed = ("127.0.0.1", "localhost", "::1", "traces.example.com", "[fe80::1]")
+    assert server.public_base(value, allowed) == base
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("traces.example.com", "http or https"),
+        ("ftp://traces.example.com", "http or https"),
+        ("javascript:alert(1)", "http or https"),
+        ("https://", "http or https"),
+        ("https://owner:secret@traces.example.com", "user name or password"),
+        ("https://traces.example.com/ui", "no path"),
+        ("https://traces.example.com/?a=1", "no path"),
+        ("https://traces.example.com/#/alerts", "no path"),
+        ("https://elsewhere.example.com", "not passed with --allow-host"),
+        ("https://traces.example.com:port", "not a URL"),
+        ("https://127.0.0.1:4318@evil.example", "user name or password"),
+    ],
+)
+def test_other_public_urls_are_refused(value: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        server.public_base(value, ("127.0.0.1", "traces.example.com"))
+    # Any host is served, so any host may be named; the shape is still checked.
+    if "elsewhere" in value:
+        assert server.public_base(value, ("*",)) == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "http://a b",
+        "http://x\\y",
+        "http://exa_mple.com",
+        "http://-a.com",
+        "http://.a",
+        "http://a..b",
+        "http://a.b.",
+        "http://[fe80::1%25eth0]",
+    ],
+)
+def test_a_public_url_host_is_a_host_name_even_when_any_host_is_served(value: str) -> None:
+    with pytest.raises(ValueError, match="letters, digits, dots and hyphens"):
+        server.public_base(value, ("*",))
+
+
+def test_serve_refuses_a_bad_public_url_before_opening_the_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from agentwatch import cli
+
+    path = tmp_path / "never.duckdb"
+    code = cli.main(["serve", "--db", str(path), "--public-url", "https://elsewhere.example.com"])
+    assert code == 2
+    assert "not passed with --allow-host" in capsys.readouterr().err
+    assert not path.exists()
+
+
 # --- API ---------------------------------------------------------------------------------
 
 
@@ -849,6 +1206,9 @@ def test_alerts_order_and_delivery(client: TestClient, db: Store, traces: Traces
         "baseline_value",
         "baseline_minutes",
         "muted",
+        "detail",
+        "examples",
+        "url",
     }
     oldest = client.get("/api/alerts?undelivered=1").json()["alerts"]
     assert [a["kind"] for a in oldest] == ["firing", "resolved"]
@@ -940,7 +1300,7 @@ def test_migration_from_schema_8(tmp_path: Path) -> None:
     assert upgraded.query_one("SELECT value FROM meta WHERE key = 'schema'")[0] == str(
         store.SCHEMA_VERSION
     )
-    assert store.SCHEMA_VERSION == 11
+    assert store.SCHEMA_VERSION == 12
     assert upgraded.span_count() == 1
     make(upgraded)
     assert len(monitors.list_monitors(upgraded)) == 1

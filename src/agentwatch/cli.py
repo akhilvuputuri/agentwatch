@@ -43,6 +43,13 @@ def main(argv: list[str] | None = None) -> int:
         help="also accept requests addressed to this host name (repeatable; '*' for any)",
     )
     serve.add_argument(
+        "--public-url",
+        default=None,
+        metavar="URL",
+        help="where people open agentwatch, such as https://traces.example.com; alerts then "
+        "carry links to the traces behind them (its host must be served: see --allow-host)",
+    )
+    serve.add_argument(
         "--retain-days",
         type=int,
         default=None,
@@ -179,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             auth=auth,
             forwarded_allow_ips=args.forwarded_allow_ips,
+            public_url=args.public_url,
         )
     return _demo(args.db, args.traces, args.seed)
 
@@ -195,6 +203,7 @@ def _serve(
     judge_policy: JudgePolicy | None = None,
     auth: Auth | None = None,
     forwarded_allow_ips: str | None = None,
+    public_url: str | None = None,
 ) -> int:
     import uvicorn
 
@@ -202,9 +211,18 @@ def _serve(
     from agentwatch.judges import JudgeRunner
     from agentwatch.monitors import MonitorRunner
     from agentwatch.retention import Retention
-    from agentwatch.server import LOOPBACK_HOSTS, create_app
+    from agentwatch.server import LOOPBACK_HOSTS, create_app, public_base
     from agentwatch.store import Store
 
+    allowed = [*LOOPBACK_HOSTS, *extra_hosts]
+    if host not in ("0.0.0.0", "::"):
+        allowed.append(host)
+    if public_url is not None:
+        try:
+            public_url = public_base(public_url, allowed)
+        except ValueError as error:
+            print(f"agentwatch: {error}", file=sys.stderr)
+            return 2
     try:
         store = Store(None if demo else db, memory_limit=memory_limit)
     except ValueError as error:
@@ -214,9 +232,6 @@ def _serve(
         now = time.time_ns()
         store.insert(dataset.generate(end_ns=now), now)
         dataset.seed_datasets(store)
-    allowed = [*LOOPBACK_HOSTS, *extra_hosts]
-    if host not in ("0.0.0.0", "::"):
-        allowed.append(host)
     if host not in LOOPBACK_HOSTS and auth is None:
         print(
             f"warning: binding to {host}; agentwatch has no authentication, "
@@ -241,7 +256,13 @@ def _serve(
         retention.start()
     try:
         uvicorn.run(
-            create_app(store, allowed_hosts=allowed, judge_runner=runner, auth=auth),
+            create_app(
+                store,
+                allowed_hosts=allowed,
+                judge_runner=runner,
+                auth=auth,
+                public_url=public_url,
+            ),
             host=host,
             port=port,
             log_level="warning",
