@@ -907,6 +907,7 @@ Added 13 November 2026. The trace list's service and "Errors only" (`#/?service=
 beside `session` and `user`) and the dashboard's range and service
 (`#/dashboard?range=7d&service=…`; the 24-hour range is the default and is left out) are read
 from the address and changed by changing it. A link or bookmark reopens the same view, a reload
-keeps it, and Back undoes a filter. `nav.ts` tells the router about such a change at once: the
-browser reports a hash change a moment later, and a checkbox driven by the address would
-otherwise show its old state in between.
+keeps it, and Back undoes a filter. Such a change goes through `nav.ts`, as picking a span on
+the trace page does: the address changes through the History API and the router is told at
+once. The browser reports a change of `location.hash` only a moment later, and a checkbox
+driven by the address would otherwise show its old state in between.

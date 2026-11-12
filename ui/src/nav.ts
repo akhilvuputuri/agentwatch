@@ -1,21 +1,21 @@
-/** Moving between routes from code, for views whose controls are driven by the address. */
-
-const listeners = new Set<() => void>();
-
-/** Calls `listener` whenever `navigate` moves; returns how to stop. */
-export function onNavigate(listener: () => void): () => void {
-  listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
-  };
-}
+/** Changing the address from code, for views whose state lives in it. */
 
 /**
- * Go to a route, adding a history entry. The browser reports a hash change only a moment later,
- * and a control that reads its state from the address (a checked box, a pressed button) would
- * show the old state until then, so the router is told at once.
+ * Change the address without leaving the page, and tell the router at once. The router listens
+ * for `hashchange`, which the History API does not send, and which the browser sends only a
+ * moment after `location.hash` is set: a control that reads its state from the address (a
+ * checked box, a pressed button, an open span) would show the old state until then.
+ *
+ * `push` adds a history entry, so Back undoes the change; `replace` does not. `state` is the
+ * entry's history state, kept as it was unless given.
  */
+export function go(hash: string, how: "push" | "replace", state: unknown = window.history.state): void {
+  if (how === "push") window.history.pushState(state, "", hash);
+  else window.history.replaceState(state, "", hash);
+  window.dispatchEvent(new HashChangeEvent("hashchange"));
+}
+
+/** Go to a route as a link would: a new history entry with no state of its own. */
 export function navigate(hash: string): void {
-  window.location.hash = hash;
-  for (const listener of listeners) listener();
+  go(hash, "push", null);
 }

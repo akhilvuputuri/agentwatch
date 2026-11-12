@@ -7,7 +7,6 @@ import { DatasetList, DatasetView } from "./Datasets";
 import { Drift } from "./Drift";
 import { Judges } from "./Judges";
 import { MemoryItemView, MemoryList } from "./Memory";
-import { onNavigate } from "./nav";
 import { Prices } from "./Prices";
 import { RunView } from "./Runs";
 import { SessionList, SessionView } from "./Sessions";
@@ -118,11 +117,7 @@ export function App() {
   useEffect(() => {
     const onChange = () => setCurrent(route(window.location.hash));
     window.addEventListener("hashchange", onChange);
-    const stop = onNavigate(onChange);
-    return () => {
-      window.removeEventListener("hashchange", onChange);
-      stop();
-    };
+    return () => window.removeEventListener("hashchange", onChange);
   }, []);
   const [user, setUser] = useState<string | null>(null);
   useEffect(() => {

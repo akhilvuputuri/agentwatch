@@ -17,6 +17,7 @@ import { AddToDataset } from "./AddToDataset";
 import { ScorePanel } from "./ScorePanel";
 import { approxTokens, contentText } from "./Memory";
 import { Content, Copy, Text, useNarrow } from "./Reading";
+import { go } from "./nav";
 import { layout, type Row } from "./tree";
 
 /** How the spans are laid out: read top to bottom as steps, or against time as a waterfall. */
@@ -30,17 +31,6 @@ function storedMode(): Mode | null {
   } catch {
     return null; // storage can be blocked; the default for the screen width applies
   }
-}
-
-/**
- * Change the address without leaving the page and tell the router at once (it listens for
- * `hashchange`, which the History API does not send). The span shown always matches the
- * address, so a resize, a reload or Back never finds the two disagreeing.
- */
-function go(hash: string, how: "push" | "replace", state: unknown = window.history.state): void {
-  if (how === "push") window.history.pushState(state, "", hash);
-  else window.history.replaceState(state, "", hash);
-  window.dispatchEvent(new HashChangeEvent("hashchange"));
 }
 
 /** History state of an entry a tap on a span added: closing the span goes back over it. */
