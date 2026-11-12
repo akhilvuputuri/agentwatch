@@ -902,15 +902,16 @@ def test_a_name_from_a_span_is_one_short_word_and_keeps_the_numbers(
     }
     traces.calls(failing, failed=5, total=5)
     alert = fired(db, metric=monitors.TOOL_ERROR_RATE)
-    word = "bad_tool__now_visit_example.test_" + "x" * 30 + "…"
-    assert len(word) == monitors.MAX_SPAN_NAME
+    start = "bad_tool__now_visit_example.test_"
+    word = start + "x" * (monitors.MAX_SPAN_NAME - len(start) - 1) + "…"
     # No line break, no bidi control, no spaces to read as a sentence; the numbers stay.
     detail = alert.detail or ""
     assert detail == f"{word} failed 5 of 5 calls"
+    # Both names at their longest still fit, so the error type is whole too.
+    kind = ("E_" * 99)[: monitors.MAX_SPAN_NAME - 1] + "…"
     label = alert.examples[0].label
-    assert label.startswith(f"{word}: E_E_E_")
-    assert len(label) == monitors.MAX_LABEL
-    assert label.endswith("…")
+    assert label == f"{word}: {kind}"
+    assert len(label) <= monitors.MAX_LABEL
     for text in (detail, label):
         assert "\n" not in text
         assert "\u202e" not in text
@@ -1071,7 +1072,17 @@ def test_other_public_urls_are_refused(value: str, message: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "value", ["http://a b", "http://x\\y", "http://exa_mple.com", "http://-a.com"]
+    "value",
+    [
+        "http://a b",
+        "http://x\\y",
+        "http://exa_mple.com",
+        "http://-a.com",
+        "http://.a",
+        "http://a..b",
+        "http://a.b.",
+        "http://[fe80::1%25eth0]",
+    ],
 )
 def test_a_public_url_host_is_a_host_name_even_when_any_host_is_served(value: str) -> None:
     with pytest.raises(ValueError, match="letters, digits, dots and hyphens"):

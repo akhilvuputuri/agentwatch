@@ -88,9 +88,10 @@ RATE_MIN_SAMPLES = 3
 DEFAULT_MIN_SAMPLES = 10
 DEFAULT_COOLDOWN_MINUTES = 60
 # How many traces a firing alert points at, and how long a name taken from a span may be in a
-# label or the detail line (which then stay well under MAX_LABEL, the cut for either).
+# label or the detail line. Two names at their longest and what joins them fit in MAX_LABEL,
+# the cut for either, so a label never loses its second name or its numbers.
 MAX_EXAMPLES = 3
-MAX_SPAN_NAME = 64
+MAX_SPAN_NAME = 56
 MAX_LABEL = 120
 # Controls, format and bidi characters, and line breaks: a name is shown wherever an alert is
 # delivered, and must not be able to fake a new line or reorder what is around it.

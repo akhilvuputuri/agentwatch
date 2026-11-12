@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -1056,8 +1057,20 @@ def _alert_json(alert: monitors.Alert, public_url: str | None) -> dict[str, Any]
     }
 
 
-# A DNS name or an IPv4 address, or an IPv6 address as urlsplit returns it (no brackets).
-_HOST_NAME = re.compile(r"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?|[0-9a-f:.]{2,45}")
+# A DNS name: labels of letters, digits and inner hyphens, 253 characters at most in all.
+_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_DNS_NAME = re.compile(rf"(?=.{{1,253}}\Z){_LABEL}(?:\.{_LABEL})*")
+
+
+def _is_host(host: str) -> bool:
+    """A DNS name or an IP address, as urlsplit returns it (lower case, IPv6 unbracketed)."""
+    if _DNS_NAME.fullmatch(host):
+        return True
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
 
 
 def public_base(value: str, allowed_hosts: Sequence[str]) -> str:
@@ -1074,7 +1087,7 @@ def public_base(value: str, allowed_hosts: Sequence[str]) -> str:
         raise ValueError(f"--public-url is not a URL: {error}") from None
     if parts.scheme not in ("http", "https") or not host:
         raise ValueError("--public-url must be an http or https URL")
-    if not _HOST_NAME.fullmatch(host):
+    if not _is_host(host):
         raise ValueError("--public-url must name a host by letters, digits, dots and hyphens")
     if parts.username is not None or parts.password is not None:
         raise ValueError("--public-url must not hold a user name or password")

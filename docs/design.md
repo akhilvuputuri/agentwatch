@@ -471,10 +471,10 @@ held no longer. Resolved alerts carry none. They are not kept up to date: a trac
 later be removed by retention, and its link then says so. Muted alerts record them too.
 
 Labels and `detail` carry names taken from spans (a tool, a model, an error type, a score) and
-numbers, never message content. Each name is made one word of at most 64 characters before it
+numbers, never message content. Each name is made one word of at most 56 characters before it
 goes in (whitespace, control, format and bidi characters become underscores), so it cannot read
-as a sentence, start a new line or push out the numbers beside it; the whole is one line of at
-most 120 characters. A name is still text that an agent's inputs can shape, and it may look like
+as a sentence, start a new line or push out what stands beside it: two names at their longest
+still fit in the whole, one line of at most 120 characters. A name is still text that an agent's inputs can shape, and it may look like
 an address. **A client must show labels and `detail` as literal text, never as markup or as a
 link**; the only links are the `url` fields below.
 
